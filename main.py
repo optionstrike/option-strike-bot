@@ -1,14 +1,16 @@
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 import requests
 import os
 import time
+import json
 from typing import Dict, Any, Optional
 
 app = FastAPI()
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-CHAT_ID = os.getenv("CHAT_ID", "").strip()
-SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8619465902:AAHPP9AFiL0fV1lejKtaThLlQ4qZ6qCYgX0").strip()
+CHAT_ID = os.getenv("CHAT_ID", "8371374055").strip()
+SECRET_KEY = os.getenv("SECRET_KEY", "12345").strip()
 
 # إعدادات قابلة للتعديل من Render
 DUPLICATE_WINDOW_SEC = int(os.getenv("DUPLICATE_WINDOW_SEC", "300"))
@@ -26,6 +28,7 @@ stats = {
     "blocked_conflict": 0,
     "blocked_weak": 0,
     "blocked_secret": 0,
+    "invalid_payload": 0,
 }
 
 
@@ -302,7 +305,6 @@ def build_alert_message(payload: Dict[str, Any]) -> str:
     pivot = payload["pivot"]
 
     strike = payload["strike"]
-    estimated_premium = payload["estimated_premium"]
 
     stock_stop = payload["stock_stop"]
     stock_t1 = payload["stock_target1"]
@@ -350,6 +352,21 @@ def build_alert_message(payload: Dict[str, Any]) -> str:
 """
 
 
+async def parse_request_payload(request: Request) -> Dict[str, Any]:
+    try:
+        return await request.json()
+    except Exception:
+        pass
+
+    try:
+        raw = await request.body()
+        if not raw:
+            return {}
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return {}
+
+
 @app.get("/")
 def home():
     return {"status": "Option Strike Bot running"}
@@ -379,11 +396,15 @@ def test():
 async def webhook(request: Request):
     global last_signal_message
 
-    data = await request.json()
+    data = await parse_request_payload(request)
 
-    if data.get("secret") != SECRET_KEY:
+    if not isinstance(data, dict) or not data:
+        stats["invalid_payload"] += 1
+        return JSONResponse({"error": "Invalid payload"}, status_code=400)
+
+    if str(data.get("secret", "")).strip() != SECRET_KEY:
         stats["blocked_secret"] += 1
-        return {"error": "Unauthorized"}
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
     ticker = str(data.get("ticker", "")).upper().strip()
     signal = str(data.get("signal", "")).upper().strip()
@@ -391,7 +412,8 @@ async def webhook(request: Request):
     price = safe_float(data.get("price"))
 
     if not ticker or signal not in ["CALL", "PUT"] or price <= 0:
-        return {"error": "Invalid payload"}
+        stats["invalid_payload"] += 1
+        return JSONResponse({"error": "Invalid payload"}, status_code=400)
 
     score_data = score_signal(data)
     strength_score = score_data["strength_score"]
@@ -450,7 +472,7 @@ async def webhook(request: Request):
 async def telegram_webhook(request: Request):
     global last_signal_message
 
-    update = await request.json()
+    update = await parse_request_payload(request)
 
     try:
         message = update.get("message", {})
@@ -501,5 +523,3 @@ async def telegram_webhook(request: Request):
         pass
 
     return {"ok": True}
-
-    
