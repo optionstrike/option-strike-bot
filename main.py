@@ -7,11 +7,14 @@ import json
 from typing import Dict, Any, Optional
 
 app = FastAPI()
-API_KEY = "zgd0qCw0OW5HNLXhuMC6jN1rjIpQQuzU"
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8619465902:AAHPP9AFiL0fV1lejKtaThLlQ4qZ6qCYgX0").strip()
-CHAT_ID = os.getenv("CHAT_ID", "8371374055").strip()
-SECRET_KEY = os.getenv("SECRET_KEY", "12345").strip()
+last_drafts = {}
+REPORT_FILE = "trades_report.csv"
+API_KEY = "zgdoQcwoOW5HNLXhuMC6jN1rjIpQQuzU"
 
+TELEGRAM_TOKEN = "8619465902:AAHPP9AFiL0fV1lejKtaThLlQ4qZ6qCYgX0"
+CHAT_ID = "8371374055"
+
+SECRET_KEY = os.getenv("SECRET_KEY", "12345").strip()
 # إعدادات قابلة للتعديل من Render
 DUPLICATE_WINDOW_SEC = int(os.getenv("DUPLICATE_WINDOW_SEC", "300"))
 CONFLICT_WINDOW_SEC = int(os.getenv("CONFLICT_WINDOW_SEC", "300"))
@@ -672,13 +675,281 @@ def draft_signal(ticker: str, direction: str):
 ⚠️ تنبيه: هذا الطرح تعليمي وليس توصية استثمارية، والقرار النهائي يعود للمتداول.
 
 📢 @Option_Strike01"""
+def ensure_report_file():
+    if not os.path.exists(REPORT_FILE):
+        with open(REPORT_FILE, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "id",
+                "ticker",
+                "direction",
+                "direction_ar",
+                "strike",
+                "expiry",
+                "contract",
+                "entry_high",
+                "entry_low",
+                "entry_display",
+                "highest_price",
+                "profit_pct",
+                "created_at",
+                "updated_at"
+            ])
 
+
+def save_trade_record(data: dict):
+    ensure_report_file()
+
+    with open(REPORT_FILE, "a", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            data["id"],
+            data["ticker"],
+            data["direction"],
+            data["direction_ar"],
+            data["strike"],
+            data["expiry"],
+            data["contract"],
+            f'{data["entry_high"]:.2f}',
+            f'{data["entry_low"]:.2f}',
+            data["entry_display"],
+            f'{data["highest_price"]:.2f}',
+            f'{data["profit_pct"]:.2f}',
+            data["created_at"],
+            data["updated_at"]
+        ])
+
+
+def refresh_report_file():
+    ensure_report_file()
+
+    with open(REPORT_FILE, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "id",
+            "ticker",
+            "direction",
+            "direction_ar",
+            "strike",
+            "expiry",
+            "contract",
+            "entry_high",
+            "entry_low",
+            "entry_display",
+            "highest_price",
+            "profit_pct",
+            "created_at",
+            "updated_at"
+        ])
+
+        for _, data in last_drafts.items():
+            writer.writerow([
+                data["id"],
+                data["ticker"],
+                data["direction"],
+                data["direction_ar"],
+                data["strike"],
+                data["expiry"],
+                data["contract"],
+                f'{data["entry_high"]:.2f}',
+                f'{data["entry_low"]:.2f}',
+                data["entry_display"],
+                f'{data["highest_price"]:.2f}',
+                f'{data["profit_pct"]:.2f}',
+                data["created_at"],
+                data["updated_at"]
+            ])
+
+
+def send_telegram_text(text: str):
     telegram_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
     requests.post(telegram_url, json={
         "chat_id": CHAT_ID,
         "text": text
-    })
+    }, timeout=20)
 
+
+@app.get("/draft/{ticker}/{direction}")
+def draft_signal(ticker: str, direction: str):
+    smart = smart_contract(ticker, direction)
+
+    if smart.get("error"):
+        return PlainTextResponse(str(smart))
+
+    strike = smart["strike"]
+    expiry = smart["expiry"]
+    contract = smart["contract"]
+    current_price = smart.get("current_price")
+    option_price = smart.get("option_price")
+    bid = smart.get("bid")
+    ask = smart.get("ask")
+
+    is_call = direction.lower() == "call"
+    contract_type = "كول (CALL)" if is_call else "بوت (PUT)"
+    direction_ar = "كول" if is_call else "بوت"
+    icon = "🟢" if is_call else "🔴"
+
+    # سعر الدخول الأعلى = سعر العقد لو موجود، وإلا 2.50
+    if option_price:
+        entry_high = round(float(option_price), 2)
+    else:
+        entry_high = 2.50
+
+    # فرق أسعار التنفيذ ثابت 0.50
+    entry_low = round(max(entry_high - 0.50, 0.01), 2)
+    entry_display = f"{entry_high:.2f}-{entry_low:.2f}"
+
+    tp1 = round(entry_high + 0.60, 2)
+    tp2 = round(entry_high + 1.20, 2)
+    tp3 = round(entry_high + 2.00, 2)
+
+    text = f"""🆕 طرح جديد | {ticker.upper()}
+
+{icon} النوع: {contract_type}
+🎯 السترايك: ${strike}
+📅 التاريخ: {expiry}
+
+💰 أسعار التنفيذ: {entry_display}
+
+📈 الأهداف:
+🥇 الهدف الأول: {tp1:.2f}
+🥈 الهدف الثاني: {tp2:.2f}
+🥉 الهدف الثالث: {tp3:.2f}
+
+🛑 الوقف:
+كسر الارتكاز بإغلاق ساعة = خروج ❌
+
+⚠️ تنبيه: هذا الطرح تعليمي وليس توصية استثمارية، والقرار النهائي يعود للمتداول.
+
+📢 @Option_Strike01"""
+
+    key = f"{ticker.upper()}_{direction.lower()}"
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    trade_data = {
+        "id": key,
+        "ticker": ticker.upper(),
+        "direction": direction.lower(),
+        "direction_ar": direction_ar,
+        "strike": strike,
+        "expiry": expiry,
+        "contract": contract,
+        "current_price": current_price,
+        "option_price": option_price,
+        "bid": bid,
+        "ask": ask,
+        "entry_high": entry_high,
+        "entry_low": entry_low,
+        "entry_display": entry_display,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "highest_price": entry_high,
+        "profit_pct": 0.0,
+        "created_at": now_str,
+        "updated_at": now_str,
+        "message": text
+    }
+
+    # إذا كانت الصفقة موجودة من قبل، يحدثها؛ إذا لا، يسجلها جديدة
+    is_new_trade = key not in last_drafts
+    last_drafts[key] = trade_data
+
+    if is_new_trade:
+        save_trade_record(trade_data)
+    else:
+        refresh_report_file()
+
+    send_telegram_text(text)
     return PlainTextResponse(text)
-   
+
+
+@app.get("/send/{ticker}/{direction}")
+def send_signal(ticker: str, direction: str):
+    return draft_signal(ticker, direction)
+
+
+@app.get("/contract/{ticker}/{direction}")
+def contract_info(ticker: str, direction: str):
+    smart = smart_contract(ticker, direction)
+
+    if smart.get("error"):
+        return smart
+
+    return {
+        "ticker": smart["ticker"],
+        "direction": direction.lower(),
+        "type": smart["type"],
+        "strike": smart["strike"],
+        "expiry": smart["expiry"],
+        "contract": smart["contract"],
+        "current_price": smart.get("current_price"),
+        "option_price": smart.get("option_price"),
+        "bid": smart.get("bid"),
+        "ask": smart.get("ask")
+    }
+
+
+@app.get("/update/{ticker}/{direction}/{entry}/{current}")
+def update_signal(ticker: str, direction: str, entry: float, current: float):
+    key = f"{ticker.upper()}_{direction.lower()}"
+    saved = last_drafts.get(key)
+
+    if not saved:
+        return PlainTextResponse("لا يوجد طرح محفوظ لهذا السهم/الاتجاه. نفذ /draft أولاً.")
+
+    strike = saved["strike"]
+    direction_ar = saved["direction_ar"]
+
+    highest_price = max(float(saved.get("highest_price", entry)), float(current))
+    profit_pct = round(((highest_price - entry) / entry) * 100, 2)
+
+    saved["highest_price"] = round(highest_price, 2)
+    saved["profit_pct"] = profit_pct
+    saved["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    refresh_report_file()
+
+    text = f"""🔔 تحديث | {ticker.upper()} ${strike} {direction_ar}
+
+📊 سعر الدخول: {entry:.2f}
+💰 الأعلى المحقق: {highest_price:.2f}
+📈 نسبة الربح: +{profit_pct:.2f}%
+
+⚠️ تنبيه: هذا الطرح تعليمي
+والقرار النهائي يعود للمتداول.
+
+📢 @Option_Strike01"""
+
+    send_telegram_text(text)
+    return PlainTextResponse(text)
+
+
+@app.get("/lastdraft/{ticker}/{direction}")
+def last_draft(ticker: str, direction: str):
+    key = f"{ticker.upper()}_{direction.lower()}"
+    saved = last_drafts.get(key)
+
+    if not saved:
+        return {"error": "no saved draft"}
+
+    return saved
+
+
+@app.get("/report")
+def report_view():
+    ensure_report_file()
+
+    if not os.path.exists(REPORT_FILE):
+        return PlainTextResponse("لا يوجد تقرير حتى الآن.")
+
+    with open(REPORT_FILE, "r", encoding="utf-8-sig") as f:
+        content = f.read()
+
+    return PlainTextResponse(content)
+
+
+@app.get("/report/json")
+def report_json():
+    return last_drafts
+    
