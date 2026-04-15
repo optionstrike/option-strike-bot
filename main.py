@@ -622,13 +622,15 @@ def smart_contract(ticker: str, direction: str):
         "contract": best["ticker"],
         "current_price": current_price
     }
+from fastapi.responses import PlainTextResponse
+
 @app.get("/draft/{ticker}/{direction}")
 def draft_signal(ticker: str, direction: str):
     # أول شيء: نجيب العقد الذكي
     smart = smart_contract(ticker, direction)
 
     if smart.get("error"):
-        return smart
+        return PlainTextResponse(str(smart))
 
     strike = smart["strike"]
     expiry = smart["expiry"]
@@ -676,13 +678,4 @@ def draft_signal(ticker: str, direction: str):
 
 📢 @Option_Strike01"""
 
-    return {
-        "ticker": ticker.upper(),
-        "direction": direction.lower(),
-        "contract": smart["contract"],
-        "current_price": smart.get("current_price"),
-        "option_price": option_price,
-        "bid": bid,
-        "ask": ask,
-        "message": text
-    }
+    return PlainTextResponse(text)
