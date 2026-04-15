@@ -677,5 +677,12 @@ def draft_signal(ticker: str, direction: str):
 ⚠️ تنبيه: هذا الطرح تعليمي وليس توصية استثمارية، والقرار النهائي يعود للمتداول.
 
 📢 @Option_Strike01"""
+telegram_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+
+    requests.post(telegram_url, json={
+        "chat_id": CHAT_ID,
+        "text": text
+    })
 
     return PlainTextResponse(text)
+   
