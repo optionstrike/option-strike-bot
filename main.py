@@ -622,25 +622,20 @@ def smart_contract(ticker: str, direction: str):
         "contract": best["ticker"],
         "current_price": current_price
     }
-from fastapi.responses import PlainTextResponse
-
 @app.get("/draft/{ticker}/{direction}")
 def draft_signal(ticker: str, direction: str):
-    # أول شيء: نجيب العقد الذكي
     smart = smart_contract(ticker, direction)
 
     if smart.get("error"):
-        return PlainTextResponse(str(smart))
+        return smart
 
     strike = smart["strike"]
     expiry = smart["expiry"]
+
     contract_type = "كول (CALL)" if direction.lower() == "call" else "بوت (PUT)"
     icon = "🟢" if direction.lower() == "call" else "🔴"
 
-    # نحاول نجيب سعر العقد إذا موجود
     option_price = smart.get("option_price")
-    bid = smart.get("bid")
-    ask = smart.get("ask")
 
     if option_price:
         entry_high = round(float(option_price), 2)
@@ -677,7 +672,8 @@ def draft_signal(ticker: str, direction: str):
 ⚠️ تنبيه: هذا الطرح تعليمي وليس توصية استثمارية، والقرار النهائي يعود للمتداول.
 
 📢 @Option_Strike01"""
-telegram_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+
+    telegram_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
     requests.post(telegram_url, json={
         "chat_id": CHAT_ID,
