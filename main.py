@@ -532,3 +532,14 @@ def test_polygon():
         "status": res.status_code,
         "data": res.json()
     }
+@app.get("/options/{ticker}")
+def get_options(ticker: str):
+    url = "https://api.polygon.io/v3/reference/options/contracts"
+    
+    res = requests.get(url, params={
+        "underlying_ticker": ticker.upper(),
+        "limit": 50,
+        "apiKey": API_KEY
+    }, timeout=20)
+
+    return res.json()
