@@ -4,40 +4,66 @@ import requests
 import os
 import time
 import json
+import csv
+from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
 
 app = FastAPI()
-last_drafts = {}
-REPORT_FILE = "trades_report.csv"
-API_KEY = "zgdoQcwoOW5HNLXhuMC6jN1rjIpQQuzU"
 
+# =========================
+# الإعدادات الأساسية
+# =========================
+API_KEY = "zgdoQcwoOW5HNLXhuMC6jN1rjIpQQuzU"
 TELEGRAM_TOKEN = "8619465902:AAHPP9AFiL0fV1lejKtaThLlQ4qZ6qCYgX0"
 CHAT_ID = "8371374055"
-
 SECRET_KEY = os.getenv("SECRET_KEY", "12345").strip()
-# إعدادات قابلة للتعديل من Render
+
+REPORT_FILE = "trades_report.csv"
+
+# حد يومي / فلترة
+MAX_SIGNALS_PER_DAY = 5
+MIN_SCORE_TO_SEND = 80
+
+# منع التكرار السريع
 DUPLICATE_WINDOW_SEC = int(os.getenv("DUPLICATE_WINDOW_SEC", "300"))
 CONFLICT_WINDOW_SEC = int(os.getenv("CONFLICT_WINDOW_SEC", "300"))
-MIN_STRENGTH_TO_SEND = int(os.getenv("MIN_STRENGTH_TO_SEND", "40"))
 DEFAULT_CONTRACT_BUDGET = float(os.getenv("DEFAULT_CONTRACT_BUDGET", "3.0"))
 ROUND_TO = int(os.getenv("ROUND_TO", "2"))
 
-# ذاكرة بسيطة داخلية
+# =========================
+# ذاكرة داخلية
+# =========================
 last_signals: Dict[str, Dict[str, Any]] = {}
 last_signal_message: Optional[str] = None
+last_drafts: Dict[str, Dict[str, Any]] = {}
+
+# قفل الاتجاه لكل سهم
+direction_state: Dict[str, Dict[str, Any]] = {}
+
+# تتبع يومي
+daily_tracker = {
+    "date": datetime.now().strftime("%Y-%m-%d"),
+    "sent_count": 0,
+    "tickers": []
+}
+
 stats = {
     "sent": 0,
     "blocked_duplicate": 0,
     "blocked_conflict": 0,
     "blocked_weak": 0,
     "blocked_secret": 0,
+    "blocked_daily_limit": 0,
+    "blocked_daily_ticker": 0,
+    "blocked_direction_lock": 0,
     "invalid_payload": 0,
 }
 
-
+# =========================
+# أدوات مساعدة
+# =========================
 def roundx(value: float) -> float:
     return round(value, ROUND_TO)
-
 
 def safe_float(value, default=0.0) -> float:
     try:
@@ -47,6 +73,12 @@ def safe_float(value, default=0.0) -> float:
     except Exception:
         return default
 
+def reset_daily_tracker_if_needed():
+    today = datetime.now().strftime("%Y-%m-%d")
+    if daily_tracker["date"] != today:
+        daily_tracker["date"] = today
+        daily_tracker["sent_count"] = 0
+        daily_tracker["tickers"] = []
 
 def send_telegram(message: str) -> None:
     if not TELEGRAM_TOKEN or not CHAT_ID:
@@ -62,7 +94,6 @@ def send_telegram(message: str) -> None:
     except Exception:
         pass
 
-
 def send_telegram_reply(chat_id: str, message: str) -> None:
     if not TELEGRAM_TOKEN or not chat_id:
         return
@@ -77,16 +108,14 @@ def send_telegram_reply(chat_id: str, message: str) -> None:
     except Exception:
         pass
 
-
 def format_strength_label(score: int) -> str:
-    if score >= 80:
+    if score >= 90:
         return "قوية جدًا"
-    if score >= 65:
+    if score >= 80:
         return "قوية"
-    if score >= 50:
-        return "متوسطة"
+    if score >= 65:
+        return "جيدة"
     return "ضعيفة"
-
 
 def infer_pivot(price: float, pivot: float, signal: str, atr: float) -> float:
     if pivot > 0:
@@ -95,18 +124,17 @@ def infer_pivot(price: float, pivot: float, signal: str, atr: float) -> float:
     offset = max(price * 0.003, atr * 0.25 if atr > 0 else price * 0.002)
     return roundx(price - offset) if signal == "CALL" else roundx(price + offset)
 
-
 def compute_stock_levels(price: float, pivot: float, signal: str, atr: float):
     if atr <= 0:
         atr = max(price * 0.006, 0.5)
 
     if signal == "CALL":
-        stock_stop = roundx(min(pivot, price - atr * 0.75))
+        stock_stop = roundx(pivot)
         t1 = roundx(price + atr * 0.8)
         t2 = roundx(price + atr * 1.5)
         t3 = roundx(price + atr * 2.4)
     else:
-        stock_stop = roundx(max(pivot, price + atr * 0.75))
+        stock_stop = roundx(pivot)
         t1 = roundx(price - atr * 0.8)
         t2 = roundx(price - atr * 1.5)
         t3 = roundx(price - atr * 2.4)
@@ -117,7 +145,6 @@ def compute_stock_levels(price: float, pivot: float, signal: str, atr: float):
         "stock_target2": t2,
         "stock_target3": t3
     }
-
 
 def choose_strike(price: float, signal: str, strength_score: int, budget: float):
     if price < 25:
@@ -132,27 +159,13 @@ def choose_strike(price: float, signal: str, strength_score: int, budget: float)
         step = 10
 
     if signal == "CALL":
-        if strength_score >= 80:
-            raw_strike = price * 1.01
-        elif strength_score >= 65:
-            raw_strike = price * 1.005
-        elif strength_score >= 50:
-            raw_strike = price
-        else:
-            raw_strike = price * 0.995
+        raw_strike = price * 1.01 if strength_score >= 80 else price
     else:
-        if strength_score >= 80:
-            raw_strike = price * 0.99
-        elif strength_score >= 65:
-            raw_strike = price * 0.995
-        elif strength_score >= 50:
-            raw_strike = price
-        else:
-            raw_strike = price * 1.005
+        raw_strike = price * 0.99 if strength_score >= 80 else price
 
     strike = round(raw_strike / step) * step
     distance_pct = abs(strike - price) / max(price, 1)
-    estimated_premium = max(0.6, budget - (distance_pct * 20))
+    estimated_premium = max(0.8, budget - (distance_pct * 20))
     estimated_premium = roundx(min(max(estimated_premium, 0.8), budget))
 
     return {
@@ -161,20 +174,14 @@ def choose_strike(price: float, signal: str, strength_score: int, budget: float)
         "estimated_premium": estimated_premium
     }
 
-
 def compute_option_targets(estimated_premium: float, strength_score: int):
+    # نستعملها في webhook فقط
     if strength_score >= 80:
-        tp1_mult, tp2_mult, tp3_mult = 1.25, 1.55, 1.95
-        stop_mult = 0.72
-    elif strength_score >= 65:
-        tp1_mult, tp2_mult, tp3_mult = 1.20, 1.45, 1.75
         stop_mult = 0.75
-    elif strength_score >= 50:
-        tp1_mult, tp2_mult, tp3_mult = 1.15, 1.35, 1.60
-        stop_mult = 0.78
+        tp1_mult, tp2_mult, tp3_mult = 1.25, 1.55, 1.95
     else:
-        tp1_mult, tp2_mult, tp3_mult = 1.10, 1.25, 1.45
-        stop_mult = 0.82
+        stop_mult = 0.80
+        tp1_mult, tp2_mult, tp3_mult = 1.15, 1.35, 1.60
 
     return {
         "contract_entry": roundx(estimated_premium),
@@ -183,7 +190,6 @@ def compute_option_targets(estimated_premium: float, strength_score: int):
         "contract_target2": roundx(estimated_premium * tp2_mult),
         "contract_target3": roundx(estimated_premium * tp3_mult),
     }
-
 
 def score_signal(data: Dict[str, Any]) -> Dict[str, Any]:
     price = safe_float(data.get("price"))
@@ -276,13 +282,86 @@ def score_signal(data: Dict[str, Any]) -> Dict[str, Any]:
         "reasons": reasons
     }
 
+# =========================
+# قفل الاتجاه
+# =========================
+def update_direction_lock(ticker: str, close_price: float, pivot: float):
+    key = ticker.upper()
 
+    if key not in direction_state:
+        direction_state[key] = {
+            "locked_direction": None,
+            "above_count": 0,
+            "below_count": 0,
+            "last_pivot": pivot,
+            "last_change": None
+        }
+
+    state = direction_state[key]
+    state["last_pivot"] = pivot
+
+    if close_price > pivot:
+        state["above_count"] += 1
+        state["below_count"] = 0
+    elif close_price < pivot:
+        state["below_count"] += 1
+        state["above_count"] = 0
+
+    # إذا كان الاتجاه الحالي كول، ما ينقلب بوت إلا بعد 3 إغلاقات تحت الارتكاز
+    if state["locked_direction"] == "call" and state["below_count"] >= 3:
+        state["locked_direction"] = "put"
+        state["last_change"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # إذا كان الاتجاه الحالي بوت، ما ينقلب كول إلا بعد 3 إغلاقات فوق الارتكاز
+    elif state["locked_direction"] == "put" and state["above_count"] >= 3:
+        state["locked_direction"] = "call"
+        state["last_change"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # لو ما فيه قفل أصلًا، نقدر نثبت بعد 3 إغلاقات متتالية
+    elif state["locked_direction"] is None:
+        if state["above_count"] >= 3:
+            state["locked_direction"] = "call"
+            state["last_change"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        elif state["below_count"] >= 3:
+            state["locked_direction"] = "put"
+            state["last_change"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    return state
+
+def get_locked_direction(ticker: str):
+    key = ticker.upper()
+    if key not in direction_state:
+        return None
+    return direction_state[key].get("locked_direction")
+
+def can_send_signal(ticker: str, requested_direction: str):
+    locked = get_locked_direction(ticker)
+    if locked is None:
+        return True, "no_lock"
+
+    if locked == requested_direction.lower():
+        return True, "matched_lock"
+
+    return False, f"locked_on_{locked}"
+
+# =========================
+# فلترة يومية / منع الإزعاج
+# =========================
 def should_block_signal(ticker: str, signal: str, score: int):
+    reset_daily_tracker_if_needed()
     now = time.time()
 
-    if score < MIN_STRENGTH_TO_SEND:
+    if score < MIN_SCORE_TO_SEND:
         stats["blocked_weak"] += 1
         return True, "weak blocked"
+
+    if daily_tracker["sent_count"] >= MAX_SIGNALS_PER_DAY:
+        stats["blocked_daily_limit"] += 1
+        return True, "daily limit reached"
+
+    if ticker.upper() in daily_tracker["tickers"]:
+        stats["blocked_daily_ticker"] += 1
+        return True, "ticker already sent today"
 
     if ticker in last_signals:
         prev = last_signals[ticker]
@@ -297,7 +376,88 @@ def should_block_signal(ticker: str, signal: str, score: int):
 
     return False, "ok"
 
+# =========================
+# التقرير
+# =========================
+def ensure_report_file():
+    if not os.path.exists(REPORT_FILE):
+        with open(REPORT_FILE, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "id",
+                "ticker",
+                "direction",
+                "direction_ar",
+                "strike",
+                "expiry",
+                "contract",
+                "pivot",
+                "entry_high",
+                "entry_low",
+                "entry_display",
+                "highest_price",
+                "current_price",
+                "profit_pct",
+                "status",
+                "created_at",
+                "updated_at",
+                "closed_at"
+            ])
 
+def refresh_report_file():
+    ensure_report_file()
+
+    with open(REPORT_FILE, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "id",
+            "ticker",
+            "direction",
+            "direction_ar",
+            "strike",
+            "expiry",
+            "contract",
+            "pivot",
+            "entry_high",
+            "entry_low",
+            "entry_display",
+            "highest_price",
+            "current_price",
+            "profit_pct",
+            "status",
+            "created_at",
+            "updated_at",
+            "closed_at"
+        ])
+
+        for _, data in last_drafts.items():
+            writer.writerow([
+                data["id"],
+                data["ticker"],
+                data["direction"],
+                data["direction_ar"],
+                data["strike"],
+                data["expiry"],
+                data["contract"],
+                f'{data["pivot"]:.2f}',
+                f'{data["entry_high"]:.2f}',
+                f'{data["entry_low"]:.2f}',
+                data["entry_display"],
+                f'{data["highest_price"]:.2f}',
+                f'{data["current_price"]:.2f}',
+                f'{data["profit_pct"]:.2f}',
+                data["status"],
+                data["created_at"],
+                data["updated_at"],
+                data["closed_at"]
+            ])
+
+def send_telegram_text(text: str):
+    send_telegram(text)
+
+# =========================
+# الرسالة
+# =========================
 def build_alert_message(payload: Dict[str, Any]) -> str:
     ticker = payload["ticker"]
     signal = payload["signal"]
@@ -323,6 +483,11 @@ def build_alert_message(payload: Dict[str, Any]) -> str:
     reasons = "، ".join(payload["reasons"][:3]) if payload["reasons"] else "مطابقة الشروط"
     direction = "🟢 CALL" if signal == "CALL" else "🔴 PUT"
 
+    if signal == "CALL":
+        stop_text = f"كسر {pivot} بإغلاق ساعة"
+    else:
+        stop_text = f"اختراق {pivot} بإغلاق ساعة"
+
     return f"""🚨 Option Strike Alert
 
 📈 السهم: {ticker}
@@ -343,7 +508,7 @@ def build_alert_message(payload: Dict[str, Any]) -> str:
 🥉 {stock_t3}
 
 🛑 وقف السهم:
-{stock_stop}
+{stop_text}
 
 📈 أهداف العقد:
 🥇 {contract_t1}
@@ -353,7 +518,6 @@ def build_alert_message(payload: Dict[str, Any]) -> str:
 🛑 وقف العقد:
 {contract_stop}
 """
-
 
 async def parse_request_payload(request: Request) -> Dict[str, Any]:
     try:
@@ -369,32 +533,44 @@ async def parse_request_payload(request: Request) -> Dict[str, Any]:
     except Exception:
         return {}
 
-
+# =========================
+# الصفحة الرئيسية
+# =========================
 @app.get("/")
 def home():
     return {"status": "Option Strike Bot running"}
 
-
 @app.get("/status")
 def status():
+    reset_daily_tracker_if_needed()
     return {
         "status": "running",
         "stats": stats,
-        "tracked_symbols": len(last_signals)
+        "tracked_symbols": len(last_signals),
+        "daily_tracker": daily_tracker,
+        "direction_state": direction_state
     }
-
 
 @app.get("/last")
 def last():
     return {"last_signal": last_signal_message}
-
 
 @app.get("/test")
 def test():
     send_telegram("🔥 البوت شغال بنجاح!")
     return {"status": "ok"}
 
+# =========================
+# اختبار قفل الاتجاه يدويًا
+# =========================
+@app.get("/lock/{ticker}/{pivot}/{close_price}")
+def lock_direction(ticker: str, pivot: float, close_price: float):
+    state = update_direction_lock(ticker, close_price, pivot)
+    return state
 
+# =========================
+# Webhook TradingView
+# =========================
 @app.post("/webhook")
 async def webhook(request: Request):
     global last_signal_message
@@ -430,11 +606,18 @@ async def webhook(request: Request):
     atr = safe_float(data.get("atr"))
     pivot = infer_pivot(price, safe_float(data.get("pivot")), signal, atr)
 
+    # تحديث قفل الاتجاه بناءً على الإغلاق الحالي بالنسبة للارتكاز
+    update_direction_lock(ticker, price, pivot)
+
+    allowed, lock_reason = can_send_signal(ticker, signal.lower())
+    if not allowed:
+        stats["blocked_direction_lock"] += 1
+        return {"status": f"direction locked on {get_locked_direction(ticker)}"}
+
     stock_levels = compute_stock_levels(price, pivot, signal, atr)
 
     budget = safe_float(data.get("budget"), DEFAULT_CONTRACT_BUDGET)
     strike_info = choose_strike(price, signal, strength_score, budget)
-
     option_levels = compute_option_targets(strike_info["estimated_premium"], strength_score)
 
     last_signals[ticker] = {
@@ -443,6 +626,16 @@ async def webhook(request: Request):
         "score": strength_score,
         "price": price
     }
+
+    # إذا ما فيه اتجاه مثبت للسهم، ثبت أول اتجاه بعد أول إرسال ناجح
+    if get_locked_direction(ticker) is None:
+        direction_state[ticker] = {
+            "locked_direction": signal.lower(),
+            "above_count": 1 if signal == "CALL" else 0,
+            "below_count": 1 if signal == "PUT" else 0,
+            "last_pivot": pivot,
+            "last_change": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
 
     payload = {
         "ticker": ticker,
@@ -463,14 +656,21 @@ async def webhook(request: Request):
     send_telegram(message)
     stats["sent"] += 1
 
+    reset_daily_tracker_if_needed()
+    daily_tracker["sent_count"] += 1
+    daily_tracker["tickers"].append(ticker.upper())
+
     return {
         "status": "sent",
         "strength_score": strength_score,
         "strength_label": strength_label,
-        "strike": strike_info["strike"]
+        "strike": strike_info["strike"],
+        "pivot": pivot
     }
 
-
+# =========================
+# Telegram webhook
+# =========================
 @app.post("/telegram")
 async def telegram_webhook(request: Request):
     global last_signal_message
@@ -489,7 +689,7 @@ async def telegram_webhook(request: Request):
             send_telegram_reply(
                 chat_id,
                 "🔥 أهلاً بك في Option Strike Bot\n\n"
-                "الأوامر المتاحة:\n"
+                "الأوامر:\n"
                 "/help\n"
                 "/status\n"
                 "/last"
@@ -503,7 +703,9 @@ async def telegram_webhook(request: Request):
                 "- السترايك المقترح\n"
                 "- أهداف ووقف السهم\n"
                 "- أهداف ووقف العقد\n"
-                "- فلترة ذكية ومنع تضارب"
+                "- فلترة 80%+\n"
+                "- حد أقصى 5 فرص يوميًا\n"
+                "- قفل اتجاه بعد 3 إغلاقات ساعة"
             )
 
         elif text == "/status":
@@ -513,7 +715,8 @@ async def telegram_webhook(request: Request):
                 f"الإشارات المرسلة: {stats['sent']}\n"
                 f"ممنوع تكرار: {stats['blocked_duplicate']}\n"
                 f"ممنوع تضارب: {stats['blocked_conflict']}\n"
-                f"مرفوضة لضعفها: {stats['blocked_weak']}"
+                f"مرفوضة لضعفها: {stats['blocked_weak']}\n"
+                f"مرفوضة بسبب القفل: {stats['blocked_direction_lock']}"
             )
 
         elif text == "/last":
@@ -526,7 +729,11 @@ async def telegram_webhook(request: Request):
         pass
 
     return {"ok": True}
-@app.get("/test")
+
+# =========================
+# اختبارات بيانات
+# =========================
+@app.get("/test_polygon")
 def test_polygon():
     url = "https://api.polygon.io/v2/aggs/ticker/AAPL/prev"
     res = requests.get(url, params={"apiKey": API_KEY}, timeout=20)
@@ -535,10 +742,11 @@ def test_polygon():
         "status": res.status_code,
         "data": res.json()
     }
+
 @app.get("/options/{ticker}")
 def get_options(ticker: str):
     url = "https://api.polygon.io/v3/reference/options/contracts"
-    
+
     res = requests.get(url, params={
         "underlying_ticker": ticker.upper(),
         "limit": 50,
@@ -546,10 +754,47 @@ def get_options(ticker: str):
     }, timeout=20)
 
     return res.json()
+
+# =========================
+# اختيار عقد ذكي
+# =========================
+def get_yahoo_stock_price(ticker: str):
+    price_url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker.upper()}"
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    price_res = requests.get(price_url, headers=headers, timeout=20)
+
+    if price_res.status_code != 200:
+        return None
+
+    try:
+        price_data = price_res.json()
+    except Exception:
+        return None
+
+    chart = price_data.get("chart", {})
+    result = chart.get("result", [])
+
+    if not result:
+        return None
+
+    meta = result[0].get("meta", {})
+    current_price = meta.get("regularMarketPrice", 0)
+
+    if not current_price:
+        return None
+
+    return float(current_price)
+
+def nearest_friday():
+    today = datetime.now().date()
+    days_ahead = (4 - today.weekday()) % 7
+    if days_ahead == 0:
+        return today.strftime("%Y-%m-%d")
+    return (today + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+
 @app.get("/smart/{ticker}/{direction}")
 def smart_contract(ticker: str, direction: str):
-    import datetime
-
     url = "https://api.polygon.io/v3/reference/options/contracts"
 
     res = requests.get(url, params={
@@ -565,53 +810,34 @@ def smart_contract(ticker: str, direction: str):
         if c["contract_type"] == direction.lower()
     ]
 
+    current_price = get_yahoo_stock_price(ticker)
+
+    # fallback إذا ما قدرنا نجيب السعر
+    if not current_price:
+        current_price = 100.0
+
+    # fallback إذا ما فيه عقود
+    if not filtered:
+        if direction.lower() == "call":
+            strike = round(current_price)
+        else:
+            strike = round(current_price)
+
+        return {
+            "ticker": ticker.upper(),
+            "type": direction.lower(),
+            "strike": strike,
+            "expiry": nearest_friday(),
+            "contract": f"FALLBACK_{ticker.upper()}_{direction.upper()}",
+            "current_price": current_price,
+            "option_price": None,
+            "bid": None,
+            "ask": None,
+            "fallback": True
+        }
+
     filtered.sort(key=lambda x: x["expiration_date"])
 
-    if not filtered:
-        return {"error": "no contracts"}
-
-# نجيب سعر السهم الحالي من Yahoo Finance
-    price_url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker.upper()}"
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
-
-    price_res = requests.get(price_url, headers=headers, timeout=20)
-
-    if price_res.status_code != 200:
-        return {
-            "error": "failed to fetch price from yahoo",
-            "status_code": price_res.status_code,
-            "response_text": price_res.text[:300]
-        }
-
-    try:
-        price_data = price_res.json()
-    except Exception:
-        return {
-            "error": "yahoo did not return json",
-            "response_text": price_res.text[:300]
-        }
-
-    chart = price_data.get("chart", {})
-    result = chart.get("result", [])
-
-    if not result:
-        return {
-            "error": "could not get current stock price",
-            "price_data": price_data
-        }
-
-    meta = result[0].get("meta", {})
-    current_price = meta.get("regularMarketPrice", 0)
-
-    if not current_price:
-        return {
-            "error": "no market price found",
-            "meta": meta
-        }
-
-    # نختار أقرب سترايك للسعر
     best = min(
         filtered,
         key=lambda x: abs(x["strike_price"] - current_price)
@@ -623,171 +849,49 @@ def smart_contract(ticker: str, direction: str):
         "strike": best["strike_price"],
         "expiry": best["expiration_date"],
         "contract": best["ticker"],
-        "current_price": current_price
+        "current_price": current_price,
+        "option_price": None,
+        "bid": None,
+        "ask": None,
+        "fallback": False
     }
+
+# =========================
+# Draft / Send / Contract / Update / Report
+# =========================
 @app.get("/draft/{ticker}/{direction}")
-def draft_signal(ticker: str, direction: str):
+def draft_signal(ticker: str, direction: str, pivot: float = 0.0):
     smart = smart_contract(ticker, direction)
 
+    # فحص قفل الاتجاه حتى في الطرح اليدوي
+    allowed, reason = can_send_signal(ticker, direction.lower())
+    if not allowed:
+        return PlainTextResponse(f"الإشارة مرفوضة: الاتجاه مقفل على {get_locked_direction(ticker)}")
+
     if smart.get("error"):
-        return smart
-
-    strike = smart["strike"]
-    expiry = smart["expiry"]
-
-    contract_type = "كول (CALL)" if direction.lower() == "call" else "بوت (PUT)"
-    icon = "🟢" if direction.lower() == "call" else "🔴"
-
-    option_price = smart.get("option_price")
-
-    if option_price:
-        entry_high = round(float(option_price), 2)
-        entry_low = round(max(entry_high - 0.30, 0.01), 2)
-
-        tp1 = round(entry_high + 0.60, 2)
-        tp2 = round(entry_high + 1.20, 2)
-        tp3 = round(entry_high + 2.00, 2)
+        strike = 0
+        expiry = datetime.now().strftime("%Y-%m-%d")
+        contract = "N/A"
+        current_price = 100.0
+        option_price = None
+        bid = None
+        ask = None
     else:
-        entry_high = 2.50
-        entry_low = 2.10
-
-        tp1 = 3.10
-        tp2 = 3.70
-        tp3 = 4.50
-
-    text = f"""🆕 طرح جديد | {ticker.upper()}
-
-{icon} النوع: {contract_type}
-🎯 السترايك: ${strike}
-📅 التاريخ: {expiry}
-
-💰 أسعار التنفيذ:
-{entry_high} – {entry_low}
-
-📈 الأهداف:
-🥇 الهدف الأول: {tp1}
-🥈 الهدف الثاني: {tp2}
-🥉 الهدف الثالث: {tp3}
-
-🛑 الوقف:
-كسر الارتكاز بإغلاق ساعة = خروج ❌
-
-⚠️ تنبيه: هذا الطرح تعليمي وليس توصية استثمارية، والقرار النهائي يعود للمتداول.
-
-📢 @Option_Strike01"""
-def ensure_report_file():
-    if not os.path.exists(REPORT_FILE):
-        with open(REPORT_FILE, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                "id",
-                "ticker",
-                "direction",
-                "direction_ar",
-                "strike",
-                "expiry",
-                "contract",
-                "entry_high",
-                "entry_low",
-                "entry_display",
-                "highest_price",
-                "profit_pct",
-                "created_at",
-                "updated_at"
-            ])
-
-
-def save_trade_record(data: dict):
-    ensure_report_file()
-
-    with open(REPORT_FILE, "a", newline="", encoding="utf-8-sig") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            data["id"],
-            data["ticker"],
-            data["direction"],
-            data["direction_ar"],
-            data["strike"],
-            data["expiry"],
-            data["contract"],
-            f'{data["entry_high"]:.2f}',
-            f'{data["entry_low"]:.2f}',
-            data["entry_display"],
-            f'{data["highest_price"]:.2f}',
-            f'{data["profit_pct"]:.2f}',
-            data["created_at"],
-            data["updated_at"]
-        ])
-
-
-def refresh_report_file():
-    ensure_report_file()
-
-    with open(REPORT_FILE, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "id",
-            "ticker",
-            "direction",
-            "direction_ar",
-            "strike",
-            "expiry",
-            "contract",
-            "entry_high",
-            "entry_low",
-            "entry_display",
-            "highest_price",
-            "profit_pct",
-            "created_at",
-            "updated_at"
-        ])
-
-        for _, data in last_drafts.items():
-            writer.writerow([
-                data["id"],
-                data["ticker"],
-                data["direction"],
-                data["direction_ar"],
-                data["strike"],
-                data["expiry"],
-                data["contract"],
-                f'{data["entry_high"]:.2f}',
-                f'{data["entry_low"]:.2f}',
-                data["entry_display"],
-                f'{data["highest_price"]:.2f}',
-                f'{data["profit_pct"]:.2f}',
-                data["created_at"],
-                data["updated_at"]
-            ])
-
-
-def send_telegram_text(text: str):
-    telegram_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(telegram_url, json={
-        "chat_id": CHAT_ID,
-        "text": text
-    }, timeout=20)
-
-
-@app.get("/draft/{ticker}/{direction}")
-def draft_signal(ticker: str, direction: str):
-    smart = smart_contract(ticker, direction)
-
-    if smart.get("error"):
-        return PlainTextResponse(str(smart))
-
-    strike = smart["strike"]
-    expiry = smart["expiry"]
-    contract = smart["contract"]
-    current_price = smart.get("current_price")
-    option_price = smart.get("option_price")
-    bid = smart.get("bid")
-    ask = smart.get("ask")
+        strike = smart["strike"]
+        expiry = smart["expiry"]
+        contract = smart["contract"]
+        current_price = safe_float(smart.get("current_price"), 100.0)
+        option_price = smart.get("option_price")
+        bid = smart.get("bid")
+        ask = smart.get("ask")
 
     is_call = direction.lower() == "call"
     contract_type = "كول (CALL)" if is_call else "بوت (PUT)"
     direction_ar = "كول" if is_call else "بوت"
     icon = "🟢" if is_call else "🔴"
+
+    # لو ما جاء pivot من الرابط نستخدم سعر السهم الحالي كتقدير
+    pivot_value = roundx(pivot) if pivot > 0 else roundx(current_price)
 
     # سعر الدخول الأعلى = سعر العقد لو موجود، وإلا 2.50
     if option_price:
@@ -803,6 +907,11 @@ def draft_signal(ticker: str, direction: str):
     tp2 = round(entry_high + 1.20, 2)
     tp3 = round(entry_high + 2.00, 2)
 
+    if is_call:
+        stop_text = f"كسر {pivot_value:.2f} بإغلاق ساعة = خروج ❌"
+    else:
+        stop_text = f"اختراق {pivot_value:.2f} بإغلاق ساعة = خروج ❌"
+
     text = f"""🆕 طرح جديد | {ticker.upper()}
 
 {icon} النوع: {contract_type}
@@ -817,7 +926,7 @@ def draft_signal(ticker: str, direction: str):
 🥉 الهدف الثالث: {tp3:.2f}
 
 🛑 الوقف:
-كسر الارتكاز بإغلاق ساعة = خروج ❌
+{stop_text}
 
 ⚠️ تنبيه: هذا الطرح تعليمي وليس توصية استثمارية، والقرار النهائي يعود للمتداول.
 
@@ -834,7 +943,8 @@ def draft_signal(ticker: str, direction: str):
         "strike": strike,
         "expiry": expiry,
         "contract": contract,
-        "current_price": current_price,
+        "pivot": pivot_value,
+        "current_price": float(entry_high),
         "option_price": option_price,
         "bid": bid,
         "ask": ask,
@@ -846,28 +956,23 @@ def draft_signal(ticker: str, direction: str):
         "tp3": tp3,
         "highest_price": entry_high,
         "profit_pct": 0.0,
+        "status": "OPEN",
         "created_at": now_str,
         "updated_at": now_str,
+        "closed_at": "",
         "message": text
     }
 
-    # إذا كانت الصفقة موجودة من قبل، يحدثها؛ إذا لا، يسجلها جديدة
-    is_new_trade = key not in last_drafts
     last_drafts[key] = trade_data
+    refresh_report_file()
 
-    if is_new_trade:
-        save_trade_record(trade_data)
-    else:
-        refresh_report_file()
-
-    send_telegram_text(text)
     return PlainTextResponse(text)
 
-
 @app.get("/send/{ticker}/{direction}")
-def send_signal(ticker: str, direction: str):
-    return draft_signal(ticker, direction)
-
+def send_signal(ticker: str, direction: str, pivot: float = 0.0):
+    text_response = draft_signal(ticker, direction, pivot)
+    send_telegram_text(text_response.body.decode("utf-8"))
+    return text_response
 
 @app.get("/contract/{ticker}/{direction}")
 def contract_info(ticker: str, direction: str):
@@ -886,35 +991,49 @@ def contract_info(ticker: str, direction: str):
         "current_price": smart.get("current_price"),
         "option_price": smart.get("option_price"),
         "bid": smart.get("bid"),
-        "ask": smart.get("ask")
+        "ask": smart.get("ask"),
+        "fallback": smart.get("fallback", False)
     }
 
-
 @app.get("/update/{ticker}/{direction}/{entry}/{current}")
-def update_signal(ticker: str, direction: str, entry: float, current: float):
+def update_signal(
+    ticker: str,
+    direction: str,
+    entry: float,
+    current: float,
+    status: str = "OPEN"
+):
     key = f"{ticker.upper()}_{direction.lower()}"
     saved = last_drafts.get(key)
 
     if not saved:
-        return PlainTextResponse("لا يوجد طرح محفوظ لهذا السهم/الاتجاه. نفذ /draft أولاً.")
+        return PlainTextResponse("لا يوجد طرح محفوظ لهذا السهم/الاتجاه. نفذ /draft أو /send أولاً.")
 
     strike = saved["strike"]
     direction_ar = saved["direction_ar"]
 
     highest_price = max(float(saved.get("highest_price", entry)), float(current))
-    profit_pct = round(((highest_price - entry) / entry) * 100, 2)
+    profit_pct = round(((current - entry) / entry) * 100, 2)
 
     saved["highest_price"] = round(highest_price, 2)
+    saved["current_price"] = round(float(current), 2)
     saved["profit_pct"] = profit_pct
     saved["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    saved["status"] = status.upper()
+
+    if status.upper() in ["WIN", "LOSS", "STOPPED", "CANCELLED"]:
+        saved["closed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     refresh_report_file()
+
+    current_label = "الأعلى المحقق" if current >= entry else "السعر الحالي"
 
     text = f"""🔔 تحديث | {ticker.upper()} ${strike} {direction_ar}
 
 📊 سعر الدخول: {entry:.2f}
-💰 الأعلى المحقق: {highest_price:.2f}
-📈 نسبة الربح: +{profit_pct:.2f}%
+💰 {current_label}: {current:.2f}
+📈 نسبة الربح: {profit_pct:+.2f}%
+📌 الحالة: {saved["status"]}
 
 ⚠️ تنبيه: هذا الطرح تعليمي
 والقرار النهائي يعود للمتداول.
@@ -923,7 +1042,6 @@ def update_signal(ticker: str, direction: str, entry: float, current: float):
 
     send_telegram_text(text)
     return PlainTextResponse(text)
-
 
 @app.get("/lastdraft/{ticker}/{direction}")
 def last_draft(ticker: str, direction: str):
@@ -934,7 +1052,6 @@ def last_draft(ticker: str, direction: str):
         return {"error": "no saved draft"}
 
     return saved
-
 
 @app.get("/report")
 def report_view():
@@ -948,8 +1065,6 @@ def report_view():
 
     return PlainTextResponse(content)
 
-
 @app.get("/report/json")
 def report_json():
     return last_drafts
-    
