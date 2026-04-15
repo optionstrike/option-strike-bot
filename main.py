@@ -622,3 +622,67 @@ def smart_contract(ticker: str, direction: str):
         "contract": best["ticker"],
         "current_price": current_price
     }
+@app.get("/draft/{ticker}/{direction}")
+def draft_signal(ticker: str, direction: str):
+    # أول شيء: نجيب العقد الذكي
+    smart = smart_contract(ticker, direction)
+
+    if smart.get("error"):
+        return smart
+
+    strike = smart["strike"]
+    expiry = smart["expiry"]
+    contract_type = "كول (CALL)" if direction.lower() == "call" else "بوت (PUT)"
+    icon = "🟢" if direction.lower() == "call" else "🔴"
+
+    # نحاول نجيب سعر العقد إذا موجود
+    option_price = smart.get("option_price")
+    bid = smart.get("bid")
+    ask = smart.get("ask")
+
+    if option_price:
+        entry_high = round(float(option_price), 2)
+        entry_low = round(max(entry_high - 0.30, 0.01), 2)
+
+        tp1 = round(entry_high + 0.60, 2)
+        tp2 = round(entry_high + 1.20, 2)
+        tp3 = round(entry_high + 2.00, 2)
+    else:
+        entry_high = 2.50
+        entry_low = 2.10
+
+        tp1 = 3.10
+        tp2 = 3.70
+        tp3 = 4.50
+
+    text = f"""🆕 طرح جديد | {ticker.upper()}
+
+{icon} النوع: {contract_type}
+🎯 السترايك: ${strike}
+📅 التاريخ: {expiry}
+
+💰 أسعار التنفيذ:
+{entry_high} – {entry_low}
+
+📈 الأهداف:
+🥇 الهدف الأول: {tp1}
+🥈 الهدف الثاني: {tp2}
+🥉 الهدف الثالث: {tp3}
+
+🛑 الوقف:
+كسر الارتكاز بإغلاق ساعة = خروج ❌
+
+⚠️ تنبيه: هذا الطرح تعليمي وليس توصية استثمارية، والقرار النهائي يعود للمتداول.
+
+📢 @Option_Strike01"""
+
+    return {
+        "ticker": ticker.upper(),
+        "direction": direction.lower(),
+        "contract": smart["contract"],
+        "current_price": smart.get("current_price"),
+        "option_price": option_price,
+        "bid": bid,
+        "ask": ask,
+        "message": text
+    }
