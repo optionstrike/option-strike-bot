@@ -567,12 +567,17 @@ def smart_contract(ticker: str, direction: str):
     if not filtered:
         return {"error": "no contracts"}
 
- # نجيب سعر السهم الحالي
-    price_url = f"https://api.polygon.io/v2/last/trade/{ticker.upper()}"
-    price_res = requests.get(price_url, params={"apiKey": API_KEY}, timeout=20)
+ # نجيب سعر السهم الحالي من Yahoo Finance
+    price_url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker.upper()}"
+    price_res = requests.get(price_url, timeout=20)
     price_data = price_res.json()
 
-    current_price = price_data.get("results", {}).get("p", 0)
+    result = price_data.get("chart", {}).get("result", [])
+    if not result:
+        return {"error": "could not get current stock price", "price_data": price_data}
+
+    meta = result[0].get("meta", {})
+    current_price = meta.get("regularMarketPrice", 0)
 
     if not current_price:
         return {"error": "could not get current stock price", "price_data": price_data}
@@ -589,4 +594,4 @@ def smart_contract(ticker: str, direction: str):
         "strike": best["strike_price"],
         "expiry": best["expiration_date"],
         "contract": best["ticker"]
-    } 
+    }
