@@ -7,7 +7,7 @@ import json
 from typing import Dict, Any, Optional
 
 app = FastAPI()
-
+API_KEY = "zgd0qCw0OW5HNLXhuMC6jN1rjIpQQuzU"
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8619465902:AAHPP9AFiL0fV1lejKtaThLlQ4qZ6qCYgX0").strip()
 CHAT_ID = os.getenv("CHAT_ID", "8371374055").strip()
 SECRET_KEY = os.getenv("SECRET_KEY", "12345").strip()
@@ -523,3 +523,12 @@ async def telegram_webhook(request: Request):
         pass
 
     return {"ok": True}
+@app.get("/test")
+def test_polygon():
+    url = "https://api.polygon.io/v2/aggs/ticker/AAPL/prev"
+    res = requests.get(url, params={"apiKey": API_KEY}, timeout=20)
+
+    return {
+        "status": res.status_code,
+        "data": res.json()
+    }
