@@ -567,20 +567,46 @@ def smart_contract(ticker: str, direction: str):
     if not filtered:
         return {"error": "no contracts"}
 
- # نجيب سعر السهم الحالي من Yahoo Finance
+# نجيب سعر السهم الحالي من Yahoo Finance
     price_url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker.upper()}"
-    price_res = requests.get(price_url, timeout=20)
-    price_data = price_res.json()
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
 
-    result = price_data.get("chart", {}).get("result", [])
+    price_res = requests.get(price_url, headers=headers, timeout=20)
+
+    if price_res.status_code != 200:
+        return {
+            "error": "failed to fetch price from yahoo",
+            "status_code": price_res.status_code,
+            "response_text": price_res.text[:300]
+        }
+
+    try:
+        price_data = price_res.json()
+    except Exception:
+        return {
+            "error": "yahoo did not return json",
+            "response_text": price_res.text[:300]
+        }
+
+    chart = price_data.get("chart", {})
+    result = chart.get("result", [])
+
     if not result:
-        return {"error": "could not get current stock price", "price_data": price_data}
+        return {
+            "error": "could not get current stock price",
+            "price_data": price_data
+        }
 
     meta = result[0].get("meta", {})
     current_price = meta.get("regularMarketPrice", 0)
 
     if not current_price:
-        return {"error": "could not get current stock price", "price_data": price_data}
+        return {
+            "error": "no market price found",
+            "meta": meta
+        }
 
     # نختار أقرب سترايك للسعر
     best = min(
@@ -593,5 +619,6 @@ def smart_contract(ticker: str, direction: str):
         "type": best["contract_type"],
         "strike": best["strike_price"],
         "expiry": best["expiration_date"],
-        "contract": best["ticker"]
+        "contract": best["ticker"],
+        "current_price": current_price
     }
