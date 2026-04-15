@@ -524,3 +524,10 @@ async def telegram_webhook(request: Request):
         pass
 
     return {"ok": True}
+return {"ok": True}
+
+
+@app.get("/test")
+def test():
+    send_telegram("🔥 البوت شغال بنجاح!")
+    return {"status": "ok"}
