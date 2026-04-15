@@ -543,3 +543,36 @@ def get_options(ticker: str):
     }, timeout=20)
 
     return res.json()
+@app.get("/smart/{ticker}/{direction}")
+def smart_contract(ticker: str, direction: str):
+    import datetime
+
+    url = "https://api.polygon.io/v3/reference/options/contracts"
+
+    res = requests.get(url, params={
+        "underlying_ticker": ticker.upper(),
+        "limit": 100,
+        "apiKey": API_KEY
+    }, timeout=20)
+
+    data = res.json().get("results", [])
+
+    filtered = [
+        c for c in data
+        if c["contract_type"] == direction.lower()
+    ]
+
+    filtered.sort(key=lambda x: x["expiration_date"])
+
+    if not filtered:
+        return {"error": "no contracts"}
+
+    best = filtered[0]
+
+    return {
+        "ticker": ticker.upper(),
+        "type": best["contract_type"],
+        "strike": best["strike_price"],
+        "expiry": best["expiration_date"],
+        "contract": best["ticker"]
+    }
