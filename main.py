@@ -2,7 +2,6 @@ from fastapi import FastAPI, Request
 import requests
 import os
 import time
-import math
 from typing import Dict, Any, Optional
 
 app = FastAPI()
@@ -12,10 +11,10 @@ CHAT_ID = os.getenv("CHAT_ID", "").strip()
 SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
 
 # إعدادات قابلة للتعديل من Render
-DUPLICATE_WINDOW_SEC = int(os.getenv("DUPLICATE_WINDOW_SEC", "300"))   # منع تكرار 5 دقائق
-CONFLICT_WINDOW_SEC = int(os.getenv("CONFLICT_WINDOW_SEC", "300"))     # منع تضارب 5 دقائق
-MIN_STRENGTH_TO_SEND = int(os.getenv("MIN_STRENGTH_TO_SEND", "40"))    # أقل قوة للإرسال
-DEFAULT_CONTRACT_BUDGET = float(os.getenv("DEFAULT_CONTRACT_BUDGET", "3.0"))  # ميزانية العقد
+DUPLICATE_WINDOW_SEC = int(os.getenv("DUPLICATE_WINDOW_SEC", "300"))
+CONFLICT_WINDOW_SEC = int(os.getenv("CONFLICT_WINDOW_SEC", "300"))
+MIN_STRENGTH_TO_SEND = int(os.getenv("MIN_STRENGTH_TO_SEND", "40"))
+DEFAULT_CONTRACT_BUDGET = float(os.getenv("DEFAULT_CONTRACT_BUDGET", "3.0"))
 ROUND_TO = int(os.getenv("ROUND_TO", "2"))
 
 # ذاكرة بسيطة داخلية
@@ -29,8 +28,10 @@ stats = {
     "blocked_secret": 0,
 }
 
+
 def roundx(value: float) -> float:
     return round(value, ROUND_TO)
+
 
 def safe_float(value, default=0.0) -> float:
     try:
@@ -40,9 +41,11 @@ def safe_float(value, default=0.0) -> float:
     except Exception:
         return default
 
+
 def send_telegram(message: str) -> None:
     if not TELEGRAM_TOKEN or not CHAT_ID:
         return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     data = {
         "chat_id": CHAT_ID,
@@ -53,9 +56,11 @@ def send_telegram(message: str) -> None:
     except Exception:
         pass
 
+
 def send_telegram_reply(chat_id: str, message: str) -> None:
     if not TELEGRAM_TOKEN or not chat_id:
         return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     data = {
         "chat_id": chat_id,
@@ -66,6 +71,7 @@ def send_telegram_reply(chat_id: str, message: str) -> None:
     except Exception:
         pass
 
+
 def format_strength_label(score: int) -> str:
     if score >= 80:
         return "قوية جدًا"
@@ -75,15 +81,16 @@ def format_strength_label(score: int) -> str:
         return "متوسطة"
     return "ضعيفة"
 
+
 def infer_pivot(price: float, pivot: float, signal: str, atr: float) -> float:
-    # إذا ما وصل pivot من TradingView نعطي Pivot تقريبي
     if pivot > 0:
-        return pivot
+        return roundx(pivot)
+
     offset = max(price * 0.003, atr * 0.25 if atr > 0 else price * 0.002)
     return roundx(price - offset) if signal == "CALL" else roundx(price + offset)
 
+
 def compute_stock_levels(price: float, pivot: float, signal: str, atr: float):
-    # لو ما وصل ATR نستخدم نسبة تقريبية
     if atr <= 0:
         atr = max(price * 0.006, 0.5)
 
@@ -105,13 +112,8 @@ def compute_stock_levels(price: float, pivot: float, signal: str, atr: float):
         "stock_target3": t3
     }
 
+
 def choose_strike(price: float, signal: str, strength_score: int, budget: float):
-    """
-    اختيار ذكي مبدئي للسترايك:
-    - قوة أعلى = يسمح بابتعاد بسيط OTM
-    - قوة أقل = أقرب إلى السعر أو ITM خفيف
-    """
-    # تقريب السترايك حسب مستوى السعر
     if price < 25:
         step = 0.5
     elif price < 100:
@@ -143,9 +145,6 @@ def choose_strike(price: float, signal: str, strength_score: int, budget: float)
             raw_strike = price * 1.005
 
     strike = round(raw_strike / step) * step
-
-    # تقدير سعر عقد مبدئي وليس حقيقي
-    # كلما ابتعد السترايك تقل التكلفة التقريبية
     distance_pct = abs(strike - price) / max(price, 1)
     estimated_premium = max(0.6, budget - (distance_pct * 20))
     estimated_premium = roundx(min(max(estimated_premium, 0.8), budget))
@@ -156,10 +155,8 @@ def choose_strike(price: float, signal: str, strength_score: int, budget: float)
         "estimated_premium": estimated_premium
     }
 
+
 def compute_option_targets(estimated_premium: float, strength_score: int):
-    """
-    أهداف العقد كنسب ربح تقريبية
-    """
     if strength_score >= 80:
         tp1_mult, tp2_mult, tp3_mult = 1.25, 1.55, 1.95
         stop_mult = 0.72
@@ -181,17 +178,8 @@ def compute_option_targets(estimated_premium: float, strength_score: int):
         "contract_target3": roundx(estimated_premium * tp3_mult),
     }
 
+
 def score_signal(data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    يحسب قوة الإشارة من 100
-    يعتمد على:
-    - بعد السعر عن الارتكاز
-    - حجم نسبي
-    - RSI
-    - EMA alignment
-    - ATR
-    - signal_confidence القادمة من TradingView لو موجودة
-    """
     price = safe_float(data.get("price"))
     signal = str(data.get("signal", "")).upper()
     pivot = safe_float(data.get("pivot"))
@@ -205,7 +193,6 @@ def score_signal(data: Dict[str, Any]) -> Dict[str, Any]:
     reasons = []
     score = 50
 
-    # Pivot distance
     if pivot > 0 and price > 0:
         dist_pct = abs(price - pivot) / price
         if dist_pct >= 0.008:
@@ -218,7 +205,6 @@ def score_signal(data: Dict[str, Any]) -> Dict[str, Any]:
             score -= 8
             reasons.append("السعر قريب من الارتكاز")
 
-    # RSI
     if signal == "CALL":
         if rsi >= 60:
             score += 10
@@ -240,7 +226,6 @@ def score_signal(data: Dict[str, Any]) -> Dict[str, Any]:
             score -= 10
             reasons.append("RSI غير داعم")
 
-    # Relative volume
     if rel_volume >= 1.5:
         score += 10
         reasons.append("حجم تداول قوي")
@@ -251,7 +236,6 @@ def score_signal(data: Dict[str, Any]) -> Dict[str, Any]:
         score -= 6
         reasons.append("حجم تداول ضعيف")
 
-    # EMA alignment
     if ema_fast > 0 and ema_slow > 0:
         if signal == "CALL":
             if ema_fast > ema_slow:
@@ -268,12 +252,10 @@ def score_signal(data: Dict[str, Any]) -> Dict[str, Any]:
                 score -= 8
                 reasons.append("EMA غير داعم للبوت")
 
-    # ATR presence
     if atr > 0:
         score += 4
         reasons.append("ATR متوفر للحساب")
 
-    # signal_confidence من TradingView لو موجود 0-100
     if signal_confidence > 0:
         extra = int((signal_confidence - 50) * 0.25)
         score += extra
@@ -288,13 +270,8 @@ def score_signal(data: Dict[str, Any]) -> Dict[str, Any]:
         "reasons": reasons
     }
 
+
 def should_block_signal(ticker: str, signal: str, score: int):
-    """
-    فلترة:
-    - منع ضعيف جدًا
-    - منع تكرار
-    - منع تضارب سريع
-    """
     now = time.time()
 
     if score < MIN_STRENGTH_TO_SEND:
@@ -304,17 +281,16 @@ def should_block_signal(ticker: str, signal: str, score: int):
     if ticker in last_signals:
         prev = last_signals[ticker]
 
-        # تكرار نفس الإشارة
         if prev["signal"] == signal and (now - prev["time"] < DUPLICATE_WINDOW_SEC):
             stats["blocked_duplicate"] += 1
             return True, "duplicate blocked"
 
-        # تضارب خلال نفس النافذة
         if prev["signal"] != signal and (now - prev["time"] < CONFLICT_WINDOW_SEC):
             stats["blocked_conflict"] += 1
             return True, "conflict blocked"
 
     return False, "ok"
+
 
 def build_alert_message(payload: Dict[str, Any]) -> str:
     ticker = payload["ticker"]
@@ -340,7 +316,6 @@ def build_alert_message(payload: Dict[str, Any]) -> str:
     contract_t3 = payload["contract_target3"]
 
     reasons = "، ".join(payload["reasons"][:3]) if payload["reasons"] else "مطابقة الشروط"
-
     direction = "🟢 CALL" if signal == "CALL" else "🔴 PUT"
 
     return f"""🚨 Option Strike Alert
@@ -374,9 +349,11 @@ def build_alert_message(payload: Dict[str, Any]) -> str:
 {contract_stop}
 """
 
+
 @app.get("/")
 def home():
     return {"status": "Option Strike Bot running"}
+
 
 @app.get("/status")
 def status():
@@ -386,9 +363,17 @@ def status():
         "tracked_symbols": len(last_signals)
     }
 
+
 @app.get("/last")
 def last():
     return {"last_signal": last_signal_message}
+
+
+@app.get("/test")
+def test():
+    send_telegram("🔥 البوت شغال بنجاح!")
+    return {"status": "ok"}
+
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -408,13 +393,11 @@ async def webhook(request: Request):
     if not ticker or signal not in ["CALL", "PUT"] or price <= 0:
         return {"error": "Invalid payload"}
 
-    # حساب القوة
     score_data = score_signal(data)
     strength_score = score_data["strength_score"]
     strength_label = score_data["strength_label"]
     reasons = score_data["reasons"]
 
-    # فلترة
     blocked, reason = should_block_signal(ticker, signal, strength_score)
     if blocked:
         return {"status": reason}
@@ -422,17 +405,13 @@ async def webhook(request: Request):
     atr = safe_float(data.get("atr"))
     pivot = infer_pivot(price, safe_float(data.get("pivot")), signal, atr)
 
-    # أهداف ووقف السهم
     stock_levels = compute_stock_levels(price, pivot, signal, atr)
 
-    # اختيار السترايك
     budget = safe_float(data.get("budget"), DEFAULT_CONTRACT_BUDGET)
     strike_info = choose_strike(price, signal, strength_score, budget)
 
-    # أهداف ووقف العقد
     option_levels = compute_option_targets(strike_info["estimated_premium"], strength_score)
 
-    # حفظ الإشارة
     last_signals[ticker] = {
         "signal": signal,
         "time": time.time(),
@@ -466,11 +445,9 @@ async def webhook(request: Request):
         "strike": strike_info["strike"]
     }
 
+
 @app.post("/telegram")
 async def telegram_webhook(request: Request):
-    """
-    أوامر تيليجرام عبر webhook
-    """
     global last_signal_message
 
     update = await request.json()
@@ -524,10 +501,5 @@ async def telegram_webhook(request: Request):
         pass
 
     return {"ok": True}
-return {"ok": True}
 
-
-@app.get("/test")
-def test():
-    send_telegram("🔥 البوت شغال بنجاح!")
-    return {"status": "ok"}
+    
