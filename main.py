@@ -70,6 +70,9 @@ stats = {
     "blocked_direction_lock": 0,
     "blocked_time_filter": 0,
     "blocked_no_contract": 0,
+    "blocked_budget": 0,
+    "blocked_liquidity": 0,
+    "blocked_spread": 0,
     "invalid_payload": 0,
     "updated": 0,
     "closed": 0,
@@ -123,6 +126,7 @@ def reset_daily_tracker_if_needed():
 
 def send_telegram(message: str) -> None:
     if not TELEGRAM_TOKEN or not CHAT_ID:
+        print("Telegram config missing")
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -132,13 +136,16 @@ def send_telegram(message: str) -> None:
     }
 
     try:
-        requests.post(url, json=data, timeout=10)
-    except Exception:
-        pass
+        res = requests.post(url, json=data, timeout=10)
+        print("Telegram status:", res.status_code)
+        print("Telegram response:", res.text)
+    except Exception as e:
+        print("Telegram send error:", str(e))
 
 
 def send_telegram_reply(chat_id: str, message: str) -> None:
     if not TELEGRAM_TOKEN or not chat_id:
+        print("Telegram reply config missing")
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -148,9 +155,11 @@ def send_telegram_reply(chat_id: str, message: str) -> None:
     }
 
     try:
-        requests.post(url, json=data, timeout=10)
-    except Exception:
-        pass
+        res = requests.post(url, json=data, timeout=10)
+        print("Telegram reply status:", res.status_code)
+        print("Telegram reply response:", res.text)
+    except Exception as e:
+        print("Telegram reply error:", str(e))
 
 
 def format_strength_label(score: int) -> str:
@@ -231,7 +240,6 @@ def is_valid_market_time() -> bool:
     ny = ZoneInfo("America/New_York")
     now_ny = datetime.now(ny)
 
-    # الإثنين إلى الجمعة فقط
     if now_ny.weekday() >= 5:
         return False
 
@@ -239,11 +247,9 @@ def is_valid_market_time() -> bool:
     market_open = 9 * 60 + 30
     market_close = 16 * 60
 
-    # أول 15 دقيقة ممنوعة
     if total_minutes < market_open + 15:
         return False
 
-    # بعد الإغلاق ممنوع
     if total_minutes >= market_close:
         return False
 
@@ -692,15 +698,18 @@ def get_yahoo_stock_price(ticker: str):
 
     try:
         price_res = requests.get(price_url, headers=headers, timeout=20)
-    except Exception:
+    except Exception as e:
+        print("Yahoo price request error:", str(e))
         return None
 
     if price_res.status_code != 200:
+        print("Yahoo price bad status:", price_res.status_code, price_res.text)
         return None
 
     try:
         price_data = price_res.json()
-    except Exception:
+    except Exception as e:
+        print("Yahoo price json error:", str(e))
         return None
 
     chart = price_data.get("chart", {})
@@ -735,9 +744,11 @@ def get_options_chain(ticker: str, direction: str = None, limit: int = 250):
 
     try:
         res = requests.get(url, params=params, timeout=15)
+        print("Options chain status:", res.status_code)
         data = res.json()
         return data.get("results", [])
-    except Exception:
+    except Exception as e:
+        print("Options chain error:", str(e))
         return []
 
 
@@ -757,11 +768,13 @@ def get_option_snapshot(option_ticker: str):
 
         url = f"https://api.polygon.io/v3/snapshot/options/{underlying}/{clean_contract}"
         res = requests.get(url, params={"apiKey": API_KEY}, timeout=15)
+        print("Option snapshot status:", res.status_code, "contract:", option_ticker)
         raw = res.json()
         results = raw.get("results", {}) if isinstance(raw, dict) else {}
         return extract_quote_prices(results)
 
-    except Exception:
+    except Exception as e:
+        print("Option snapshot error:", option_ticker, str(e))
         return {
             "bid": 0.0,
             "ask": 0.0,
@@ -828,6 +841,7 @@ def pick_best_contract(ticker: str, direction: str, price: float, max_ask: float
         })
 
     if not candidates:
+        print("No valid contracts found for:", ticker, direction, price)
         return None
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
@@ -1008,157 +1022,168 @@ def lock_direction(ticker: str, pivot: float, close_price: float):
 async def webhook(request: Request):
     global last_signal_message
 
-    data = await parse_request_payload(request)
+    try:
+        data = await parse_request_payload(request)
+        print("RAW DATA:", data)
 
-    if not isinstance(data, dict) or not data:
-        stats["invalid_payload"] += 1
-        return JSONResponse({"error": "Invalid payload"}, status_code=400)
+        if not isinstance(data, dict) or not data:
+            stats["invalid_payload"] += 1
+            return JSONResponse({"error": "Invalid payload"}, status_code=400)
 
-    if str(data.get("secret", "")).strip() != SECRET_KEY:
-        stats["blocked_secret"] += 1
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+        if str(data.get("secret", "")).strip() != SECRET_KEY:
+            stats["blocked_secret"] += 1
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
-    if not is_valid_market_time():
-        stats["blocked_time_filter"] += 1
-        return {"status": "blocked by market time filter"}
+        if not is_valid_market_time():
+            stats["blocked_time_filter"] += 1
+            return {"status": "blocked by market time filter"}
 
-    ticker = str(data.get("ticker", "")).upper().strip()
-    signal = str(data.get("signal", "")).upper().strip()
-    interval = str(data.get("interval", "1H")).strip()
-    price = safe_float(data.get("price"))
+        ticker = str(data.get("ticker", "")).upper().strip()
+        signal = str(data.get("signal", "")).upper().strip()
+        interval = str(data.get("interval", "1H")).strip()
+        price = safe_float(data.get("price"))
 
-    if not ticker or signal not in ["CALL", "PUT"] or price <= 0:
-        stats["invalid_payload"] += 1
-        return JSONResponse({"error": "Invalid payload"}, status_code=400)
+        if not ticker or signal not in ["CALL", "PUT"] or price <= 0:
+            stats["invalid_payload"] += 1
+            return JSONResponse({"error": "Invalid payload"}, status_code=400)
 
-    score_data = score_signal(data)
-    strength_score = score_data["strength_score"]
-    strength_label = score_data["strength_label"]
-    reasons = score_data["reasons"]
+        score_data = score_signal(data)
+        strength_score = score_data["strength_score"]
+        strength_label = score_data["strength_label"]
+        reasons = score_data["reasons"]
 
-    blocked, reason = should_block_signal(ticker, signal, strength_score)
-    if blocked:
-        return {"status": reason}
+        blocked, reason = should_block_signal(ticker, signal, strength_score)
+        if blocked:
+            print("Signal blocked:", reason)
+            return {"status": reason}
 
-    atr = safe_float(data.get("atr"))
-    pivot = infer_pivot(price, safe_float(data.get("pivot")), signal, atr)
+        atr = safe_float(data.get("atr"))
+        pivot = infer_pivot(price, safe_float(data.get("pivot")), signal, atr)
 
-    update_direction_lock(ticker, price, pivot)
+        update_direction_lock(ticker, price, pivot)
 
-    allowed, _ = can_send_signal(ticker, signal.lower())
-    if not allowed:
-        stats["blocked_direction_lock"] += 1
-        return {"status": f"direction locked on {get_locked_direction(ticker)}"}
+        allowed, lock_reason = can_send_signal(ticker, signal.lower())
+        if not allowed:
+            stats["blocked_direction_lock"] += 1
+            print("Direction blocked:", lock_reason)
+            return {"status": f"direction locked on {get_locked_direction(ticker)}"}
 
-    stock_levels = compute_stock_levels(price, pivot, signal, atr)
-    budget = safe_float(data.get("budget"), DEFAULT_CONTRACT_BUDGET)
-    best = pick_best_contract(ticker, signal, price, max_ask=budget)
+        stock_levels = compute_stock_levels(price, pivot, signal, atr)
+        budget = safe_float(data.get("budget"), DEFAULT_CONTRACT_BUDGET)
+        best = pick_best_contract(ticker, signal, price, max_ask=budget)
 
-    if not best:
-        stats["blocked_no_contract"] += 1
-        return {"status": "no valid contract found"}
+        if not best:
+            stats["blocked_no_contract"] += 1
+            return {"status": "no valid contract found"}
 
-    strike = best["strike"]
-    contract = best["contract"]
-    expiry = best["expiry"]
-    bid = best["bid"]
-    ask = best["ask"]
-    spread_pct = best["spread_pct"]
+        strike = best["strike"]
+        contract = best["contract"]
+        expiry = best["expiry"]
+        bid = best["bid"]
+        ask = best["ask"]
+        spread_pct = best["spread_pct"]
 
-    option_levels = compute_option_targets(ask, strength_score)
+        option_levels = compute_option_targets(ask, strength_score)
 
-    payload = {
-        "ticker": ticker,
-        "signal": signal,
-        "interval": interval,
-        "price": roundx(price),
-        "pivot": pivot,
-        "strength_score": strength_score,
-        "strength_label": strength_label,
-        "reasons": reasons,
-        "strike": strike,
-        "expiry": expiry,
-        "contract": contract,
-        "bid": bid,
-        "ask": ask,
-        "spread_pct": spread_pct,
-        **stock_levels,
-        **option_levels
-    }
-
-    message = build_alert_message(payload)
-    last_signal_message = message
-    send_telegram(message)
-
-    stats["sent"] += 1
-    last_signals[ticker] = {
-        "signal": signal,
-        "time": time.time(),
-        "score": strength_score,
-        "price": price
-    }
-
-    daily_tracker["sent_count"] += 1
-    daily_tracker["tickers"].append(ticker.upper())
-
-    if get_locked_direction(ticker) is None:
-        direction_state[ticker] = {
-            "locked_direction": signal.lower(),
-            "above_count": 1 if signal == "CALL" else 0,
-            "below_count": 1 if signal == "PUT" else 0,
-            "last_pivot": pivot,
-            "last_change": now_str()
+        payload = {
+            "ticker": ticker,
+            "signal": signal,
+            "interval": interval,
+            "price": roundx(price),
+            "pivot": pivot,
+            "strength_score": strength_score,
+            "strength_label": strength_label,
+            "reasons": reasons,
+            "strike": strike,
+            "expiry": expiry,
+            "contract": contract,
+            "bid": bid,
+            "ask": ask,
+            "spread_pct": spread_pct,
+            **stock_levels,
+            **option_levels
         }
 
-    trade_id = generate_trade_id(ticker, signal)
-    trade_key = f"{ticker.upper()}_{signal.lower()}"
-    direction_ar = "كول" if signal == "CALL" else "بوت"
+        message = build_alert_message(payload)
+        print("FINAL PAYLOAD:", payload)
+        print("FINAL MESSAGE:", message)
 
-    entry_display = f"{ask:.2f}-{bid:.2f}"
+        last_signal_message = message
+        send_telegram(message)
 
-    trade_data = {
-        "id": trade_id,
-        "ticker": ticker.upper(),
-        "direction": signal.lower(),
-        "direction_ar": direction_ar,
-        "strike": strike,
-        "expiry": expiry,
-        "contract": contract,
-        "pivot": pivot,
-        "entry_price": ask,
-        "entry_high": ask,
-        "entry_low": bid,
-        "entry_display": entry_display,
-        "bid": bid,
-        "ask": ask,
-        "spread_pct": spread_pct,
-        "highest_price": ask,
-        "current_price": ask,
-        "profit_pct": 0.0,
-        "strength_score": strength_score,
-        "status": "OPEN",
-        "tp1_hit": False,
-        "tp2_hit": False,
-        "tp3_hit": False,
-        "stop_hit": False,
-        "last_post_tp3_alert_price": 0.0,
-        "created_at": now_str(),
-        "updated_at": now_str(),
-        "closed_at": ""
-    }
+        stats["sent"] += 1
+        last_signals[ticker] = {
+            "signal": signal,
+            "time": time.time(),
+            "score": strength_score,
+            "price": price
+        }
 
-    save_trade_record(trade_data)
-    active_trade_index[trade_key] = trade_id
+        daily_tracker["sent_count"] += 1
+        daily_tracker["tickers"].append(ticker.upper())
 
-    return {
-        "status": "sent",
-        "strength_score": strength_score,
-        "strength_label": strength_label,
-        "strike": strike,
-        "contract": contract,
-        "expiry": expiry,
-        "pivot": pivot
-    }
+        if get_locked_direction(ticker) is None:
+            direction_state[ticker] = {
+                "locked_direction": signal.lower(),
+                "above_count": 1 if signal == "CALL" else 0,
+                "below_count": 1 if signal == "PUT" else 0,
+                "last_pivot": pivot,
+                "last_change": now_str()
+            }
+
+        trade_id = generate_trade_id(ticker, signal)
+        trade_key = f"{ticker.upper()}_{signal.lower()}"
+        direction_ar = "كول" if signal == "CALL" else "بوت"
+
+        entry_display = f"{ask:.2f}-{bid:.2f}"
+
+        trade_data = {
+            "id": trade_id,
+            "ticker": ticker.upper(),
+            "direction": signal.lower(),
+            "direction_ar": direction_ar,
+            "strike": strike,
+            "expiry": expiry,
+            "contract": contract,
+            "pivot": pivot,
+            "entry_price": ask,
+            "entry_high": ask,
+            "entry_low": bid,
+            "entry_display": entry_display,
+            "bid": bid,
+            "ask": ask,
+            "spread_pct": spread_pct,
+            "highest_price": ask,
+            "current_price": ask,
+            "profit_pct": 0.0,
+            "strength_score": strength_score,
+            "status": "OPEN",
+            "tp1_hit": False,
+            "tp2_hit": False,
+            "tp3_hit": False,
+            "stop_hit": False,
+            "last_post_tp3_alert_price": 0.0,
+            "created_at": now_str(),
+            "updated_at": now_str(),
+            "closed_at": ""
+        }
+
+        save_trade_record(trade_data)
+        active_trade_index[trade_key] = trade_id
+
+        return {
+            "status": "sent",
+            "strength_score": strength_score,
+            "strength_label": strength_label,
+            "strike": strike,
+            "contract": contract,
+            "expiry": expiry,
+            "pivot": pivot
+        }
+
+    except Exception as e:
+        print("WEBHOOK ERROR:", str(e))
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 # =========================
@@ -1168,9 +1193,10 @@ async def webhook(request: Request):
 async def telegram_webhook(request: Request):
     global last_signal_message
 
-    update = await parse_request_payload(request)
-
     try:
+        update = await parse_request_payload(request)
+        print("TELEGRAM UPDATE:", update)
+
         message = update.get("message", {})
         chat_id = str(message.get("chat", {}).get("id", ""))
         text = str(message.get("text", "")).strip()
@@ -1219,8 +1245,8 @@ async def telegram_webhook(request: Request):
         else:
             send_telegram_reply(chat_id, "الأمر غير معروف. استخدم /help")
 
-    except Exception:
-        pass
+    except Exception as e:
+        print("Telegram webhook error:", str(e))
 
     return {"ok": True}
 
@@ -1297,7 +1323,6 @@ def auto_manage_trade_levels():
         tp3 = levels["contract_target3"]
         stop = levels["contract_stop"]
 
-        # وقف العقد
         if not trade.get("stop_hit") and current_price <= stop:
             trade["stop_hit"] = True
             trade["status"] = "STOPPED"
@@ -1309,21 +1334,18 @@ def auto_manage_trade_levels():
             changed = True
             continue
 
-        # TP1
         if not trade.get("tp1_hit") and current_price >= tp1:
             trade["tp1_hit"] = True
             stats["tp1_alerts"] += 1
             send_telegram(build_progress_update_message(trade, "🎯 الهدف الأول تحقق"))
             changed = True
 
-        # TP2
         if not trade.get("tp2_hit") and current_price >= tp2:
             trade["tp2_hit"] = True
             stats["tp2_alerts"] += 1
             send_telegram(build_progress_update_message(trade, "🚀 الهدف الثاني تحقق"))
             changed = True
 
-        # TP3
         if not trade.get("tp3_hit") and current_price >= tp3:
             trade["tp3_hit"] = True
             trade["status"] = "RUNNING"
@@ -1332,7 +1354,6 @@ def auto_manage_trade_levels():
             send_telegram(build_progress_update_message(trade, "🏆 الهدف الثالث تحقق"))
             changed = True
 
-        # بعد الهدف الثالث: كل +0.30$
         if trade.get("tp3_hit"):
             last_tp3_alert_price = safe_float(trade.get("last_post_tp3_alert_price"), 0.0)
 
@@ -1356,8 +1377,8 @@ def monitor_loop():
         try:
             monitor_open_trades()
             auto_manage_trade_levels()
-        except Exception:
-            pass
+        except Exception as e:
+            print("Monitor loop error:", str(e))
         time.sleep(MONITOR_INTERVAL_SEC)
 
 
@@ -1366,6 +1387,7 @@ def startup_event():
     ensure_report_file()
     t = threading.Thread(target=monitor_loop, daemon=True)
     t.start()
+    print("Startup complete. Monitor thread started.")
 
 
 # =========================
