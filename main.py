@@ -1,10 +1,10 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
 import requests
-import os
 import time
 import json
 import csv
+import os
 import threading
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List
@@ -18,30 +18,40 @@ app = FastAPI()
 API_KEY = "AcbX3y7rKzou3MzUi8EVlETdYLFsVGa2"
 TELEGRAM_TOKEN = "8619465902:AAHPP9AFiL0fV1lejKtaThLlQ4qZ6qCYgX0"
 CHAT_ID = "8371374055"
-SECRET_KEY = os.getenv("SECRET_KEY", "12345").strip()
+SECRET_KEY = "12345"
 
 REPORT_FILE = "trades_report.csv"
 
-# الفلترة الأساسية
-MIN_SCORE_TO_SEND = int(os.getenv("MIN_SCORE_TO_SEND", "80"))
-MAX_SIGNALS_PER_DAY = int(os.getenv("MAX_SIGNALS_PER_DAY", "5"))
+# =========================
+# إعدادات القناص
+# =========================
+MIN_SCORE_TO_SEND = 70
+MAX_SIGNALS_PER_DAY = 5
 
-# إعدادات إضافية
-DUPLICATE_WINDOW_SEC = int(os.getenv("DUPLICATE_WINDOW_SEC", "300"))
-CONFLICT_WINDOW_SEC = int(os.getenv("CONFLICT_WINDOW_SEC", "300"))
-DEFAULT_CONTRACT_BUDGET = float(os.getenv("DEFAULT_CONTRACT_BUDGET", "3.0"))
-ROUND_TO = int(os.getenv("ROUND_TO", "2"))
+# 3 ساعات
+DUPLICATE_WINDOW_SEC = 10800
+CONFLICT_WINDOW_SEC = 10800
+
+DEFAULT_CONTRACT_BUDGET = 3.0
+ROUND_TO = 2
 
 # فلترة العقود
-MIN_OPTION_VOLUME = int(os.getenv("MIN_OPTION_VOLUME", "50"))
-MIN_OPTION_OI = int(os.getenv("MIN_OPTION_OI", "100"))
-MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "25"))
-MAX_STRIKE_DISTANCE_PCT = float(os.getenv("MAX_STRIKE_DISTANCE_PCT", "3.0"))
+MIN_OPTION_VOLUME = 50
+MIN_OPTION_OI = 100
+MAX_SPREAD_PCT = 25.0
+MAX_STRIKE_DISTANCE_PCT = 3.0
 
-# فلتر الوقت والمتابعة
-REQUIRE_MARKET_TIME = os.getenv("REQUIRE_MARKET_TIME", "true").lower() == "true"
-MONITOR_INTERVAL_SEC = int(os.getenv("MONITOR_INTERVAL_SEC", "60"))
-POST_TP3_STEP_USD = float(os.getenv("POST_TP3_STEP_USD", "0.30"))
+# الجمعة: زيرو هيرو
+ZERO_HERO_FRIDAY_ONLY = True
+ZERO_HERO_MAX_ASK = 1.50
+NON_FRIDAY_MIN_ASK = 1.00
+
+# المتابعة
+MONITOR_INTERVAL_SEC = 60
+POST_TP3_STEP_USD = 0.30
+
+# تعطيل فلتر وقت السوق
+REQUIRE_MARKET_TIME = False
 
 # =========================
 # ذاكرة داخلية
@@ -68,7 +78,10 @@ stats = {
     "blocked_daily_limit": 0,
     "blocked_daily_ticker": 0,
     "blocked_direction_lock": 0,
-    "blocked_time_filter": 0,
+    "blocked_news": 0,
+    "blocked_trend": 0,
+    "blocked_explosion": 0,
+    "blocked_pre_explosion": 0,
     "blocked_no_contract": 0,
     "blocked_budget": 0,
     "blocked_liquidity": 0,
@@ -103,13 +116,18 @@ def safe_int(value, default=0) -> int:
     try:
         if value is None or value == "":
             return default
-        return int(value)
+        return int(float(value))
     except Exception:
         return default
 
 
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def is_friday_ny() -> bool:
+    ny = ZoneInfo("America/New_York")
+    return datetime.now(ny).weekday() == 4
 
 
 def generate_trade_id(ticker: str, direction: str) -> str:
@@ -136,7 +154,7 @@ def send_telegram(message: str) -> None:
     }
 
     try:
-        res = requests.post(url, json=data, timeout=10)
+        res = requests.post(url, json=data, timeout=15)
         print("Telegram status:", res.status_code)
         print("Telegram response:", res.text)
     except Exception as e:
@@ -145,7 +163,6 @@ def send_telegram(message: str) -> None:
 
 def send_telegram_reply(chat_id: str, message: str) -> None:
     if not TELEGRAM_TOKEN or not chat_id:
-        print("Telegram reply config missing")
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -155,9 +172,7 @@ def send_telegram_reply(chat_id: str, message: str) -> None:
     }
 
     try:
-        res = requests.post(url, json=data, timeout=10)
-        print("Telegram reply status:", res.status_code)
-        print("Telegram reply response:", res.text)
+        requests.post(url, json=data, timeout=15)
     except Exception as e:
         print("Telegram reply error:", str(e))
 
@@ -234,30 +249,11 @@ def extract_quote_prices(raw_results: Dict[str, Any]) -> Dict[str, float]:
 
 
 def is_valid_market_time() -> bool:
-    if not REQUIRE_MARKET_TIME:
-        return True
-
-    ny = ZoneInfo("America/New_York")
-    now_ny = datetime.now(ny)
-
-    if now_ny.weekday() >= 5:
-        return False
-
-    total_minutes = now_ny.hour * 60 + now_ny.minute
-    market_open = 9 * 60 + 30
-    market_close = 16 * 60
-
-    if total_minutes < market_open + 15:
-        return False
-
-    if total_minutes >= market_close:
-        return False
-
-    return True
+    return True if not REQUIRE_MARKET_TIME else True
 
 
 # =========================
-# التقرير
+# تقرير
 # =========================
 REPORT_HEADERS = [
     "id",
@@ -299,14 +295,12 @@ def ensure_report_file():
 
 def refresh_report_file():
     ensure_report_file()
-
     rows = list(trades_store.values())
     rows.sort(key=lambda x: x.get("created_at", ""))
 
     with open(REPORT_FILE, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         writer.writerow(REPORT_HEADERS)
-
         for data in rows:
             writer.writerow([
                 data.get("id", ""),
@@ -395,13 +389,10 @@ def get_locked_direction(ticker: str):
 
 def can_send_signal(ticker: str, requested_direction: str):
     locked = get_locked_direction(ticker)
-
     if locked is None:
         return True, "no_lock"
-
     if locked == requested_direction.lower():
         return True, "matched_lock"
-
     return False, f"locked_on_{locked}"
 
 
@@ -439,8 +430,100 @@ def should_block_signal(ticker: str, signal: str, score: int):
 
 
 # =========================
-# تقييم الإشارة
+# سكورات وفلاتر
 # =========================
+def has_news(ticker: str) -> bool:
+    try:
+        url = f"https://api.polygon.io/v2/reference/news?ticker={ticker}&apiKey={API_KEY}"
+        res = requests.get(url, timeout=10)
+        data = res.json()
+        return len(data.get("results", [])) > 0
+    except Exception:
+        return False
+
+
+def passes_trend_filter(data: Dict[str, Any]) -> (bool, str):
+    signal = str(data.get("signal", "")).upper()
+    ema_fast = safe_float(data.get("ema_fast"))
+    ema_slow = safe_float(data.get("ema_slow"))
+
+    if signal == "CALL" and ema_fast < ema_slow:
+        return False, "trend blocked"
+    if signal == "PUT" and ema_fast > ema_slow:
+        return False, "trend blocked"
+
+    return True, "ok"
+
+
+def passes_explosion_filter(data: Dict[str, Any]) -> (bool, str):
+    price = safe_float(data.get("price"))
+    pivot = safe_float(data.get("pivot"))
+    rsi = safe_float(data.get("rsi"), 50)
+    rel_volume = safe_float(data.get("rel_volume"), 1.0)
+    signal = str(data.get("signal", "")).upper()
+
+    if pivot > 0 and price > 0:
+        distance_pct = abs(price - pivot) / price
+        if distance_pct < 0.003:
+            return False, "explosion blocked - no movement"
+        if distance_pct > 0.025:
+            return False, "explosion blocked - too late"
+
+    if signal == "CALL" and rsi < 55:
+        return False, "explosion blocked - weak momentum"
+    if signal == "PUT" and rsi > 45:
+        return False, "explosion blocked - weak momentum"
+
+    if rel_volume < 1.2:
+        return False, "explosion blocked - low volume"
+
+    return True, "ok"
+
+
+def passes_pre_explosion_filter(data: Dict[str, Any]) -> (bool, str):
+    price = safe_float(data.get("price"))
+    pivot = safe_float(data.get("pivot"))
+    rsi = safe_float(data.get("rsi"), 50)
+    rel_volume = safe_float(data.get("rel_volume"), 1.0)
+    ema_fast = safe_float(data.get("ema_fast"))
+    ema_slow = safe_float(data.get("ema_slow"))
+    signal = str(data.get("signal", "")).upper()
+    confidence = safe_int(data.get("signal_confidence"), 0)
+
+    if price <= 0 or pivot <= 0:
+        return False, "pre-explosion invalid"
+
+    if confidence < 70:
+        return False, "pre-explosion weak confidence"
+
+    distance_pct = abs(price - pivot) / price
+    if distance_pct < 0.0015:
+        return False, "pre-explosion too early"
+    if distance_pct > 0.0060:
+        return False, "pre-explosion too late"
+
+    if rel_volume < 1.05:
+        return False, "pre-explosion low volume"
+
+    if signal == "CALL":
+        if price <= pivot:
+            return False, "pre-explosion call below pivot"
+        if rsi < 52:
+            return False, "pre-explosion weak call momentum"
+        if ema_fast <= ema_slow:
+            return False, "pre-explosion call against trend"
+
+    if signal == "PUT":
+        if price >= pivot:
+            return False, "pre-explosion put above pivot"
+        if rsi > 48:
+            return False, "pre-explosion weak put momentum"
+        if ema_fast >= ema_slow:
+            return False, "pre-explosion put against trend"
+
+    return True, "ok"
+
+
 def score_signal(data: Dict[str, Any]) -> Dict[str, Any]:
     price = safe_float(data.get("price"))
     signal = str(data.get("signal", "")).upper()
@@ -585,7 +668,7 @@ def compute_option_targets(entry_price: float, strength_score: int):
 
 
 # =========================
-# الرسالة
+# الرسائل
 # =========================
 def build_alert_message(payload: Dict[str, Any]) -> str:
     ticker = payload["ticker"]
@@ -615,13 +698,14 @@ def build_alert_message(payload: Dict[str, Any]) -> str:
 
     reasons = "، ".join(payload["reasons"][:3]) if payload["reasons"] else "مطابقة الشروط"
     direction = "🟢 CALL" if signal == "CALL" else "🔴 PUT"
+    mode_tag = "💣 ZERO HERO" if payload.get("zero_hero", False) else "🎯 SNIPER"
 
     if signal == "CALL":
         stop_text = f"كسر {pivot:.2f} بإغلاق ساعة"
     else:
         stop_text = f"اختراق {pivot:.2f} بإغلاق ساعة"
 
-    return f"""🚨 Option Strike Alert
+    return f"""🚨 {mode_tag} Option Strike Alert
 
 📈 السهم: {ticker}
 {direction}
@@ -690,7 +774,7 @@ async def parse_request_payload(request: Request) -> Dict[str, Any]:
 
 
 # =========================
-# Yahoo سعر السهم
+# Yahoo
 # =========================
 def get_yahoo_stock_price(ticker: str):
     price_url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker.upper()}"
@@ -703,18 +787,15 @@ def get_yahoo_stock_price(ticker: str):
         return None
 
     if price_res.status_code != 200:
-        print("Yahoo price bad status:", price_res.status_code, price_res.text)
         return None
 
     try:
         price_data = price_res.json()
-    except Exception as e:
-        print("Yahoo price json error:", str(e))
+    except Exception:
         return None
 
     chart = price_data.get("chart", {})
     result = chart.get("result", [])
-
     if not result:
         return None
 
@@ -728,7 +809,7 @@ def get_yahoo_stock_price(ticker: str):
 
 
 # =========================
-# Polygon / Massive
+# Polygon
 # =========================
 def get_options_chain(ticker: str, direction: str = None, limit: int = 250):
     url = "https://api.polygon.io/v3/reference/options/contracts"
@@ -744,7 +825,6 @@ def get_options_chain(ticker: str, direction: str = None, limit: int = 250):
 
     try:
         res = requests.get(url, params=params, timeout=15)
-        print("Options chain status:", res.status_code)
         data = res.json()
         return data.get("results", [])
     except Exception as e:
@@ -758,35 +838,24 @@ def get_option_snapshot(option_ticker: str):
         underlying = extract_underlying_from_option_ticker(option_ticker)
 
         if not clean_contract or not underlying:
-            return {
-                "bid": 0.0,
-                "ask": 0.0,
-                "mid": 0.0,
-                "volume": 0.0,
-                "oi": 0.0
-            }
+            return {"bid": 0.0, "ask": 0.0, "mid": 0.0, "volume": 0.0, "oi": 0.0}
 
         url = f"https://api.polygon.io/v3/snapshot/options/{underlying}/{clean_contract}"
         res = requests.get(url, params={"apiKey": API_KEY}, timeout=15)
-        print("Option snapshot status:", res.status_code, "contract:", option_ticker)
         raw = res.json()
         results = raw.get("results", {}) if isinstance(raw, dict) else {}
         return extract_quote_prices(results)
 
     except Exception as e:
         print("Option snapshot error:", option_ticker, str(e))
-        return {
-            "bid": 0.0,
-            "ask": 0.0,
-            "mid": 0.0,
-            "volume": 0.0,
-            "oi": 0.0
-        }
+        return {"bid": 0.0, "ask": 0.0, "mid": 0.0, "volume": 0.0, "oi": 0.0}
 
 
 def pick_best_contract(ticker: str, direction: str, price: float, max_ask: float = 3.0):
     contracts = get_options_chain(ticker, direction=direction, limit=250)
     candidates = []
+
+    friday_mode = ZERO_HERO_FRIDAY_ONLY and is_friday_ny()
 
     for c in contracts:
         strike = safe_float(c.get("strike_price"))
@@ -810,9 +879,16 @@ def pick_best_contract(ticker: str, direction: str, price: float, max_ask: float
         if bid <= 0 or ask <= 0:
             continue
 
-        if ask > max_ask:
-            stats["blocked_budget"] += 1
-            continue
+        if friday_mode:
+            if ask > ZERO_HERO_MAX_ASK:
+                stats["blocked_budget"] += 1
+                continue
+        else:
+            if ask > max_ask:
+                stats["blocked_budget"] += 1
+                continue
+            if ask < NON_FRIDAY_MIN_ASK:
+                continue
 
         if volume < MIN_OPTION_VOLUME or oi < MIN_OPTION_OI:
             stats["blocked_liquidity"] += 1
@@ -825,7 +901,7 @@ def pick_best_contract(ticker: str, direction: str, price: float, max_ask: float
             stats["blocked_spread"] += 1
             continue
 
-        score = (volume * 1.5) + oi - (spread_pct * 10)
+        score = (volume * 2.5) + (oi * 1.5) - (spread_pct * 20)
 
         candidates.append({
             "contract": option_ticker,
@@ -837,11 +913,11 @@ def pick_best_contract(ticker: str, direction: str, price: float, max_ask: float
             "volume": volume,
             "oi": oi,
             "spread_pct": roundx(spread_pct),
-            "score": score
+            "score": score,
+            "zero_hero": friday_mode and ask <= ZERO_HERO_MAX_ASK
         })
 
     if not candidates:
-        print("No valid contracts found for:", ticker, direction, price)
         return None
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
@@ -849,44 +925,7 @@ def pick_best_contract(ticker: str, direction: str, price: float, max_ask: float
 
 
 # =========================
-# اختيار العقد الذكي
-# =========================
-@app.get("/smart/{ticker}/{direction}")
-def smart_contract(ticker: str, direction: str):
-    current_price = get_yahoo_stock_price(ticker) or 100.0
-    best = pick_best_contract(ticker.upper(), direction.upper(), current_price, DEFAULT_CONTRACT_BUDGET)
-
-    if not best:
-        return {
-            "ticker": ticker.upper(),
-            "type": direction.lower(),
-            "strike": roundx(current_price),
-            "expiry": nearest_friday(),
-            "contract": f"FALLBACK_{ticker.upper()}_{direction.upper()}",
-            "current_price": current_price,
-            "option_price": None,
-            "bid": None,
-            "ask": None,
-            "fallback": True
-        }
-
-    return {
-        "ticker": ticker.upper(),
-        "type": direction.lower(),
-        "strike": best["strike"],
-        "expiry": best["expiry"],
-        "contract": best["contract"],
-        "current_price": current_price,
-        "option_price": best["ask"],
-        "bid": best["bid"],
-        "ask": best["ask"],
-        "spread_pct": best["spread_pct"],
-        "fallback": False
-    }
-
-
-# =========================
-# الصفحة الرئيسية
+# Routes
 # =========================
 @app.get("/")
 def home():
@@ -1005,7 +1044,6 @@ def report_view_html():
     </body>
     </html>
     """
-
     return HTMLResponse(content=html)
 
 
@@ -1015,8 +1053,43 @@ def lock_direction(ticker: str, pivot: float, close_price: float):
     return state
 
 
+@app.get("/smart/{ticker}/{direction}")
+def smart_contract(ticker: str, direction: str):
+    current_price = get_yahoo_stock_price(ticker) or 100.0
+    best = pick_best_contract(ticker.upper(), direction.upper(), current_price, DEFAULT_CONTRACT_BUDGET)
+
+    if not best:
+        return {
+            "ticker": ticker.upper(),
+            "type": direction.lower(),
+            "strike": roundx(current_price),
+            "expiry": nearest_friday(),
+            "contract": f"FALLBACK_{ticker.upper()}_{direction.upper()}",
+            "current_price": current_price,
+            "option_price": None,
+            "bid": None,
+            "ask": None,
+            "fallback": True
+        }
+
+    return {
+        "ticker": ticker.upper(),
+        "type": direction.lower(),
+        "strike": best["strike"],
+        "expiry": best["expiry"],
+        "contract": best["contract"],
+        "current_price": current_price,
+        "option_price": best["ask"],
+        "bid": best["bid"],
+        "ask": best["ask"],
+        "spread_pct": best["spread_pct"],
+        "fallback": False,
+        "zero_hero": best.get("zero_hero", False)
+    }
+
+
 # =========================
-# Webhook TradingView
+# Webhook
 # =========================
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -1035,8 +1108,7 @@ async def webhook(request: Request):
             return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
         if not is_valid_market_time():
-            stats["blocked_time_filter"] += 1
-            return {"status": "blocked by market time filter"}
+            return {"status": "blocked by market time"}
 
         ticker = str(data.get("ticker", "")).upper().strip()
         signal = str(data.get("signal", "")).upper().strip()
@@ -1047,6 +1119,25 @@ async def webhook(request: Request):
             stats["invalid_payload"] += 1
             return JSONResponse({"error": "Invalid payload"}, status_code=400)
 
+        if has_news(ticker):
+            stats["blocked_news"] += 1
+            return {"status": "blocked - news"}
+
+        trend_ok, trend_reason = passes_trend_filter(data)
+        if not trend_ok:
+            stats["blocked_trend"] += 1
+            return {"status": trend_reason}
+
+        exp_ok, exp_reason = passes_explosion_filter(data)
+        if not exp_ok:
+            stats["blocked_explosion"] += 1
+            return {"status": exp_reason}
+
+        pre_ok, pre_reason = passes_pre_explosion_filter(data)
+        if not pre_ok:
+            stats["blocked_pre_explosion"] += 1
+            return {"status": pre_reason}
+
         score_data = score_signal(data)
         strength_score = score_data["strength_score"]
         strength_label = score_data["strength_label"]
@@ -1054,7 +1145,6 @@ async def webhook(request: Request):
 
         blocked, reason = should_block_signal(ticker, signal, strength_score)
         if blocked:
-            print("Signal blocked:", reason)
             return {"status": reason}
 
         atr = safe_float(data.get("atr"))
@@ -1065,7 +1155,6 @@ async def webhook(request: Request):
         allowed, lock_reason = can_send_signal(ticker, signal.lower())
         if not allowed:
             stats["blocked_direction_lock"] += 1
-            print("Direction blocked:", lock_reason)
             return {"status": f"direction locked on {get_locked_direction(ticker)}"}
 
         stock_levels = compute_stock_levels(price, pivot, signal, atr)
@@ -1082,6 +1171,7 @@ async def webhook(request: Request):
         bid = best["bid"]
         ask = best["ask"]
         spread_pct = best["spread_pct"]
+        zero_hero = best.get("zero_hero", False)
 
         option_levels = compute_option_targets(ask, strength_score)
 
@@ -1100,14 +1190,12 @@ async def webhook(request: Request):
             "bid": bid,
             "ask": ask,
             "spread_pct": spread_pct,
+            "zero_hero": zero_hero,
             **stock_levels,
             **option_levels
         }
 
         message = build_alert_message(payload)
-        print("FINAL PAYLOAD:", payload)
-        print("FINAL MESSAGE:", message)
-
         last_signal_message = message
         send_telegram(message)
 
@@ -1134,7 +1222,6 @@ async def webhook(request: Request):
         trade_id = generate_trade_id(ticker, signal)
         trade_key = f"{ticker.upper()}_{signal.lower()}"
         direction_ar = "كول" if signal == "CALL" else "بوت"
-
         entry_display = f"{ask:.2f}-{bid:.2f}"
 
         trade_data = {
@@ -1178,7 +1265,8 @@ async def webhook(request: Request):
             "strike": strike,
             "contract": contract,
             "expiry": expiry,
-            "pivot": pivot
+            "pivot": pivot,
+            "zero_hero": zero_hero
         }
 
     except Exception as e:
@@ -1195,8 +1283,6 @@ async def telegram_webhook(request: Request):
 
     try:
         update = await parse_request_payload(request)
-        print("TELEGRAM UPDATE:", update)
-
         message = update.get("message", {})
         chat_id = str(message.get("chat", {}).get("id", ""))
         text = str(message.get("text", "")).strip()
@@ -1205,27 +1291,19 @@ async def telegram_webhook(request: Request):
             return {"ok": True}
 
         if text == "/start":
-            send_telegram_reply(
-                chat_id,
-                "🔥 أهلاً بك في Option Strike Bot\n\n"
-                "الأوامر:\n"
-                "/help\n"
-                "/status\n"
-                "/last"
-            )
-
+            send_telegram_reply(chat_id, "🔥 أهلاً بك في Option Strike Bot\n\n/help\n/status\n/last")
         elif text == "/help":
             send_telegram_reply(
                 chat_id,
                 "🧠 البوت يستقبل إشارات TradingView ويرسل:\n"
-                "- فلترة 80%+\n"
-                "- حد أقصى 5 فرص يوميًا\n"
-                "- قفل اتجاه بعد 3 إغلاقات ساعة\n"
-                "- اختيار عقد حقيقي تلقائيًا\n"
-                "- متابعة تلقائية للعقد\n"
-                "- تحديث بعد الهدف الثالث كل +0.30$"
+                "- فلترة 70%+\n"
+                "- 5 فرص يوميًا\n"
+                "- منع التكرار 3 ساعات\n"
+                "- قفل اتجاه\n"
+                "- اختيار عقد تلقائي\n"
+                "- متابعة TP1 / TP2 / TP3\n"
+                "- زيرو هيرو يوم الجمعة"
             )
-
         elif text == "/status":
             send_telegram_reply(
                 chat_id,
@@ -1238,10 +1316,8 @@ async def telegram_webhook(request: Request):
                 f"Stops: {stats['stop_alerts']}\n"
                 f"المرسل اليوم: {daily_tracker['sent_count']}/{MAX_SIGNALS_PER_DAY}"
             )
-
         elif text == "/last":
             send_telegram_reply(chat_id, last_signal_message or "لا توجد إشارة سابقة حتى الآن.")
-
         else:
             send_telegram_reply(chat_id, "الأمر غير معروف. استخدم /help")
 
@@ -1252,7 +1328,7 @@ async def telegram_webhook(request: Request):
 
 
 # =========================
-# المتابعة التلقائية
+# متابعة تلقائية
 # =========================
 def monitor_open_trades():
     updated_count = 0
@@ -1356,7 +1432,6 @@ def auto_manage_trade_levels():
 
         if trade.get("tp3_hit"):
             last_tp3_alert_price = safe_float(trade.get("last_post_tp3_alert_price"), 0.0)
-
             if last_tp3_alert_price <= 0:
                 trade["last_post_tp3_alert_price"] = roundx(current_price)
                 changed = True
@@ -1390,22 +1465,13 @@ def startup_event():
     print("Startup complete. Monitor thread started.")
 
 
-# =========================
-# Endpoint اختياري للمتابعة اليدوية
-# =========================
 @app.get("/monitor")
 def run_monitor():
     updated = monitor_open_trades()
     auto_manage_trade_levels()
-    return {
-        "status": "ok",
-        "updated_trades": updated
-    }
+    return {"status": "ok", "updated_trades": updated}
 
 
-# =========================
-# تحديث يدوي اختياري
-# =========================
 @app.get("/update/{ticker}/{direction}/{entry}/{current}")
 def update_signal(
     ticker: str,
