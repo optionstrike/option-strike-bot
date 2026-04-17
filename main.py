@@ -28,7 +28,12 @@ TREND_CONFIRM_HOURS = 3
 SCAN_INTERVAL_SECONDS = 3600  # كل ساعة
 
 # =========================
-# قائمة الشركات (80 شركة)
+# أصول الارتكاز اليومي
+# =========================
+INDEX_DAILY_PIVOT = {"US500", "SPY", "QQQ", "SPX", "NDX", "US100"}
+
+# =========================
+# قائمة الشركات + المؤشرات
 # =========================
 WATCHLIST = list(dict.fromkeys([
     "GLD","IBM","V","JPM","SBUX","MMM","QCOM","GOOG","INTC","NFLX","GS","SMH",
@@ -37,7 +42,8 @@ WATCHLIST = list(dict.fromkeys([
     "LRCX","LOW","HD","PANW","BA","ZS","MRVL","ULTA","SMCI","MARA","MCD","PDD","FDX",
     "FSLR","COST","SHOP","ALB","NBIS","ARM","CRCL","ABBV","HOOD","BABA","ADBE","LULU","ORCL",
     "LLY","TSM","CVNA","COIN","CRWV","CAT","AMD","SNOW","MDB","AMZN","MU","CRM","GE",
-    "NVDA","AAPL","GOOGL","MSFT","TSLA","META","AVGO","CRWD","APP","UNH","MSTR","US500","QQQ","SPY","SPX","PLTR"
+    "NVDA","AAPL","GOOGL","MSFT","TSLA","META","AVGO","CRWD","APP","UNH","MSTR","PLTR",
+    "US500","SPY","QQQ","SPX","NDX","US100"
 ]))
 
 # =========================
@@ -56,9 +62,9 @@ def allow(user):
 # =========================
 # تتبع الإشارات
 # =========================
-LAST_SENT_STOCK = {}         # ticker -> datetime آخر إرسال
-TREND_STATE = {}             # ticker -> {"side": "above"/"below"/"neutral", "confirmed_at": datetime}
-DAILY_SIGNAL_STATE = {       # إعادة ضبط يومي
+LAST_SENT_STOCK = {}
+TREND_STATE = {}
+DAILY_SIGNAL_STATE = {
     "date": datetime.now().date(),
     "count": 0
 }
@@ -157,14 +163,28 @@ TF = {
     "1w": ("3y","1wk"),
 }
 
+# =========================
+# تحويل بعض الرموز لـ yfinance
+# =========================
+def map_symbol_for_data(ticker: str) -> str:
+    mapping = {
+        "SPX": "^GSPC",
+        "NDX": "^NDX",
+        "SPY": "SPY",
+        "QQQ": "QQQ",
+        "US500": "^GSPC",
+        "US100": "^NDX",
+    }
+    return mapping.get(ticker, ticker)
+
 def get_df(ticker, tf):
     period, interval = TF.get(tf, ("1y","1d"))
-    s = yf.Ticker(ticker)
+    data_ticker = map_symbol_for_data(ticker)
+    s = yf.Ticker(data_ticker)
     df = s.history(period=period, interval=interval)
     if df.empty:
         return df
 
-    # توحيد التوقيت وترتيب البيانات
     df.index = pd.to_datetime(df.index, utc=False)
 
     if tf == "4h":
@@ -179,17 +199,12 @@ def get_df(ticker, tf):
     return df
 
 # =========================
-# تثبيت الاتجاه 3 ساعات
+# تثبيت الاتجاه 3 ساعات حول الارتكاز
 # =========================
-def get_confirmed_side_hourly(ticker: str):
+def get_confirmed_side_hourly(ticker: str, pivot: float):
     df_1h = get_df(ticker, "1h")
-    if df_1h.empty or len(df_1h) < 20:
+    if df_1h.empty or len(df_1h) < 3:
         return "neutral"
-
-    price = float(df_1h["Close"].iloc[-1])
-    high = float(df_1h["High"].rolling(20).max().iloc[-1])
-    low = float(df_1h["Low"].rolling(20).min().iloc[-1])
-    pivot = (high + low + price) / 3.0
 
     closes = df_1h["Close"].tail(3)
 
@@ -209,15 +224,12 @@ def get_confirmed_side_hourly(ticker: str):
         }
         return side
 
-    # إذا نفس الجهة، خله ثابت
     if prev["side"] == side:
         return side
 
-    # إذا رجع محايد، لا نقلب الاتجاه المؤكد مباشرة
     if side == "neutral":
         return prev["side"]
 
-    # يحتاج 3 ساعات تثبيت فعلية قبل تغيير الحالة
     if datetime.now() - prev["confirmed_at"] >= timedelta(hours=TREND_CONFIRM_HOURS):
         TREND_STATE[ticker] = {
             "side": side,
@@ -231,24 +243,57 @@ def get_confirmed_side_hourly(ticker: str):
 # حسابات أساسية
 # =========================
 def core_metrics(df, ticker=None):
+    if df.empty:
+        return None
+
     price = float(df["Close"].iloc[-1])
-    high = float(df["High"].rolling(20).max().iloc[-1])
-    low  = float(df["Low"].rolling(20).min().iloc[-1])
 
-    pivot = (high + low + price) / 3.0
-    rng = high - low
+    # ===== تحديد نوع الارتكاز =====
+    if ticker in INDEX_DAILY_PIVOT:
+        ref = get_df(ticker, "1d")
+        if ref.empty or len(ref) < 2:
+            return None
 
-    tp1 = pivot + rng * 0.5
-    tp2 = pivot + rng
-    tp3 = high + rng
+        prev = ref.iloc[-2]  # آخر شمعة يومية مكتملة
+        ref_high = float(prev["High"])
+        ref_low = float(prev["Low"])
+        ref_close = float(prev["Close"])
+        pivot_label = "اليومي"
+    else:
+        ref = get_df(ticker, "1w")
+        if ref.empty or len(ref) < 2:
+            return None
+
+        prev = ref.iloc[-2]  # آخر شمعة أسبوعية مكتملة
+        ref_high = float(prev["High"])
+        ref_low = float(prev["Low"])
+        ref_close = float(prev["Close"])
+        pivot_label = "الأسبوعي"
+
+    pivot = (ref_high + ref_low + ref_close) / 3.0
+    ref_range = ref_high - ref_low
+
+    tp1 = pivot + ref_range * 0.5
+    tp2 = pivot + ref_range
+    tp3 = ref_high + ref_range
     sl = pivot
 
+    # الفرق عن الارتكاز
+    pivot_diff = price - pivot
+    if pivot_diff > 0:
+        pivot_position = "فوق الارتكاز"
+    elif pivot_diff < 0:
+        pivot_position = "تحت الارتكاز"
+    else:
+        pivot_position = "على الارتكاز"
+
+    # الترند
     ema20 = float(df["Close"].ewm(span=20).mean().iloc[-1])
     ema50 = float(df["Close"].ewm(span=50).mean().iloc[-1])
+    trend = "صاعد 📈" if ema20 > ema50 else "هابط 📉"
 
-    base_trend = "صاعد 📈" if ema20 > ema50 else "هابط 📉"
-
-    confirmed_side = get_confirmed_side_hourly(ticker) if ticker else "neutral"
+    # تثبيت الاتجاه بإغلاقات الساعة حول الارتكاز
+    confirmed_side = get_confirmed_side_hourly(ticker, pivot) if ticker else "neutral"
 
     if confirmed_side == "above":
         strongest_trend = "صاعد قوي 🔥"
@@ -257,10 +302,10 @@ def core_metrics(df, ticker=None):
     else:
         strongest_trend = "محايد ⚖️"
 
-    # القرار النهائي
-    if price > pivot and confirmed_side == "above" and ema20 > ema50:
+    # القرار النهائي = الترند + الارتكاز فقط
+    if trend == "صاعد 📈" and price > pivot and confirmed_side == "above":
         direction = "CALL 🟢"
-    elif price < pivot and confirmed_side == "below" and ema20 < ema50:
+    elif trend == "هابط 📉" and price < pivot and confirmed_side == "below":
         direction = "PUT 🔴"
     else:
         direction = "انتظار ⚪"
@@ -269,14 +314,17 @@ def core_metrics(df, ticker=None):
 
     return {
         "price": price,
-        "high": high,
-        "low": low,
+        "high": ref_high,
+        "low": ref_low,
         "pivot": pivot,
+        "pivot_label": pivot_label,
+        "pivot_diff": pivot_diff,
+        "pivot_position": pivot_position,
         "tp1": tp1,
         "tp2": tp2,
         "tp3": tp3,
         "sl": sl,
-        "trend": base_trend,
+        "trend": trend,
         "strongest_trend": strongest_trend,
         "direction": direction,
         "best_entry": best_entry,
@@ -287,7 +335,9 @@ def core_metrics(df, ticker=None):
 
 def options_approx(ticker, price):
     try:
-        s = yf.Ticker(ticker)
+        # بعض المؤشرات ما عندها options chain، fallback تلقائي
+        data_ticker = map_symbol_for_data(ticker)
+        s = yf.Ticker(data_ticker)
         exps = s.options
         if not exps:
             raise Exception("no exp")
@@ -348,26 +398,21 @@ def calc_score(c, o):
     score = 0
 
     if c["direction"].startswith("CALL") or c["direction"].startswith("PUT"):
-        score += 30
+        score += 35
 
     if c["strongest_trend"] in ["صاعد قوي 🔥", "هابط قوي 🔻"]:
         score += 25
 
-    if o["prob"] >= 60:
-        score += 20
-
-    if o["liq"] != "—":
+    if abs(c["pivot_diff"]) > 0:
         score += 10
+
+    if o["prob"] >= 60:
+        score += 15
 
     if c["trend"] == "صاعد 📈" and c["direction"].startswith("CALL"):
         score += 10
     if c["trend"] == "هابط 📉" and c["direction"].startswith("PUT"):
         score += 10
-
-    if c["price"] > c["pivot"] and c["direction"].startswith("CALL"):
-        score += 5
-    if c["price"] < c["pivot"] and c["direction"].startswith("PUT"):
-        score += 5
 
     return score
 
@@ -378,8 +423,11 @@ def msg_quick(tk, tf, c):
     return f"""📊 {tk} | TF: {tf}
 
 السعر: {c['price']:.2f}
-الاتجاه: {c['trend']}
+الترند: {c['trend']}
 الاتجاه الأقوى: {c['strongest_trend']}
+
+📍 الارتكاز {c['pivot_label']}: {c['pivot']:.2f}
+📏 البعد عن الارتكاز: {c['pivot_diff']:+.2f} ({c['pivot_position']})
 
 🔵 دعم: {c['low']:.2f}
 🔴 مقاومة: {c['high']:.2f}
@@ -393,19 +441,13 @@ def msg_pro(tk, tf, c, o):
     return f"""🔥 {tk} Professional | TF: {tf}
 
 السعر: {c['price']:.2f}
-الاتجاه: {c['trend']}
+الترند: {c['trend']}
 الاتجاه الأقوى: {c['strongest_trend']}
 
-🔵 دعم: {c['low']:.2f}
-🔴 مقاومة: {c['high']:.2f}
-
-🧲 القاما: {o['gamma']:.2f}
-📍 Magnet: {o['zlow']:.2f} - {o['zhigh']:.2f}
-📊 احتمال الوصول: {o['prob']}%
-
-💰 كول: {o['call']:.2f}
-💸 بوت: {o['put']:.2f}
-🔥 الأقوى: {o['liq']}
+🔵 دعم {c['pivot_label']}: {c['low']:.2f}
+🔴 مقاومة {c['pivot_label']}: {c['high']:.2f}
+📍 الارتكاز {c['pivot_label']}: {c['pivot']:.2f}
+📏 البعد عن الارتكاز: {c['pivot_diff']:+.2f} ({c['pivot_position']})
 
 📌 دخول: {c['best_entry']:.2f}
 🛑 وقف: {c['sl']:.2f}
@@ -415,7 +457,15 @@ def msg_pro(tk, tf, c, o):
 2) {c['tp2']:.2f}
 3) {c['tp3']:.2f}
 
-📈 القرار: {c['direction']}"""
+📈 القرار النهائي: {c['direction']}
+
+🧲 معلومات القاما:
+القاما: {o['gamma']:.2f}
+Magnet: {o['zlow']:.2f} - {o['zhigh']:.2f}
+احتمال الوصول: {o['prob']}%
+سيولة الكول: {o['call']:.2f}
+سيولة البوت: {o['put']:.2f}
+الأقوى: {o['liq']}"""
 
 def msg_gamma(tk, tf, c, o):
     return f"""🧲 {tk} Gamma & Liquidity | TF: {tf}
@@ -428,22 +478,30 @@ def msg_gamma(tk, tf, c, o):
 💸 سيولة البوت: {o['put']:.2f}
 🔥 الأقوى: {o['liq']}
 
+📍 الارتكاز {c['pivot_label']}: {c['pivot']:.2f}
+📏 البعد عن الارتكاز: {c['pivot_diff']:+.2f} ({c['pivot_position']})
+
 الاتجاه الأقوى: {c['strongest_trend']}
 السعر الحالي: {c['price']:.2f}"""
 
 def msg_sr(tk, tf, c):
     return f"""📈 {tk} Support/Resistance | TF: {tf}
 
-🔵 دعم: {c['low']:.2f}
-🔴 مقاومة: {c['high']:.2f}
+🔵 دعم {c['pivot_label']}: {c['low']:.2f}
+🔴 مقاومة {c['pivot_label']}: {c['high']:.2f}
 
-Pivot: {c['pivot']:.2f}
+📍 الارتكاز {c['pivot_label']}: {c['pivot']:.2f}
+📏 البعد عن الارتكاز: {c['pivot_diff']:+.2f} ({c['pivot_position']})
+
 الاتجاه الأقوى: {c['strongest_trend']}"""
 
 def msg_plan(tk, tf, c):
     return f"""🎯 {tk} Entry Plan | TF: {tf}
 
 الاتجاه الأقوى: {c['strongest_trend']}
+📍 الارتكاز {c['pivot_label']}: {c['pivot']:.2f}
+📏 البعد عن الارتكاز: {c['pivot_diff']:+.2f} ({c['pivot_position']})
+
 📌 دخول: {c['best_entry']:.2f}
 🛑 وقف: {c['sl']:.2f}
 
@@ -462,6 +520,9 @@ Strike: {o['strike']}
 Expiry: {o['expiry']}
 
 الاتجاه الأقوى: {c['strongest_trend']}
+📍 الارتكاز {c['pivot_label']}: {c['pivot']:.2f}
+📏 البعد عن الارتكاز: {c['pivot_diff']:+.2f} ({c['pivot_position']})
+
 📌 دخول: {c['best_entry']:.2f}
 🛑 وقف: {c['sl']:.2f}
 
@@ -474,8 +535,11 @@ def msg_scanner_signal(tk, c, o, score):
     return f"""🚨 فرصة قوية | {tk}
 
 السعر: {c['price']:.2f}
-الاتجاه: {c['trend']}
+الترند: {c['trend']}
 الاتجاه الأقوى: {c['strongest_trend']}
+
+📍 الارتكاز {c['pivot_label']}: {c['pivot']:.2f}
+📏 البعد عن الارتكاز: {c['pivot_diff']:+.2f} ({c['pivot_position']})
 
 📌 دخول: {c['best_entry']:.2f}
 🛑 وقف: {c['sl']:.2f}
@@ -495,7 +559,7 @@ def msg_scanner_signal(tk, c, o, score):
 # =========================
 # تخزين حالة المستخدم
 # =========================
-STATE = {}  # user_id -> {"ticker": str, "tf": str}
+STATE = {}
 
 def set_state(user, ticker=None, tf=None):
     s = STATE.get(user, {"ticker": None, "tf": "1d"})
@@ -512,7 +576,7 @@ def get_state(user):
 # الصيّاد التلقائي
 # =========================
 async def scanner_loop():
-    await asyncio.sleep(10)  # مهلة قصيرة بعد التشغيل
+    await asyncio.sleep(10)
     while True:
         try:
             reset_daily_counter_if_needed()
@@ -533,9 +597,11 @@ async def scanner_loop():
                         continue
 
                     c = core_metrics(df, ticker=ticker)
+                    if c is None:
+                        continue
+
                     o = options_approx(ticker, c["price"])
 
-                    # فقط إشارات فعلية، وليس انتظار
                     if c["direction"] == "انتظار ⚪":
                         continue
 
@@ -582,7 +648,6 @@ async def webhook(req: Request):
     data = await req.json()
 
     try:
-        # رسالة نصية
         if "message" in data:
             msg = data["message"]
             text = msg.get("text", "").strip()
@@ -593,14 +658,13 @@ async def webhook(req: Request):
 
             if text == "/start":
                 set_state(user, ticker=None, tf="1d")
-                send("👋 أهلاً بك\nأرسل رمز السهم من قائمتك مثل: NVDA\nأو اختر من القائمة 👇", main_menu())
+                send("👋 أهلاً بك\nأرسل رمز السهم من قائمتك مثل: NVDA أو SPY\nأو اختر من القائمة 👇", main_menu())
                 return {"ok": True}
 
             if text == "/test":
                 send("✅ البوت شغال 100%")
                 return {"ok": True}
 
-            # parse ticker + tf
             parts = text.upper().split()
             ticker = parts[0]
             tf = parts[1].lower() if len(parts) > 1 else get_state(user)["tf"]
@@ -617,12 +681,15 @@ async def webhook(req: Request):
                 return {"ok": True}
 
             c = core_metrics(df, ticker=ticker)
+            if c is None:
+                send("❌ تعذر حساب الارتكاز لهذا الأصل")
+                return {"ok": True}
+
             o = options_approx(ticker, c["price"])
 
             send(msg_pro(ticker, tf, c, o), main_menu())
             return {"ok": True}
 
-        # أزرار
         if "callback_query" in data:
             cb = data["callback_query"]
             user = str(cb["message"]["chat"]["id"])
@@ -663,6 +730,10 @@ async def webhook(req: Request):
                 return {"ok": True}
 
             c = core_metrics(df, ticker=ticker)
+            if c is None:
+                send("❌ تعذر حساب الارتكاز لهذا الأصل")
+                return {"ok": True}
+
             o = options_approx(ticker, c["price"])
 
             if data_cb == "quick":
