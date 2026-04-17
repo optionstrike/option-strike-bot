@@ -28,6 +28,12 @@ TREND_CONFIRM_HOURS = 3
 SCAN_INTERVAL_SECONDS = 3600  # كل ساعة
 
 # =========================
+# فلتر الدخول المباشر
+# =========================
+ENTRY_MAX_DISTANCE_PCT = 0.015   # 1.5%
+BREAKOUT_BUFFER_PCT = 0.003      # 0.3%
+
+# =========================
 # أصول الارتكاز اليومي
 # =========================
 INDEX_DAILY_PIVOT = {"US500", "SPY", "QQQ", "SPX", "NDX", "US100"}
@@ -254,7 +260,7 @@ def core_metrics(df, ticker=None):
         if ref.empty or len(ref) < 2:
             return None
 
-        prev = ref.iloc[-2]  # آخر شمعة يومية مكتملة
+        prev = ref.iloc[-2]
         ref_high = float(prev["High"])
         ref_low = float(prev["Low"])
         ref_close = float(prev["Close"])
@@ -264,7 +270,7 @@ def core_metrics(df, ticker=None):
         if ref.empty or len(ref) < 2:
             return None
 
-        prev = ref.iloc[-2]  # آخر شمعة أسبوعية مكتملة
+        prev = ref.iloc[-2]
         ref_high = float(prev["High"])
         ref_low = float(prev["Low"])
         ref_close = float(prev["Close"])
@@ -278,7 +284,6 @@ def core_metrics(df, ticker=None):
     tp3 = ref_high + ref_range
     sl = pivot
 
-    # الفرق عن الارتكاز
     pivot_diff = price - pivot
     if pivot_diff > 0:
         pivot_position = "فوق الارتكاز"
@@ -287,12 +292,10 @@ def core_metrics(df, ticker=None):
     else:
         pivot_position = "على الارتكاز"
 
-    # الترند
     ema20 = float(df["Close"].ewm(span=20).mean().iloc[-1])
     ema50 = float(df["Close"].ewm(span=50).mean().iloc[-1])
     trend = "صاعد 📈" if ema20 > ema50 else "هابط 📉"
 
-    # تثبيت الاتجاه بإغلاقات الساعة حول الارتكاز
     confirmed_side = get_confirmed_side_hourly(ticker, pivot) if ticker else "neutral"
 
     if confirmed_side == "above":
@@ -335,7 +338,6 @@ def core_metrics(df, ticker=None):
 
 def options_approx(ticker, price):
     try:
-        # بعض المؤشرات ما عندها options chain، fallback تلقائي
         data_ticker = map_symbol_for_data(ticker)
         s = yf.Ticker(data_ticker)
         exps = s.options
@@ -415,6 +417,32 @@ def calc_score(c, o):
         score += 10
 
     return score
+
+# =========================
+# فلتر الدخول المباشر
+# =========================
+def is_entry_ready_now(c):
+    if c["direction"] == "انتظار ⚪":
+        return False
+
+    price = c["price"]
+    entry = c["best_entry"]
+
+    near_entry = abs(price - entry) / max(entry, 1e-9) <= ENTRY_MAX_DISTANCE_PCT
+
+    breakout_call = (
+        c["direction"].startswith("CALL")
+        and price >= c["best_entry"] * (1 - BREAKOUT_BUFFER_PCT)
+        and c["confirmed_side"] == "above"
+    )
+
+    breakout_put = (
+        c["direction"].startswith("PUT")
+        and price <= c["best_entry"] * (1 + BREAKOUT_BUFFER_PCT)
+        and c["confirmed_side"] == "below"
+    )
+
+    return near_entry or breakout_call or breakout_put
 
 # =========================
 # بناء الرسائل
@@ -532,7 +560,7 @@ Expiry: {o['expiry']}
 3) {c['tp3']:.2f}"""
 
 def msg_scanner_signal(tk, c, o, score):
-    return f"""🚨 فرصة قوية | {tk}
+    return f"""🚨 دخول الآن | {tk}
 
 السعر: {c['price']:.2f}
 الترند: {c['trend']}
@@ -541,7 +569,7 @@ def msg_scanner_signal(tk, c, o, score):
 📍 الارتكاز {c['pivot_label']}: {c['pivot']:.2f}
 📏 البعد عن الارتكاز: {c['pivot_diff']:+.2f} ({c['pivot_position']})
 
-📌 دخول: {c['best_entry']:.2f}
+📌 دخول الآن: {c['best_entry']:.2f}
 🛑 وقف: {c['sl']:.2f}
 
 🎯 الأهداف:
@@ -603,6 +631,9 @@ async def scanner_loop():
                     o = options_approx(ticker, c["price"])
 
                     if c["direction"] == "انتظار ⚪":
+                        continue
+
+                    if not is_entry_ready_now(c):
                         continue
 
                     score = calc_score(c, o)
@@ -766,5 +797,7 @@ def home():
         "watchlist_count": len(WATCHLIST),
         "daily_limit": MAX_SIGNALS_PER_DAY,
         "stock_cooldown_days": STOCK_COOLDOWN_DAYS,
-        "trend_confirm_hours": TREND_CONFIRM_HOURS
+        "trend_confirm_hours": TREND_CONFIRM_HOURS,
+        "entry_max_distance_pct": ENTRY_MAX_DISTANCE_PCT,
+        "breakout_buffer_pct": BREAKOUT_BUFFER_PCT
     }
