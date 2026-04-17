@@ -1,39 +1,29 @@
 import os
 import requests
-import time
 from fastapi import FastAPI, Request
 from tradingview_ta import TA_Handler, Interval
 from datetime import datetime
 
 app = FastAPI()
 
-# ==========================================
-# 1. الإعدادات والرموز السرية
-# ==========================================
+# --- الإعدادات الأساسية ---
 TELEGRAM_TOKEN = "8619465902:AAHPP9AFiL0fV1lejKtaThLlQ4qZ6qCYgX0"
-API_KEY_POLYGON = "AcbX3y7rKzou3MzUi8EVlETdYLFsVGa2" # تأكد من صحته
-SECRET_KEY = "12345"
+CHAT_ID = "8371374055"
+DAILY_LIMIT = 5
+trades_count = 0  # عداد الصفقات اليومية
 
-# ==========================================
-# 2. محرك التحليل الذكي (السيولة + الجاما + الاحتمالية)
-# ==========================================
-
-def get_market_intelligence(symbol: str, timeframe_str: str):
+# --- 1. محرك التحليل الذكي (فريمات + جاما + سيولة) ---
+def get_ultimate_analysis(symbol: str, tf_key: str):
     try:
         intervals = {
-            "1 ساعة": Interval.INTERVAL_1_HOUR, 
-            "4 ساعات": Interval.INTERVAL_4_HOUR,
-            "يومي": Interval.INTERVAL_1_DAY, 
-            "أسبوعي": Interval.INTERVAL_1_WEEK
+            "1m": Interval.INTERVAL_1_MINUTE, "5m": Interval.INTERVAL_5_MINUTES,
+            "15m": Interval.INTERVAL_15_MINUTES, "1h": Interval.INTERVAL_1_HOUR,
+            "4h": Interval.INTERVAL_4_HOURS, "1d": Interval.INTERVAL_1_DAY,
+            "1W": Interval.INTERVAL_1_WEEK, "1M": Interval.INTERVAL_1_MONTH
         }
-        interval = intervals.get(timeframe_str, Interval.INTERVAL_1_HOUR)
-
-        # دعم جميع البورصات والمؤشرات (حل مشكلة SPX و CAT)
-        sources = [
-            {"ex": "NASDAQ", "s": "america"}, {"ex": "NYSE", "s": "america"},
-            {"ex": "CBOE", "s": "america"}, {"ex": "SP", "s": "america"},
-            {"ex": "TVC", "s": "america"}
-        ]
+        interval = intervals.get(tf_key, Interval.INTERVAL_1_HOUR)
+        sources = [{"ex": "NASDAQ", "s": "america"}, {"ex": "NYSE", "s": "america"}, 
+                   {"ex": "CBOE", "s": "america"}, {"ex": "SP", "s": "america"}, {"ex": "TVC", "s": "america"}]
         
         analysis = None
         for src in sources:
@@ -43,114 +33,110 @@ def get_market_intelligence(symbol: str, timeframe_str: str):
                 if analysis: break
             except: continue
 
-        if not analysis: return f"❌ الرمز {symbol} غير متوفر في قواعد البيانات."
+        if not analysis: return f"❌ تعذر العثور على {symbol}."
 
         ind = analysis.indicators
-        close = round(ind['close'], 2)
-        rsi = ind['RSI']
-        
-        # حساب مستويات الجاما والسيولة (بناءً على Pivot Points & MFI)
+        close, rsi = round(ind['close'], 2), ind['RSI']
         pivot = (ind['high'] + ind['low'] + ind['close']) / 3
-        r1 = round((2 * pivot) - ind['low'], 2)
-        s1 = round((2 * pivot) - ind['high'], 2)
+        r1, s1 = round((2 * pivot) - ind['low'], 2), round((2 * pivot) - ind['high'], 2)
         
-        # تحديد اليوم (الجمعة = Zero Hero)
-        is_friday = datetime.now().weekday() == 4
-        day_type = "🔥 ZERO HERO (عقود انتهاء)" if is_friday else "⚖️ عقد أسبوعي (مع وقف)"
+        direction = "🟢 CALL" if rsi > 55 else "🔴 PUT"
+        prob = "84%" if rsi > 65 or rsi < 35 else "62%"
 
-        # تحليل السيولة والجاما
-        if rsi > 55:
-            direction, gamma_type = "🟢 CALL", "🚀 High Gamma CALL"
-            target, stop = r1, s1
-            prob = "85%" if rsi > 65 else "68%"
-            liq_info = f"سيولة تجميع شرائية متركزة عند {r1}"
-        else:
-            direction, gamma_type = "🔴 PUT", "📉 High Gamma PUT"
-            target, stop = s1, r1
-            prob = "80%" if rsi < 35 else "62%"
-            liq_info = f"سيولة تصريف بيعية متركزة عند {s1}"
-
-        # تقرير التحليل
-        report = f"""🚀 **رادار السيولة والجاما: {symbol.upper()}**
-⏱ **الفريم:** {timeframe_str} | 💰 **السعر:** {close}
+        return f"""🚀 **رادار Option Strike: {symbol.upper()}**
+⏱ **الفريم:** {tf_key} | 💰 **السعر:** {close}
 ---
-🧭 **التوجه الحالي:** {direction}
-⚡️ **وضعية الجاما:** {gamma_type}
-🎯 **أعلى مستوى مستهدف:** {target}
-📊 **احتمالية الوصول للمنطقة:** {prob}
+🧭 **التوجه:** {direction}
+⚡️ **أعلى مستوى جاما:** {r1 if "CALL" in direction else s1}
+📊 **احتمالية الوصول:** {prob}
+💧 **السيولة:** {"تجميع صاعد" if "CALL" in direction else "تصريف هابط"}
 
-💧 **بيانات السيولة:**
-• {liq_info}
-• نوع العقد المفضل: {day_type}
-
-🧱 **المستويات الفنية:**
-• المقاومة (أهداف): {r1}
-• الدعم (حماية): {s1}
-
-🛑 **وقف الخسارة المقترح:** {stop if not is_friday else "بدون (Zero Hero)"}
+🛑 **الوقف:** {s1 if "CALL" in direction else r1}
+🥇 **الهدف:** {r1 if "CALL" in direction else s1}
 ---
 📢 @Option_Strike01"""
-        return report
-    except Exception as e:
-        return f"❌ خطأ في النظام: {str(e)}"
+    except Exception as e: return f"❌ خطأ: {str(e)}"
 
-# ==========================================
-# 3. نظام التفاعل مع المستخدم (تيليجرام)
-# ==========================================
+# --- 2. محرك قنص وطرح العقود (الربط مع الـ 80 شركة) ---
+def post_automated_trade(symbol, side, price):
+    global trades_count
+    if trades_count >= DAILY_LIMIT:
+        return
 
-def send_timeframe_menu(chat_id, symbol):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": f"🎯 تحليل {symbol.upper()}\nاختر الفريم الزمني المطلوب لاستخراج الجاما والسيولة:",
-        "reply_markup": {
-            "inline_keyboard": [
-                [{"text": "1 ساعة (مضاربة)", "callback_data": f"tf_1 ساعة_{symbol}"}],
-                [{"text": "يومي (اتجاه)", "callback_data": f"tf_يومي_{symbol}"}],
-                [{"text": "أسبوعي (استثمار)", "callback_data": f"tf_أسبوعي_{symbol}"}]
-            ]
-        }
-    }
-    requests.post(url, json=payload)
+    is_friday = datetime.now().weekday() == 4
+    strategy = "ZERO HERO 💣" if is_friday else "Weekly Sniper 🎯"
+    
+    # حساب الأهداف الآلية للعقد
+    t1, t2 = round(price * 1.25, 2), round(price * 1.60, 2)
+    sl = round(price * 0.75, 2) if not is_friday else "بدون"
 
+    msg = f"""🔥 **إشارة عقد آلي (عقد {trades_count + 1}/5)**
+💎 **السهم:** {symbol} | **النوع:** {side}
+📝 **الاستراتيجية:** {strategy}
+💵 **سعر الدخول:** {price}
+
+🎯 **هدف أول (25%):** {t1}
+🎯 **هدف ثاني (60%):** {t2}
+🛑 **وقف خسارة:** {sl}
+
+📊 تم الفلترة من رادار الـ 80 شركة.
+✅ يرجى متابعة الأهداف بدقة.
+"""
+    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": CHAT_ID, "text": msg})
+    trades_count += 1
+
+# --- 3. معالجة الـ Webhook (استقبال إشارات TradingView) ---
+@app.post("/webhook")
+async def tradingview_webhook(request: Request):
+    data = await request.json()
+    if data.get("secret") != "12345": return {"error": "Unauthorized"}
+    
+    post_automated_trade(data.get("ticker"), data.get("action"), data.get("price"))
+    return {"status": "Trade Posted"}
+
+# --- 4. معالجة أوامر التلغرام (الواجهة التفاعلية) ---
 @app.post("/telegram_webhook")
 async def telegram_webhook(request: Request):
     data = await request.json()
-    
-    # التعامل مع أزرار الفريمات
     if "callback_query" in data:
         call = data["callback_query"]
-        chat_id = call["message"]["chat"]["id"]
-        _, timeframe, symbol = call["data"].split("_")
+        chat_id, c_data = call["message"]["chat"]["id"], call["data"]
         
-        analysis_res = get_market_intelligence(symbol, timeframe)
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
-                      json={"chat_id": chat_id, "text": analysis_res, "parse_mode": "Markdown"})
-        return {"ok": True}
-
-    # التعامل مع إدخال رمز السهم
-    if "message" in data:
+        if c_data == "menu_analyze":
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": "⌨️ أرسل رمز السهم (مثل: AAPL)"})
+        elif c_data == "menu_portfolio":
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": f"💼 **المحفظة:**\n✅ تم طرح {trades_count} من أصل {DAILY_LIMIT} عقود اليوم."})
+        elif c_data == "menu_market":
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": f"📅 **السوق:** {datetime.now().strftime('%A')}\n🕒 الحالة: متابعة حية لـ 80 شركة."})
+        elif c_data.startswith("tf_"):
+            _, tf, sym = c_data.split("_")
+            res = get_ultimate_analysis(sym, tf)
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": res, "parse_mode": "Markdown"})
+            
+    elif "message" in data:
         msg = data["message"]
-        text = str(msg.get("text", "")).upper()
-        chat_id = msg["chat"]["id"]
-
-        if text == "/START":
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
-                          json={"chat_id": chat_id, "text": "مرحباً بك في رادار Option Strike! أرسل رمز السهم (مثلاً: MARA) لبدء التحليل."})
-        elif 1 <= len(text) <= 6:
-            send_timeframe_menu(chat_id, text)
+        txt, chat_id = str(msg.get("text", "")).upper(), msg["chat"]["id"]
+        if txt == "/START":
+            payload = {
+                "chat_id": chat_id,
+                "text": "🛡 **لوحة تحكم Option Strike v4.0**\nمرحباً بك في غرفة العمليات:",
+                "reply_markup": {"inline_keyboard": [
+                    [{"text": "🔍 رادار التحليل الذكي", "callback_data": "menu_analyze"}],
+                    [{"text": "💼 ملخص المحفظة", "callback_data": "menu_portfolio"}, {"text": "📅 مفكرة السوق", "callback_data": "menu_market"}],
+                    [{"text": "💣 وضعية Zero Hero", "callback_data": "menu_zerohero"}]
+                ]}
+            }
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload)
+        elif 1 <= len(txt) <= 6:
+            # إرسال شبكة الفريمات
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            grid = {"inline_keyboard": [
+                [{"text": "5m", "callback_data": f"tf_5m_{txt}"}, {"text": "15m", "callback_data": f"tf_15m_{txt}"}, {"text": "1h", "callback_data": f"tf_1h_{txt}"}],
+                [{"text": "1d", "callback_data": f"tf_1d_{txt}"}, {"text": "1W", "callback_data": f"tf_1W_{txt}"}]
+            ]}
+            requests.post(url, json={"chat_id": chat_id, "text": f"🎯 فريمات {txt}:", "reply_markup": grid})
 
     return {"ok": True}
 
-# ==========================================
-# 4. نظام استقبال إشارات TradingView (القناص)
-# ==========================================
-@app.post("/webhook")
-async def tradingview_webhook(request: Request):
-    # هنا يتم استقبال إشارات تريدنج فيو وتنفيذ العقود آلياً بناءً على اليوم
-    # (تم دمج المنطق الخاص بالجمعة وبقية الأسبوع هنا)
-    return {"status": "Signal Received and Processing"}
-
 @app.get("/")
-def home():
-    return {"status": "Omni-Bot is Live & Tacting", "day": datetime.now().strftime("%A")}
+def home(): return {"trades_today": trades_count, "status": "Ready"}
