@@ -15,76 +15,58 @@ async def send_msg(chat_id, text, markup=None):
     if markup: payload["reply_markup"] = markup
     try:
         async with httpx.AsyncClient() as client:
-            await client.post(url, json=payload, timeout=10.0)
+            await client.post(url, json=payload, timeout=5.0)
     except: pass
 
-async def get_pure_analysis(symbol, tf_key, include_option=False):
+async def get_full_analysis(symbol, tf_key, include_option=False):
     try:
-        # 1. إعداد الفريمات
         itv_map = {"5m": Interval.INTERVAL_5_MINUTES, "1h": Interval.INTERVAL_1_HOUR, "1d": Interval.INTERVAL_1_DAY, "1W": Interval.INTERVAL_1_WEEK, "1M": Interval.INTERVAL_1_MONTH}
         itv = itv_map.get(tf_key, Interval.INTERVAL_1_HOUR)
         
-        # 2. جلب البيانات الفنية
         h = TA_Handler(symbol=symbol.upper(), screener="america", exchange="NASDAQ", interval=itv)
-        analysis = await asyncio.to_thread(h.get_analysis)
+        # حماية: الانتظار 3 ثواني فقط للتحليل الفني
+        analysis = await asyncio.wait_for(asyncio.to_thread(h.get_analysis), timeout=3.0)
+        
         ind = analysis.indicators
         close, rsi = round(ind['close'], 2), ind['RSI']
         is_call = rsi > 50
+        pivot = (ind['high'] + ind['low'] + ind['close']) / 3
         
-        # 3. حساب مستويات القاما والأهداف الثلاثة (بمعادلات Pivot Points)
-        high, low, cp = ind['high'], ind['low'], ind['close']
-        pivot = (high + low + cp) / 3
-        
-        if is_call:
-            t1 = round((2 * pivot) - low, 2) # مستوى القاما
-            t2 = round(pivot + (high - low), 2)
-            t3 = round(high + 2*(pivot - low), 2)
-            sl = round(low, 2)
-        else:
-            t1 = round((2 * pivot) - high, 2) # مستوى القاما
-            t2 = round(pivot - (high - low), 2)
-            t3 = round(low - 2*(high - pivot), 2)
-            sl = round(high, 2)
+        # حساب الأهداف الثلاثة والوقف
+        t1 = round((2 * pivot) - ind['low'], 2) if is_call else round((2 * pivot) - ind['high'], 2)
+        t2 = round(pivot + (ind['high'] - ind['low']), 2) if is_call else round(pivot - (ind['high'] - ind['low']), 2)
+        t3 = round(ind['high'] + 2*(pivot - ind['low']), 2) if is_call else round(ind['low'] - 2*(ind['high'] - pivot), 2)
+        sl = round(ind['low'], 2) if is_call else round(ind['high'], 2)
         
         prob = min(94, max(55, int(rsi + 20) if is_call else int((100 - rsi) + 20)))
         time_est = {"5m": "30د", "1h": "4س", "1d": "3أيام", "1W": "أسبوع+", "1M": "شهر+"}.get(tf_key, "---")
 
-        res = f"""🚀 *نتائج قناص {symbol.upper()}*
----
-⏱ الفريم: {tf_key} | 💰 السعر: {close}
-🧭 التوجه: {'🟢 CALL (صعود)' if is_call else '🔴 PUT (هبوط)'}
+        res = f"🚀 *نتائج قناص {symbol.upper()}*\n---\n⏱ الفريم: {tf_key} | 💰 السعر: {close}\n🧭 التوجه: {'🟢 CALL' if is_call else '🔴 PUT'}\n\n🎯 *الأهداف:*\n1️⃣ `{t1}` | 2️⃣ `{t2}` | 3️⃣ `{t3}`\n🛑 *الوقف:* `{sl}`\n\n📊 الاحتمالية: `{prob}%` | ⏳ الوقت: `{time_est}`"
 
-🎯 *أهداف السهم:*
-1️⃣ الهدف الأول: `{t1}` (القاما)
-2️⃣ الهدف الثاني: `{t2}`
-3️⃣ الهدف الثالث: `{t3}`
-
-🛑 *وقف الخسارة:* `{sl}`
-
-📊 الاحتمالية: `{prob}%` | ⏳ الوقت: `{time_est}`"""
-
-        if include_option: # للطرح الآلي فقط يبقى العقد كاملاً
+        # إضافة بيانات العقد في الطرح الآلي فقط
+        if include_option:
             try:
                 side = "call" if is_call else "put"
-                url = f"https://api.marketdata.app/v1/options/quotes/{symbol}/?range=itm&side={side}&token={MARKET_KEY}"
+                opt_url = f"https://api.marketdata.app/v1/options/quotes/{symbol}/?range=itm&side={side}&token={MARKET_KEY}"
                 async with httpx.AsyncClient() as client:
-                    r = await client.get(url, timeout=2.0)
+                    r = await client.get(opt_url, timeout=1.5)
                     d = r.json()
                     if d.get('s') == 'ok':
                         p = d['mid'][0]
-                        res += f"\n\n📦 *العقد المقترح:*\n🔹 السترايك: {d['strike'][0]}\n💵 الدخول: {p}\n✅ هدف (30%): {round(p*1.3, 2)}"
+                        res += f"\n\n📦 *العقد:* {d['strike'][0]} | 💵: {p}\n✅ هدف (30%): {round(p*1.3, 2)}"
             except: pass
-        
+
         return res + "\n---\n📢 @Option_Strike01"
-    except: return f"❌ فشل تحليل {symbol}. تأكد من الرمز."
+    except asyncio.TimeoutError: return f"⚠️ السيرفر بطيء حالياً في تحليل {symbol}. جرب مرة أخرى."
+    except: return f"❌ فشل تحليل {symbol}."
 
 @app.post("/webhook")
 async def signals(request: Request):
-    """طرح الـ 80 شركة (بالعقود والأهداف)"""
+    """طرح الـ 80 شركة (بالعقود)"""
     data = await request.json()
     if data.get("secret") == "12345":
         symbol = data.get("ticker")
-        res = await get_pure_analysis(symbol, "1h", include_option=True)
+        res = await get_full_analysis(symbol, "1h", include_option=True)
         await send_msg(CHAT_ID, f"🔥 *طرح آلي*\n{res}")
     return {"ok": True}
 
@@ -96,19 +78,26 @@ async def telegram(request: Request):
         async with httpx.AsyncClient() as client:
             await client.post(f"https://api.telegram.org/bot{TOKEN}/answerCallbackQuery", json={"callback_query_id": call["id"]})
         
-        if c_data == "menu_analyze": await send_msg(cid, "⌨️ أرسل الرمز (مثال: TSLA):")
-        elif c_data == "menu_market": await send_msg(cid, "📅 السوق: 4:30م - 11:00م")
+        if c_data == "menu_analyze": await send_msg(cid, "⌨️ أرسل الرمز (مثال: NVDA):")
+        elif c_data == "menu_market": await send_msg(cid, "📅 السوق الأمريكي: 4:30م - 11:00م")
+        elif c_data == "menu_portfolio": await send_msg(cid, "💼 *محفظتك:*\n- العمليات المفتوحة: 0\n- الأرباح اليوم: $0.00")
+        elif c_data == "menu_zerohero": await send_msg(cid, "💣 *Zero Hero:*\nقريباً.. سيتم طرح عقود انتهاء اليوم هنا.")
         elif c_data.startswith("tf_"):
             _, tf, sym = c_data.split("_")
-            await send_msg(cid, f"⏳ جاري تحليل {sym}...")
-            res = await get_pure_analysis(sym, tf, include_option=False)
+            await send_msg(cid, f"⏳ جاري قنص {sym}...")
+            res = await get_full_analysis(sym, tf, include_option=False)
             await send_msg(cid, res)
 
     elif "message" in data:
         msg = data["message"]; cid = msg["chat"]["id"]; txt = str(msg.get("text", "")).upper().strip()
         if txt in ["/START", "START"]:
-            keyboard = {"inline_keyboard": [[{"text": "🔍 رادار التحليل", "callback_data": "menu_analyze"}], [{"text": "📅 السوق", "callback_data": "menu_market"}]]}
-            await send_msg(cid, "🛡 *Option Strike v16.0*", keyboard)
+            # إرجاع اللوحة الكاملة كما كانت
+            menu = {"inline_keyboard": [
+                [{"text": "🔍 رادار التحليل", "callback_data": "menu_analyze"}],
+                [{"text": "💼 المحفظة", "callback_data": "menu_portfolio"}, {"text": "📅 السوق", "callback_data": "menu_market"}],
+                [{"text": "💣 Zero Hero", "callback_data": "menu_zerohero"}]
+            ]}
+            await send_msg(cid, "🛡 *لوحة تحكم Option Strike v18.0*", menu)
         elif 1 <= len(txt) <= 6:
             btns = {"inline_keyboard": [
                 [{"text": "5m", "callback_data": f"tf_5m_{txt}"}, {"text": "1h", "callback_data": f"tf_1h_{txt}"}, {"text": "1d", "callback_data": f"tf_1d_{txt}"}],
@@ -118,4 +107,4 @@ async def telegram(request: Request):
     return {"ok": True}
 
 @app.get("/")
-def home(): return "Ready"
+def home(): return "Full Control Active"
