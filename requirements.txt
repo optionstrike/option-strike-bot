@@ -1,5 +1,6 @@
 fastapi
 uvicorn
-httpx
-tradingview-ta
-python-multipart
+requests
+yfinance
+pandas
+numpy
