@@ -234,5 +234,6 @@ def monitor_loop():
 def startup():
     threading.Thread(target=monitor_loop, daemon=True).start()
 
-@app.get("/")
-def home(): return {"status": "Live", "signals_today": daily_tracker["sent_count"]}
+@app.api_route("/", methods=["GET", "HEAD"])
+def home():
+    return {"status": "Live"}
