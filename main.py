@@ -296,7 +296,6 @@ def get_option_chain_snapshot(underlying: str):
     data = massive_get(f"/v3/snapshot/options/{underlying}")
     results = data.get("results", [])
     if isinstance(results, dict):
-        # بعض الردود قد ترجع dict فيها list
         if "results" in results and isinstance(results["results"], list):
             results = results["results"]
         else:
@@ -526,28 +525,37 @@ def choose_best_contract_from_massive(ticker: str, c: dict):
         limit_price = contract_price_limit_for_ticker(ticker)
         underlying_price = c["price"]
 
-        candidates = []
+        # 1) فلترة العقود حسب النوع والسعر والانتهاء أولًا
+        filtered = []
         for x in parsed:
             if x["contract_type"] != target_type:
                 continue
-            if x["contract_price"] <= 0 or x["contract_price"] > limit_price:
-                continue
             if not x["expiration"]:
                 continue
+            if x["contract_price"] is None or x["contract_price"] <= 0:
+                continue
+            if x["contract_price"] > limit_price:
+                continue
+            filtered.append(x)
 
-            # نفضّل الأقرب للسعر الحالي + OI أعلى + دلتا منطقية
+        if not filtered:
+            return None
+
+        # 2) من داخل العقود المسموح بها فقط نختار الأقرب للسعر
+        candidates = []
+        for x in filtered:
             strike_distance = abs(x["strike"] - underlying_price)
-            delta_score = 0
-            if target_type == "call":
-                delta_score = abs(abs(x["delta"]) - 0.35)
-            else:
-                delta_score = abs(abs(x["delta"]) - 0.35)
 
+            # نفضّل ديلتا قريبة من 0.35 تقريبًا
+            delta_score = abs(abs(x["delta"]) - 0.35)
+
+            # الأفضلية للأقرب سترايك داخل السعر + OI + Gamma
             score = (
-                strike_distance * 2
+                strike_distance * 3
                 + delta_score * 10
-                - min(x["oi"], 100000) / 10000
-                - min(x["gamma"], 1.0) * 10
+                - min(x["oi"], 100000) / 12000
+                - min(abs(x["gamma"]), 1.0) * 8
+                + abs(x["contract_price"] - min(limit_price, x["contract_price"])) * 0.1
             )
             candidates.append((score, x))
 
@@ -557,11 +565,10 @@ def choose_best_contract_from_massive(ticker: str, c: dict):
         candidates.sort(key=lambda z: z[0])
         best = candidates[0][1]
 
-        contract_price = float(best["contract_price"])
-        entry_high = round(contract_price, 2)
+        contract_price = round(float(best["contract_price"]), 2)
+        entry_high = contract_price
         entry_low = round(max(0.10, contract_price - ENTRY_ZONE_WIDTH), 2)
 
-        # أهداف العقد نفسها
         tp1 = round(contract_price + 0.60, 2)
         tp2 = round(contract_price + 1.20, 2)
         tp3 = round(contract_price + 1.80, 2)
@@ -582,7 +589,7 @@ def choose_best_contract_from_massive(ticker: str, c: dict):
 
         return {
             "option_ticker": best["ticker"],
-            "strike": best["strike"],
+            "strike": round(best["strike"], 2),
             "expiration": best["expiration"],
             "contract_type": best["contract_type"],
             "contract_price": contract_price,
@@ -592,13 +599,13 @@ def choose_best_contract_from_massive(ticker: str, c: dict):
             "tp2": tp2,
             "tp3": tp3,
             "stop_text": stop_text,
-            "delta": best["delta"],
-            "gamma": best["gamma"],
-            "iv": best["iv"],
+            "delta": round(best["delta"], 2),
+            "gamma": round(best["gamma"], 4),
+            "iv": round(best["iv"], 4),
             "oi": best["oi"],
             "success_rate": success_rate,
         }
-    except:
+    except Exception:
         return None
 
 # =========================
@@ -912,14 +919,12 @@ async def contract_update_loop():
                 if price > sig["highest_price"]:
                     sig["highest_price"] = price
 
-                # أول تحديث عند الهدف الأول
                 if not sig["first_update_sent"] and price >= sig["tp1"]:
                     send(msg_contract_update(sig["channel_title"], sig["entry_price"], price))
                     sig["first_update_sent"] = True
                     sig["last_update_trigger_price"] = price
                     continue
 
-                # بعد الهدف الأول: كل 30 سنت
                 if sig["first_update_sent"]:
                     if price >= sig["last_update_trigger_price"] + UPDATE_STEP_AFTER_TP1:
                         send(msg_contract_update(sig["channel_title"], sig["entry_price"], price))
@@ -987,9 +992,7 @@ async def scanner_loop():
                 if stock_in_cooldown(ticker):
                     continue
 
-                # التحليل الداخلي
                 send(msg_pro(ticker, "1h", c, o, contract))
-                # نسخة القناة
                 send(msg_channel_post(ticker, contract))
 
                 register_contract_signal(ticker, contract)
