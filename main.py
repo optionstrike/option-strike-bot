@@ -324,3 +324,259 @@ def format_news_message(ticker: str = None):
         msg += "\n"
 
     return msg
+# =========================
+# بيانات العقود
+# =========================
+
+def parse_contract_price_from_snapshot(item):
+    candidates = [
+        safe_get(item, "last_trade", "price"),
+        safe_get(item, "last_trade", "p"),
+        safe_get(item, "session", "close"),
+        safe_get(item, "session", "last"),
+        safe_get(item, "details", "last_price"),
+        safe_get(item, "day", "close"),
+        safe_get(item, "day", "last"),
+        safe_get(item, "min", "close"),
+    ]
+    for x in candidates:
+        try:
+            if x is not None and float(x) > 0:
+                return float(x)
+        except Exception:
+            pass
+    return None
+
+def parse_underlying_price_from_snapshot(item):
+    candidates = [
+        safe_get(item, "underlying_asset", "price"),
+        safe_get(item, "underlying_asset", "last", "price"),
+        safe_get(item, "underlying_asset", "last_trade", "price"),
+        safe_get(item, "underlying_asset", "value"),
+    ]
+    for x in candidates:
+        try:
+            if x is not None:
+                return float(x)
+        except Exception:
+            pass
+    return None
+
+def parse_contract_meta(item):
+    details = safe_get(item, "details", default={}) or {}
+    greeks = safe_get(item, "greeks", default={}) or {}
+    return {
+        "ticker": details.get("ticker") or item.get("ticker") or item.get("option_ticker"),
+        "strike": float(details.get("strike_price", 0) or 0),
+        "expiration": details.get("expiration_date", ""),
+        "contract_type": (details.get("contract_type") or "").lower(),
+        "delta": float(greeks.get("delta", 0) or 0),
+        "gamma": float(greeks.get("gamma", 0) or 0),
+        "iv": float(item.get("implied_volatility", 0) or 0),
+        "oi": int(item.get("open_interest", 0) or 0),
+        "contract_price": parse_contract_price_from_snapshot(item),
+        "underlying_price": parse_underlying_price_from_snapshot(item),
+    }
+
+def get_option_chain_snapshot(underlying: str):
+    try:
+        data = massive_get(f"/v3/snapshot/options/{underlying}", params={"limit": 250})
+        results = data.get("results", [])
+        if isinstance(results, list):
+            return results
+        return []
+    except Exception as e:
+        print(f"[CHAIN ERROR] {underlying}: {e}")
+        return []
+
+def get_option_contract_snapshot(underlying: str, option_contract: str):
+    try:
+        data = massive_get(f"/v3/snapshot/options/{underlying}/{option_contract}")
+        return data.get("results", data)
+    except Exception:
+        return {}
+
+def get_option_last_trade(option_contract: str):
+    try:
+        data = massive_get(f"/v2/last/trade/{option_contract}")
+        return data.get("results", {})
+    except Exception:
+        return {}
+
+# =========================
+# أدوات خاصة بالعقود
+# =========================
+
+def is_spac_ticker(ticker: str) -> bool:
+    return ticker in SPAC_TICKERS
+
+def is_friday_now() -> bool:
+    return datetime.now().weekday() == 4
+
+def contract_price_limit_for_ticker(ticker: str) -> float:
+    return MAX_SPAC_CONTRACT_PRICE if is_spac_ticker(ticker) else MAX_COMPANY_CONTRACT_PRICE
+
+def days_to_expiry(expiration_str: str):
+    try:
+        exp = datetime.strptime(expiration_str, "%Y-%m-%d").date()
+        return (exp - datetime.now().date()).days
+    except Exception:
+        return None
+
+def build_contract_from_pick(best, c, target_type, mode="NORMAL"):
+    contract_price = round(float(best["contract_price"]), 2)
+    return {
+        "option_ticker": best["ticker"],
+        "strike": round(best["strike"], 2),
+        "expiration": best["expiration"],
+        "contract_type": best["contract_type"],
+        "contract_price": contract_price,
+        "entry_high": contract_price,
+        "entry_low": round(max(0.10, contract_price - ENTRY_ZONE_WIDTH), 2),
+        "tp1": round(contract_price + 0.60, 2),
+        "tp2": round(contract_price + 1.20, 2),
+        "tp3": round(contract_price + 1.80, 2),
+        "stop_text": f"إغلاق شمعة ساعة {'تحت' if target_type == 'call' else 'فوق'} {c['pivot']:.2f}",
+        "delta": round(best["delta"], 2),
+        "gamma": round(best["gamma"], 4),
+        "iv": round(best["iv"], 4),
+        "oi": best["oi"],
+        "mode": mode
+    }
+
+# =========================
+# تثبيت الاتجاه
+# =========================
+
+def get_confirmed_side_hourly(ticker: str, pivot: float):
+    df_1h = get_df(ticker, "1h")
+    if df_1h.empty or len(df_1h) < 3:
+        return "neutral"
+
+    closes = df_1h["Close"].tail(3)
+
+    if all(closes > pivot):
+        side = "above"
+    elif all(closes < pivot):
+        side = "below"
+    else:
+        side = "neutral"
+
+    prev = TREND_STATE.get(ticker)
+
+    if prev is None:
+        TREND_STATE[ticker] = {"side": side, "confirmed_at": datetime.now()}
+        return side
+
+    if prev["side"] == side:
+        return side
+
+    if side == "neutral":
+        return prev["side"]
+
+    if datetime.now() - prev["confirmed_at"] >= timedelta(hours=TREND_CONFIRM_HOURS):
+        TREND_STATE[ticker] = {"side": side, "confirmed_at": datetime.now()}
+        return side
+
+    return prev["side"]
+
+# =========================
+# حسابات الارتكاز
+# =========================
+
+def core_metrics(df, ticker=None):
+    if df.empty:
+        return None
+
+    price = float(df["Close"].iloc[-1])
+
+    if ticker in INDEX_DAILY_PIVOT:
+        ref = get_df(ticker, "1d")
+        if ref.empty or len(ref) < 2:
+            return None
+        prev = ref.iloc[-2]
+        pivot_label = "اليومي"
+    else:
+        ref = get_df(ticker, "1w")
+        if ref.empty or len(ref) < 2:
+            return None
+        prev = ref.iloc[-2]
+        pivot_label = "الأسبوعي"
+
+    ref_high = float(prev["High"])
+    ref_low = float(prev["Low"])
+    ref_close = float(prev["Close"])
+
+    pivot = (ref_high + ref_low + ref_close) / 3.0
+    ref_range = ref_high - ref_low
+
+    call_tp1 = pivot + ref_range * 0.5
+    call_tp2 = pivot + ref_range
+    call_tp3 = ref_high + ref_range * 0.5
+
+    put_tp1 = pivot - ref_range * 0.5
+    put_tp2 = pivot - ref_range
+    put_tp3 = ref_low - ref_range * 0.5
+
+    pivot_diff = price - pivot
+    if pivot_diff > 0:
+        pivot_position = "فوق الارتكاز"
+    elif pivot_diff < 0:
+        pivot_position = "تحت الارتكاز"
+    else:
+        pivot_position = "على الارتكاز"
+
+    ema20 = float(df["Close"].ewm(span=20).mean().iloc[-1])
+    ema50 = float(df["Close"].ewm(span=50).mean().iloc[-1])
+    trend = "صاعد 📈" if ema20 > ema50 else "هابط 📉"
+
+    confirmed_side = get_confirmed_side_hourly(ticker, pivot) if ticker else "neutral"
+
+    if confirmed_side == "above":
+        strongest_trend = "صاعد قوي 🔥"
+    elif confirmed_side == "below":
+        strongest_trend = "هابط قوي 🔻"
+    else:
+        strongest_trend = "محايد ⚖️"
+
+    if trend == "صاعد 📈" and price > pivot:
+        direction = "CALL 🟢"
+    elif trend == "هابط 📉" and price < pivot:
+        direction = "PUT 🔴"
+    elif confirmed_side == "above":
+        direction = "CALL 🟢"
+    elif confirmed_side == "below":
+        direction = "PUT 🔴"
+    elif price > pivot:
+        direction = "CALL 🟢"
+    else:
+        direction = "PUT 🔴"
+
+    best_entry = pivot + 0.2 if direction.startswith("CALL") else pivot - 0.2
+
+    return {
+        "price": price,
+        "high": ref_high,
+        "low": ref_low,
+        "pivot": pivot,
+        "pivot_label": pivot_label,
+        "pivot_diff": pivot_diff,
+        "pivot_position": pivot_position,
+        "call_tp1": call_tp1,
+        "call_tp2": call_tp2,
+        "call_tp3": call_tp3,
+        "put_tp1": put_tp1,
+        "put_tp2": put_tp2,
+        "put_tp3": put_tp3,
+        "tp1": call_tp1,
+        "tp2": call_tp2,
+        "tp3": call_tp3,
+        "sl": pivot,
+        "trend": trend,
+        "strongest_trend": strongest_trend,
+        "direction": direction,
+        "best_entry": best_entry,
+        "confirmed_side": confirmed_side,
+        "ema20": ema20,
+        "ema50": ema50
+    }
