@@ -2,18 +2,36 @@ from fastapi import FastAPI, Request
 import requests
 import yfinance as yf
 import pandas as pd
-import time
 import asyncio
+import os
+import logging
 from datetime import datetime, timedelta
+from typing import Optional
 
 app = FastAPI()
 
 # =========================
-# بياناتك
+# Logging
 # =========================
-TOKEN = "8619465902:AAHPP9AFiL0fV1lejKtaThLlQ4qZ6qCYgX0"
-CHAT_ID = "8371374055"
-MASSIVE_API_KEY = "AcbX3y7rKzou3MzUi8EVlETdYLFsVGa2"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+logger = logging.getLogger("options_bot")
+
+# =========================
+# بياناتك - من البيئة فقط
+# =========================
+TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+MASSIVE_API_KEY = os.getenv("MASSIVE_API_KEY", "").strip()
+
+if not TOKEN:
+    raise RuntimeError("Missing TELEGRAM_TOKEN in environment variables")
+if not CHAT_ID:
+    raise RuntimeError("Missing TELEGRAM_CHAT_ID in environment variables")
+if not MASSIVE_API_KEY:
+    raise RuntimeError("Missing MASSIVE_API_KEY in environment variables")
 
 API_SEND = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 API_ANSWER = f"https://api.telegram.org/bot{TOKEN}/answerCallbackQuery"
@@ -80,7 +98,15 @@ HTTP = requests.Session()
 # =========================
 # منع التكرار
 # =========================
-def allow(user):
+_USER_LAST_ACTION = {}
+USER_COOLDOWN_SECONDS = 5
+
+def allow(user: str) -> bool:
+    now_ts = datetime.now().timestamp()
+    last_ts = _USER_LAST_ACTION.get(user)
+    if last_ts is not None and (now_ts - last_ts) < USER_COOLDOWN_SECONDS:
+        return False
+    _USER_LAST_ACTION[user] = now_ts
     return True
 
 # =========================
@@ -98,8 +124,14 @@ DAILY_SIGNAL_STATE = {
 # =========================
 OPEN_CONTRACT_SIGNALS = {}
 
+# =========================
+# Helpers عامة
+# =========================
+def now_local() -> datetime:
+    return datetime.now()
+
 def reset_daily_counter_if_needed():
-    today = datetime.now().date()
+    today = now_local().date()
     if DAILY_SIGNAL_STATE["date"] != today:
         DAILY_SIGNAL_STATE["date"] = today
         DAILY_SIGNAL_STATE["count"] = 0
@@ -116,10 +148,10 @@ def stock_in_cooldown(ticker: str) -> bool:
     last_sent = LAST_SENT_STOCK.get(ticker)
     if not last_sent:
         return False
-    return datetime.now() - last_sent < timedelta(days=STOCK_COOLDOWN_DAYS)
+    return now_local() - last_sent < timedelta(days=STOCK_COOLDOWN_DAYS)
 
 def mark_stock_sent(ticker: str):
-    LAST_SENT_STOCK[ticker] = datetime.now()
+    LAST_SENT_STOCK[ticker] = now_local()
 
 # =========================
 # إرسال
@@ -136,14 +168,15 @@ def send(msg, keyboard=None, chat_id=None):
     try:
         r = HTTP.post(API_SEND, json=payload, timeout=20)
         r.raise_for_status()
-    except Exception as e:
-        print(f"[SEND ERROR] {e}")
+    except requests.RequestException as e:
+        logger.exception("Telegram send failed: %s", e)
 
 def answer_callback(cb_id, text=""):
     try:
-        HTTP.post(API_ANSWER, json={"callback_query_id": cb_id, "text": text}, timeout=10)
-    except Exception as e:
-        print(f"[CALLBACK ERROR] {e}")
+        r = HTTP.post(API_ANSWER, json={"callback_query_id": cb_id, "text": text}, timeout=10)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        logger.warning("Callback answer failed: %s", e)
 
 # =========================
 # لوحة الأزرار
@@ -239,9 +272,13 @@ def massive_get(path: str, params=None):
     params = params or {}
     params["apiKey"] = MASSIVE_API_KEY
     url = f"{MASSIVE_BASE}{path}"
-    r = HTTP.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = HTTP.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        return r.json()
+    except requests.RequestException as e:
+        logger.exception("Massive request failed | path=%s | error=%s", path, e)
+        raise
 
 def safe_get(d, *keys, default=None):
     cur = d
@@ -264,8 +301,8 @@ def parse_contract_price_from_snapshot(item):
         try:
             if x is not None:
                 return float(x)
-        except:
-            pass
+        except (TypeError, ValueError):
+            continue
     return None
 
 def parse_underlying_price_from_snapshot(item):
@@ -279,8 +316,8 @@ def parse_underlying_price_from_snapshot(item):
         try:
             if x is not None:
                 return float(x)
-        except:
-            pass
+        except (TypeError, ValueError):
+            continue
     return None
 
 def parse_contract_meta(item):
@@ -323,16 +360,17 @@ def is_spac_ticker(ticker: str) -> bool:
     return ticker in SPAC_TICKERS
 
 def is_friday_now() -> bool:
-    return datetime.now().weekday() == 4
+    return now_local().weekday() == 4
 
 def contract_price_limit_for_ticker(ticker: str) -> float:
     return MAX_SPAC_CONTRACT_PRICE if is_spac_ticker(ticker) else MAX_COMPANY_CONTRACT_PRICE
 
-def days_to_expiry(expiration_str: str):
+def days_to_expiry(expiration_str: str) -> Optional[int]:
     try:
         exp = datetime.strptime(expiration_str, "%Y-%m-%d").date()
-        return (exp - datetime.now().date()).days
-    except:
+        return (exp - now_local().date()).days
+    except Exception as e:
+        logger.debug("days_to_expiry parse failed for %s: %s", expiration_str, e)
         return None
 
 def build_contract_from_pick(best, c, target_type, mode="NORMAL"):
@@ -378,21 +416,32 @@ def get_confirmed_side_hourly(ticker: str, pivot: float):
     if prev is None:
         TREND_STATE[ticker] = {
             "side": side,
-            "confirmed_at": datetime.now()
+            "confirmed_at": now_local(),
+            "candidate_side": side,
+            "candidate_since": now_local()
         }
         return side
 
+    # لو نفس الاتجاه الحالي المثبت
     if prev["side"] == side:
+        prev["candidate_side"] = side
+        prev["candidate_since"] = now_local()
         return side
 
+    # لو الحالة محايدة نحتفظ بالاتجاه السابق
     if side == "neutral":
         return prev["side"]
 
-    if datetime.now() - prev["confirmed_at"] >= timedelta(hours=TREND_CONFIRM_HOURS):
-        TREND_STATE[ticker] = {
-            "side": side,
-            "confirmed_at": datetime.now()
-        }
+    # بدأ مرشح جديد
+    if prev.get("candidate_side") != side:
+        prev["candidate_side"] = side
+        prev["candidate_since"] = now_local()
+        return prev["side"]
+
+    # إذا استمر المرشح الجديد بما يكفي نثبته
+    if now_local() - prev["candidate_since"] >= timedelta(hours=TREND_CONFIRM_HOURS):
+        prev["side"] = side
+        prev["confirmed_at"] = now_local()
         return side
 
     return prev["side"]
@@ -400,6 +449,12 @@ def get_confirmed_side_hourly(ticker: str, pivot: float):
 # =========================
 # حسابات أساسية
 # =========================
+def compute_dynamic_entry_buffer(price: float, ref_range: float) -> float:
+    vol_component = ref_range * 0.05
+    pct_component = price * 0.0025
+    buffer_value = max(0.15, min(max(vol_component, pct_component), max(price * 0.01, 0.15)))
+    return round(buffer_value, 2)
+
 def core_metrics(df, ticker=None):
     if df.empty:
         return None
@@ -461,7 +516,14 @@ def core_metrics(df, ticker=None):
     else:
         direction = "انتظار ⚪"
 
-    best_entry = pivot + 0.2 if direction.startswith("CALL") else pivot - 0.2
+    entry_buffer = compute_dynamic_entry_buffer(price, ref_range)
+
+    if direction.startswith("CALL"):
+        best_entry = pivot + entry_buffer
+    elif direction.startswith("PUT"):
+        best_entry = pivot - entry_buffer
+    else:
+        best_entry = pivot
 
     return {
         "price": price,
@@ -479,6 +541,7 @@ def core_metrics(df, ticker=None):
         "strongest_trend": strongest_trend,
         "direction": direction,
         "best_entry": best_entry,
+        "entry_buffer": entry_buffer,
         "confirmed_side": confirmed_side,
         "ema20": ema20,
         "ema50": ema50
@@ -491,13 +554,13 @@ def options_info_from_massive(ticker, price):
     try:
         chain = get_option_chain_snapshot(ticker)
         if not chain:
-            raise Exception("empty chain")
+            raise ValueError("empty chain")
 
         parsed = [parse_contract_meta(x) for x in chain]
         parsed = [x for x in parsed if x["ticker"] and x["contract_price"] is not None]
 
         if not parsed:
-            raise Exception("no valid contracts")
+            raise ValueError("no valid contracts")
 
         calls = [x for x in parsed if x["contract_type"] == "call"]
         puts = [x for x in parsed if x["contract_type"] == "put"]
@@ -505,28 +568,50 @@ def options_info_from_massive(ticker, price):
         best_call_oi = max(calls, key=lambda x: x["oi"]) if calls else None
         best_put_oi = max(puts, key=lambda x: x["oi"]) if puts else None
 
+        near_price_contracts = sorted(parsed, key=lambda x: abs(x["strike"] - price))[:20]
+        gamma_candidates = [x for x in near_price_contracts if abs(x["gamma"]) > 0]
+
+        if gamma_candidates:
+            gamma_anchor_contract = max(
+                gamma_candidates,
+                key=lambda x: (abs(x["gamma"]) * max(x["oi"], 1))
+            )
+            gamma_anchor = gamma_anchor_contract["strike"]
+        else:
+            gamma_anchor = price
+
+        magnet_width = max(0.5, round(price * 0.005, 2))
+        zone_low = gamma_anchor - magnet_width
+        zone_high = gamma_anchor + magnet_width
+
+        dist_pct = abs(price - gamma_anchor) / max(price, 1e-9)
+        prob = int(max(50, min(85, 85 - dist_pct * 100 * 2)))
+
         call_strike = best_call_oi["strike"] if best_call_oi else price
         put_strike = best_put_oi["strike"] if best_put_oi else price
 
-        gamma = best_call_oi["strike"] if best_call_oi else price
-        zone_low = gamma - 0.5
-        zone_high = gamma + 0.5
-
-        dist = abs(price - gamma)
-        prob = max(50, 85 - int(dist))
-
-        liquidity = "CALL 🟢" if call_strike > price else "PUT 🔴"
+        if best_call_oi and best_put_oi:
+            if best_call_oi["oi"] > best_put_oi["oi"]:
+                liquidity = "CALL 🟢"
+            elif best_put_oi["oi"] > best_call_oi["oi"]:
+                liquidity = "PUT 🔴"
+            else:
+                liquidity = "متوازن ⚖️"
+        else:
+            liquidity = "—"
 
         return {
             "call": call_strike,
             "put": put_strike,
-            "gamma": gamma,
+            "gamma": gamma_anchor,
             "zlow": zone_low,
             "zhigh": zone_high,
             "prob": prob,
             "liq": liquidity,
+            "note": "قراءة تقريبية مبنية على OI و Gamma وليست Gamma Exposure كامل."
         }
-    except:
+    except Exception as e:
+        logger.warning("options_info_from_massive failed for %s: %s", ticker, e)
         return {
             "call": price,
             "put": price,
@@ -535,10 +620,11 @@ def options_info_from_massive(ticker, price):
             "zhigh": price,
             "prob": 50,
             "liq": "—",
+            "note": "تعذر جلب قراءة السلسلة."
         }
 
 # =========================
-# حساب نسبة نجاح
+# حساب نسبة/درجة التوافق
 # =========================
 def calc_success_rate(c: dict, o: dict, contract: dict):
     return min(92, max(55, int(
@@ -553,19 +639,21 @@ def calc_success_rate(c: dict, o: dict, contract: dict):
 
 # =========================
 # اختيار العقد
+# ملاحظة:
+# حسب طلبك: لا نجبر السقف السعري إذا كان هناك عقد فرصته أعلى لتحقيق TP1
 # =========================
 def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
     try:
         chain = get_option_chain_snapshot(ticker)
         if not chain:
-            print(f"[CONTRACT DEBUG] {ticker}: empty chain")
+            logger.info("[CONTRACT DEBUG] %s: empty chain", ticker)
             return None
 
         parsed = [parse_contract_meta(x) for x in chain]
         parsed = [x for x in parsed if x["ticker"] and x["contract_price"] is not None]
 
         if not parsed:
-            print(f"[CONTRACT DEBUG] {ticker}: no parsed contracts")
+            logger.info("[CONTRACT DEBUG] %s: no parsed contracts", ticker)
             return None
 
         direction = c["direction"]
@@ -574,7 +662,7 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
         elif direction.startswith("PUT"):
             target_type = "put"
         else:
-            print(f"[CONTRACT DEBUG] {ticker}: no direction")
+            logger.info("[CONTRACT DEBUG] %s: no direction", ticker)
             return None
 
         underlying_price = c["price"]
@@ -626,11 +714,14 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
                 success_rate = calc_success_rate(c, o or {"prob": 50}, contract)
                 if success_rate >= ZERO_HERO_MIN_SUCCESS_RATE:
                     contract["success_rate"] = success_rate
-                    print(f"[CONTRACT DEBUG] {ticker}: zero hero picked {contract['option_ticker']} @ {contract['contract_price']}")
+                    logger.info("[CONTRACT DEBUG] %s: zero hero picked %s @ %s",
+                                ticker, contract["option_ticker"], contract["contract_price"])
                     return contract
 
         # =========================
-        # المرحلة 1: عقود ضمن الحد + مرنة + سيولة جيدة
+        # المرحلة 1: تفضيل العقود الأقرب لتحقيق TP1
+        # لا نمنع العقد بسبب تجاوز السقف السعري
+        # لكن نعطي أفضلية بسيطة للعقود المعقولة سعريًا
         # =========================
         stage1 = []
         for x in parsed:
@@ -639,8 +730,6 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
             if not x["expiration"]:
                 continue
             if x["contract_price"] is None or x["contract_price"] <= 0:
-                continue
-            if x["contract_price"] > limit_price:
                 continue
 
             dte = days_to_expiry(x["expiration"])
@@ -653,13 +742,22 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
             delta_score = abs(abs(x["delta"]) - 0.35)
             dte_penalty = min(dte, 45) / 25
 
+            # penalty خفيف فقط إذا تجاوز السقف السعري، وليس إقصاء
+            price_penalty = max(0.0, x["contract_price"] - limit_price) * 0.20
+
+            # أولوية الوصول للهدف الأول:
+            # - ديلتا مناسبة
+            # - قرب نسبي من السعر
+            # - OI جيد
+            # - Gamma داعم
+            # - مدة معقولة
             score = (
                 strike_distance_pct * 22
                 + delta_score * 5
                 + dte_penalty
+                + price_penalty
                 - min(x["oi"], 100000) / 15000
                 - min(abs(x["gamma"]), 1.0) * 4
-                + abs(x["contract_price"] - limit_price) * 0.10
             )
             stage1.append((score, x))
 
@@ -668,11 +766,12 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
             best = stage1[0][1]
             contract = build_contract_from_pick(best, c, target_type, mode="NORMAL")
             contract["success_rate"] = calc_success_rate(c, o or {"prob": 50}, contract)
-            print(f"[CONTRACT DEBUG] {ticker}: stage1 picked {contract['option_ticker']} @ {contract['contract_price']}")
+            logger.info("[CONTRACT DEBUG] %s: stage1 picked %s @ %s",
+                        ticker, contract["option_ticker"], contract["contract_price"])
             return contract
 
         # =========================
-        # المرحلة 2: أي عقد ضمن الحد السعري فقط
+        # المرحلة 2: fallback مرن جدًا
         # =========================
         stage2 = []
         for x in parsed:
@@ -682,17 +781,16 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
                 continue
             if x["contract_price"] is None or x["contract_price"] <= 0:
                 continue
-            if x["contract_price"] > limit_price:
-                continue
 
             dte = days_to_expiry(x["expiration"])
             if dte is None or dte < 0:
                 continue
 
+            strike_distance_pct = abs(x["strike"] - underlying_price) / max(underlying_price, 1e-9)
             score = (
-                abs(x["contract_price"] - limit_price) * 1.5
-                - min(x["oi"], 100000) / 20000
+                strike_distance_pct * 25
                 + min(max(dte, 0), 60) / 40
+                - min(x["oi"], 100000) / 20000
             )
             stage2.append((score, x))
 
@@ -701,14 +799,15 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
             best = stage2[0][1]
             contract = build_contract_from_pick(best, c, target_type, mode="NORMAL")
             contract["success_rate"] = calc_success_rate(c, o or {"prob": 50}, contract)
-            print(f"[CONTRACT DEBUG] {ticker}: stage2 picked {contract['option_ticker']} @ {contract['contract_price']}")
+            logger.info("[CONTRACT DEBUG] %s: stage2 picked %s @ %s",
+                        ticker, contract["option_ticker"], contract["contract_price"])
             return contract
 
-        print(f"[CONTRACT DEBUG] {ticker}: no contract under price limit {limit_price}")
+        logger.info("[CONTRACT DEBUG] %s: no usable contract found", ticker)
         return None
 
     except Exception as e:
-        print(f"[CONTRACT PICK ERROR] {ticker}: {e}")
+        logger.exception("[CONTRACT PICK ERROR] %s: %s", ticker, e)
         return None
 
 # =========================
@@ -740,7 +839,7 @@ def is_entry_ready_now(c):
     price = c["price"]
     entry = c["best_entry"]
 
-    near_entry = abs(price - entry) / max(entry, 1e-9) <= ENTRY_MAX_DISTANCE_PCT
+    near_entry = abs(price - entry) / max(abs(entry), 1e-9) <= ENTRY_MAX_DISTANCE_PCT
 
     breakout_call = (
         c["direction"].startswith("CALL")
@@ -767,7 +866,8 @@ def format_arabic_date(date_str: str):
             7: "يوليو", 8: "أغسطس", 9: "سبتمبر", 10: "أكتوبر", 11: "نوفمبر", 12: "ديسمبر"
         }
         return f"{dt.day} {months[dt.month]} {dt.year}"
-    except:
+    except Exception as e:
+        logger.debug("Date format parse failed for %s: %s", date_str, e)
         return date_str
 
 # =========================
@@ -806,15 +906,15 @@ def msg_pro(tk, tf, c, o, contract=None):
 📈 القرار النهائي: {c['direction']}
 
 🧲 معلومات داعمة:
-القاما: {o['gamma']:.2f}
+القاما المرجحة: {o['gamma']:.2f}
 Magnet: {o['zlow']:.2f} - {o['zhigh']:.2f}
-احتمال الوصول: {o['prob']}%
+احتمال الوصول التقريبي: {o['prob']}%
 سيولة الكول: {o['call']:.2f}
 سيولة البوت: {o['put']:.2f}
 الأقوى: {o['liq']}"""
 
     if not contract:
-        return base + "\n\n❌ لم يتم العثور على عقد مناسب ضمن حد السعر."
+        return base + "\n\n❌ لم يتم العثور على عقد مناسب."
 
     mode_line = f"\n🎯 الوضع: {contract.get('mode', 'NORMAL')}" if contract.get("mode") else ""
 
@@ -834,7 +934,7 @@ Magnet: {o['zlow']:.2f} - {o['zhigh']:.2f}
 3) {contract['tp3']:.2f}
 
 🛑 الوقف: {contract['stop_text']}
-📊 نسبة النجاح: {contract['success_rate']}%
+📊 درجة توافق الإشارة: {contract.get('success_rate', 0)}%
 Δ Delta: {contract['delta']:.2f}
 Γ Gamma: {contract['gamma']:.4f}
 IV: {contract['iv']:.4f}
@@ -868,12 +968,12 @@ def msg_channel_post(tk, contract):
 
 📢 @Option_Strike01"""
 
-def msg_contract_update(title, entry_price, current_price):
-    pnl = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+def msg_contract_update(title, entry_price, highest_price):
+    pnl = ((highest_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
     return f"""🔔 تحديث | {title}
 
 📊 سعر الدخول: {entry_price:.2f}
-💰 السعر الحالي: {current_price:.2f}
+💰 السعر الأعلى: {highest_price:.2f}
 📈 نسبة الربح: {pnl:+.2f}%
 
 ⚠️ تنبيه: هذا الطرح تعليمي
@@ -884,9 +984,9 @@ def msg_contract_update(title, entry_price, current_price):
 def msg_gamma(tk, tf, c, o):
     return f"""🧲 {tk} Gamma & Liquidity | TF: {tf}
 
-🧲 القاما: {o['gamma']:.2f}
+🧲 القاما المرجحة: {o['gamma']:.2f}
 📍 Magnet: {o['zlow']:.2f} - {o['zhigh']:.2f}
-📊 احتمال الوصول: {o['prob']}%
+📊 احتمال الوصول التقريبي: {o['prob']}%
 
 💰 سيولة الكول: {o['call']:.2f}
 💸 سيولة البوت: {o['put']:.2f}
@@ -896,7 +996,9 @@ def msg_gamma(tk, tf, c, o):
 📏 البعد عن الارتكاز: {c['pivot_diff']:+.2f} ({c['pivot_position']})
 
 الاتجاه الأقوى: {c['strongest_trend']}
-السعر الحالي: {c['price']:.2f}"""
+السعر الحالي: {c['price']:.2f}
+
+ℹ️ {o.get('note', '')}"""
 
 def msg_sr(tk, tf, c):
     return f"""📈 {tk} Support/Resistance | TF: {tf}
@@ -928,7 +1030,7 @@ def msg_plan(tk, tf, c):
 
 def msg_contract(tk, tf, c, contract):
     if not contract:
-        return "❌ لم يتم العثور على عقد مناسب ضمن حد السعر."
+        return "❌ لم يتم العثور على عقد مناسب."
     mode_line = f"\nMode: {contract.get('mode', 'NORMAL')}" if contract.get("mode") else ""
     return f"""💎 {tk} Best Contract | TF: {tf}{mode_line}
 
@@ -949,7 +1051,7 @@ Contract Price: {contract['contract_price']:.2f}
 2) {contract['tp2']:.2f}
 3) {contract['tp3']:.2f}
 
-📊 نسبة النجاح: {contract['success_rate']}%"""
+📊 درجة توافق الإشارة: {contract.get('success_rate', 0)}%"""
 
 # =========================
 # حالة المستخدم
@@ -958,9 +1060,9 @@ STATE = {}
 
 def set_state(user, ticker=None, tf=None):
     s = STATE.get(user, {"ticker": None, "tf": "1d"})
-    if ticker:
+    if ticker is not None:
         s["ticker"] = ticker
-    if tf:
+    if tf is not None:
         s["tf"] = tf
     STATE[user] = s
 
@@ -985,7 +1087,7 @@ def register_contract_signal(ticker: str, contract: dict):
         "tp3": contract["tp3"],
         "first_update_sent": False,
         "last_update_trigger_price": contract["tp1"],
-        "created_at": datetime.now(),
+        "created_at": now_local(),
         "channel_title": f"{ticker} ${contract['strike']:.2f} {'كول' if contract['contract_type']=='call' else 'بوت'}"
     }
 
@@ -995,16 +1097,16 @@ def get_live_contract_price(underlying: str, option_ticker: str):
         price = parse_contract_price_from_snapshot(snap)
         if price is not None:
             return float(price)
-    except:
-        pass
+    except Exception as e:
+        logger.debug("Contract snapshot fetch failed | %s | %s", option_ticker, e)
 
     try:
         lt = get_option_last_trade(option_ticker)
         p = lt.get("p")
         if p is not None:
             return float(p)
-    except:
-        pass
+    except Exception as e:
+        logger.debug("Last trade fetch failed | %s | %s", option_ticker, e)
 
     return None
 
@@ -1046,7 +1148,7 @@ def scanner_cycle():
 
             results.append((ticker, score, c, o, contract))
         except Exception as e:
-            print(f"[SCANNER ITEM ERROR] {ticker}: {e}")
+            logger.warning("[SCANNER ITEM ERROR] %s: %s", ticker, e)
             continue
 
     results.sort(key=lambda x: x[1], reverse=True)
@@ -1080,18 +1182,18 @@ def contract_update_cycle():
             if price > sig["highest_price"]:
                 sig["highest_price"] = price
 
-            if (not sig["first_update_sent"]) and price >= sig["tp1"]:
-                send(msg_contract_update(sig["channel_title"], sig["entry_price"], price))
+            if (not sig["first_update_sent"]) and sig["highest_price"] >= sig["tp1"]:
+                send(msg_contract_update(sig["channel_title"], sig["entry_price"], sig["highest_price"]))
                 sig["first_update_sent"] = True
-                sig["last_update_trigger_price"] = price
+                sig["last_update_trigger_price"] = sig["highest_price"]
                 continue
 
-            if sig["first_update_sent"] and price >= sig["last_update_trigger_price"] + UPDATE_STEP_AFTER_TP1:
-                send(msg_contract_update(sig["channel_title"], sig["entry_price"], price))
-                sig["last_update_trigger_price"] = price
+            if sig["first_update_sent"] and sig["highest_price"] >= sig["last_update_trigger_price"] + UPDATE_STEP_AFTER_TP1:
+                send(msg_contract_update(sig["channel_title"], sig["entry_price"], sig["highest_price"]))
+                sig["last_update_trigger_price"] = sig["highest_price"]
 
         except Exception as e:
-            print(f"[CONTRACT UPDATE ERROR] {option_ticker}: {e}")
+            logger.warning("[CONTRACT UPDATE ERROR] %s: %s", option_ticker, e)
 
 async def contract_update_loop():
     await asyncio.sleep(20)
@@ -1113,8 +1215,10 @@ async def scanner_loop():
 
 @app.on_event("startup")
 async def startup_event():
+    logger.info("Starting bot tasks...")
     asyncio.create_task(scanner_loop())
     asyncio.create_task(contract_update_loop())
+    logger.info("Bot tasks started successfully.")
 
 # =========================
 # Webhook
@@ -1123,7 +1227,8 @@ async def startup_event():
 async def webhook(req: Request):
     try:
         data = await req.json()
-    except:
+    except Exception as e:
+        logger.warning("Invalid webhook JSON: %s", e)
         return {"ok": True}
 
     try:
@@ -1178,7 +1283,8 @@ async def webhook(req: Request):
                     asyncio.to_thread(options_info_from_massive, ticker, c["price"]),
                     timeout=12
                 )
-            except:
+            except Exception as e:
+                logger.warning("options_info timeout/fail for %s: %s", ticker, e)
                 o = {
                     "call": c["price"],
                     "put": c["price"],
@@ -1187,6 +1293,7 @@ async def webhook(req: Request):
                     "zhigh": c["price"],
                     "prob": 50,
                     "liq": "—",
+                    "note": "fallback"
                 }
 
             try:
@@ -1194,7 +1301,8 @@ async def webhook(req: Request):
                     asyncio.to_thread(choose_best_contract_from_massive, ticker, c, o),
                     timeout=15
                 )
-            except:
+            except Exception as e:
+                logger.warning("choose_best_contract timeout/fail for %s: %s", ticker, e)
                 contract = None
 
             send(msg_pro(ticker, tf, c, o, contract), main_menu(), chat_id=user)
@@ -1221,6 +1329,9 @@ async def webhook(req: Request):
 
             if data_cb.startswith("settf:"):
                 new_tf = data_cb.split(":")[1]
+                if new_tf not in TF:
+                    send("❌ الفريم غير مدعوم", main_menu(), chat_id=user)
+                    return {"ok": True}
                 set_state(user, tf=new_tf)
                 send(f"تم تغيير الفريم إلى {new_tf}", main_menu(), chat_id=user)
                 return {"ok": True}
@@ -1254,7 +1365,8 @@ async def webhook(req: Request):
                     asyncio.to_thread(options_info_from_massive, ticker, c["price"]),
                     timeout=12
                 )
-            except:
+            except Exception as e:
+                logger.warning("options_info timeout/fail for %s: %s", ticker, e)
                 o = {
                     "call": c["price"],
                     "put": c["price"],
@@ -1263,6 +1375,7 @@ async def webhook(req: Request):
                     "zhigh": c["price"],
                     "prob": 50,
                     "liq": "—",
+                    "note": "fallback"
                 }
 
             try:
@@ -1270,7 +1383,8 @@ async def webhook(req: Request):
                     asyncio.to_thread(choose_best_contract_from_massive, ticker, c, o),
                     timeout=15
                 )
-            except:
+            except Exception as e:
+                logger.warning("choose_best_contract timeout/fail for %s: %s", ticker, e)
                 contract = None
 
             if data_cb == "quick":
@@ -1289,17 +1403,18 @@ async def webhook(req: Request):
             return {"ok": True}
 
     except Exception as e:
+        logger.exception("Webhook error: %s", e)
         try:
             if "message" in data:
                 user = str(data["message"]["chat"]["id"])
-                send(f"❌ خطأ: {str(e)}", chat_id=user)
+                send(f"❌ خطأ داخلي: {str(e)}", chat_id=user)
             elif "callback_query" in data:
                 user = str(data["callback_query"]["message"]["chat"]["id"])
-                send(f"❌ خطأ: {str(e)}", chat_id=user)
+                send(f"❌ خطأ داخلي: {str(e)}", chat_id=user)
             else:
-                send(f"❌ خطأ: {str(e)}")
-        except:
-            print(f"[WEBHOOK ERROR] {e}")
+                send(f"❌ خطأ داخلي: {str(e)}")
+        except Exception as nested_e:
+            logger.exception("[WEBHOOK ERROR] %s", nested_e)
 
     return {"ok": True}
 
@@ -1321,5 +1436,6 @@ def home():
         "friday_zero_hero_enabled": FRIDAY_ZERO_HERO_ENABLED,
         "zero_hero_min_price": ZERO_HERO_MIN_PRICE,
         "zero_hero_max_price": ZERO_HERO_MAX_PRICE,
-        "massive_connected": True
+        "massive_connected": bool(MASSIVE_API_KEY),
+        "telegram_connected": bool(TOKEN and CHAT_ID)
     }
