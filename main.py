@@ -21,9 +21,9 @@ logger = logging.getLogger("options_bot")
 # =========================
 # بياناتك
 # =========================
-TOKEN = "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE"
-CHAT_ID = "PUT_YOUR_CHAT_ID_HERE"
-MASSIVE_API_KEY = "PUT_YOUR_MASSIVE_API_KEY_HERE"
+TOKEN = "8619465902:AAHPP9AFiL0fV1lejKtaThLlQ4qZ6qCYgX0"
+CHAT_ID = "8371374055"
+MASSIVE_API_KEY = "AcbX3y7rKzou3MzUi8EVlETdYLFsVGa2"
 
 API_SEND = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 API_ANSWER = f"https://api.telegram.org/bot{TOKEN}/answerCallbackQuery"
