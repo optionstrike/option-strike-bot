@@ -69,6 +69,11 @@ WATCHLIST = list(dict.fromkeys([
 ]))
 
 # =========================
+# جلسة requests ثابتة
+# =========================
+HTTP = requests.Session()
+
+# =========================
 # منع التكرار السريع للمستخدم
 # =========================
 _last = {}
@@ -123,21 +128,28 @@ def mark_stock_sent(ticker: str):
 # =========================
 # إرسال
 # =========================
-def send(msg, keyboard=None):
+def send(msg, keyboard=None, chat_id=None):
+    target_chat_id = str(chat_id) if chat_id is not None else CHAT_ID
+
     payload = {
-        "chat_id": CHAT_ID,
+        "chat_id": target_chat_id,
         "text": msg,
         "disable_web_page_preview": True
     }
     if keyboard:
         payload["reply_markup"] = keyboard
-    requests.post(API_SEND, json=payload, timeout=20)
+
+    try:
+        r = HTTP.post(API_SEND, json=payload, timeout=20)
+        r.raise_for_status()
+    except Exception as e:
+        print(f"[SEND ERROR] {e}")
 
 def answer_callback(cb_id, text=""):
     try:
-        requests.post(API_ANSWER, json={"callback_query_id": cb_id, "text": text}, timeout=10)
-    except:
-        pass
+        HTTP.post(API_ANSWER, json={"callback_query_id": cb_id, "text": text}, timeout=10)
+    except Exception as e:
+        print(f"[CALLBACK ERROR] {e}")
 
 # =========================
 # لوحة الأزرار
@@ -233,7 +245,7 @@ def massive_get(path: str, params=None):
     params = params or {}
     params["apiKey"] = MASSIVE_API_KEY
     url = f"{MASSIVE_BASE}{path}"
-    r = requests.get(url, params=params, timeout=25)
+    r = HTTP.get(url, params=params, timeout=25)
     r.raise_for_status()
     return r.json()
 
@@ -525,7 +537,6 @@ def choose_best_contract_from_massive(ticker: str, c: dict):
         limit_price = contract_price_limit_for_ticker(ticker)
         underlying_price = c["price"]
 
-        # 1) فلترة العقود حسب النوع والسعر والانتهاء أولًا
         filtered = []
         for x in parsed:
             if x["contract_type"] != target_type:
@@ -541,15 +552,11 @@ def choose_best_contract_from_massive(ticker: str, c: dict):
         if not filtered:
             return None
 
-        # 2) من داخل العقود المسموح بها فقط نختار الأقرب للسعر
         candidates = []
         for x in filtered:
             strike_distance = abs(x["strike"] - underlying_price)
-
-            # نفضّل ديلتا قريبة من 0.35 تقريبًا
             delta_score = abs(abs(x["delta"]) - 0.35)
 
-            # الأفضلية للأقرب سترايك داخل السعر + OI + Gamma
             score = (
                 strike_distance * 3
                 + delta_score * 10
@@ -905,31 +912,101 @@ def get_live_contract_price(underlying: str, option_ticker: str):
     return None
 
 # =========================
+# نسخة blocking للفحص الخلفي
+# =========================
+def scanner_cycle():
+    reset_daily_counter_if_needed()
+
+    if not can_send_more_today():
+        return
+
+    results = []
+
+    for ticker in WATCHLIST:
+        try:
+            if stock_in_cooldown(ticker):
+                continue
+
+            df = get_df(ticker, "1h")
+            if df.empty or len(df) < 20:
+                continue
+
+            c = core_metrics(df, ticker=ticker)
+            if c is None:
+                continue
+
+            if c["direction"] == "انتظار ⚪":
+                continue
+
+            if not is_entry_ready_now(c):
+                continue
+
+            o = options_info_from_massive(ticker, c["price"])
+            contract = choose_best_contract_from_massive(ticker, c)
+            if not contract:
+                continue
+
+            score = calc_score(c, o)
+            if score < 60:
+                continue
+
+            results.append((ticker, score, c, o, contract))
+        except Exception as e:
+            print(f"[SCANNER ITEM ERROR] {ticker}: {e}")
+            continue
+
+    results.sort(key=lambda x: x[1], reverse=True)
+
+    sent_now = 0
+    for ticker, score, c, o, contract in results:
+        if not can_send_more_today():
+            break
+
+        if stock_in_cooldown(ticker):
+            continue
+
+        send(msg_pro(ticker, "1h", c, o, contract))
+        send(msg_channel_post(ticker, contract))
+
+        register_contract_signal(ticker, contract)
+        mark_stock_sent(ticker)
+        add_daily_signal()
+        sent_now += 1
+
+        if sent_now >= MAX_SIGNALS_PER_DAY:
+            break
+
+def contract_update_cycle():
+    for option_ticker, sig in list(OPEN_CONTRACT_SIGNALS.items()):
+        try:
+            price = get_live_contract_price(sig["ticker"], option_ticker)
+            if price is None:
+                continue
+
+            if price > sig["highest_price"]:
+                sig["highest_price"] = price
+
+            if not sig["first_update_sent"] and price >= sig["tp1"]:
+                send(msg_contract_update(sig["channel_title"], sig["entry_price"], price))
+                sig["first_update_sent"] = True
+                sig["last_update_trigger_price"] = price
+                continue
+
+            if sig["first_update_sent"]:
+                if price >= sig["last_update_trigger_price"] + UPDATE_STEP_AFTER_TP1:
+                    send(msg_contract_update(sig["channel_title"], sig["entry_price"], price))
+                    sig["last_update_trigger_price"] = price
+        except Exception as e:
+            print(f"[CONTRACT UPDATE ERROR] {option_ticker}: {e}")
+
+# =========================
 # متابعة العقود المطروحة
 # =========================
 async def contract_update_loop():
     await asyncio.sleep(20)
     while True:
         try:
-            for option_ticker, sig in list(OPEN_CONTRACT_SIGNALS.items()):
-                price = get_live_contract_price(sig["ticker"], option_ticker)
-                if price is None:
-                    continue
-
-                if price > sig["highest_price"]:
-                    sig["highest_price"] = price
-
-                if not sig["first_update_sent"] and price >= sig["tp1"]:
-                    send(msg_contract_update(sig["channel_title"], sig["entry_price"], price))
-                    sig["first_update_sent"] = True
-                    sig["last_update_trigger_price"] = price
-                    continue
-
-                if sig["first_update_sent"]:
-                    if price >= sig["last_update_trigger_price"] + UPDATE_STEP_AFTER_TP1:
-                        send(msg_contract_update(sig["channel_title"], sig["entry_price"], price))
-                        sig["last_update_trigger_price"] = price
-
+            await asyncio.to_thread(contract_update_cycle)
         except Exception as e:
             send(f"❌ خطأ في متابعة العقود: {str(e)}")
 
@@ -942,67 +1019,7 @@ async def scanner_loop():
     await asyncio.sleep(10)
     while True:
         try:
-            reset_daily_counter_if_needed()
-
-            if not can_send_more_today():
-                await asyncio.sleep(SCAN_INTERVAL_SECONDS)
-                continue
-
-            results = []
-
-            for ticker in WATCHLIST:
-                try:
-                    if stock_in_cooldown(ticker):
-                        continue
-
-                    df = get_df(ticker, "1h")
-                    if df.empty or len(df) < 20:
-                        continue
-
-                    c = core_metrics(df, ticker=ticker)
-                    if c is None:
-                        continue
-
-                    if c["direction"] == "انتظار ⚪":
-                        continue
-
-                    if not is_entry_ready_now(c):
-                        continue
-
-                    o = options_info_from_massive(ticker, c["price"])
-                    contract = choose_best_contract_from_massive(ticker, c)
-                    if not contract:
-                        continue
-
-                    score = calc_score(c, o)
-                    if score < 60:
-                        continue
-
-                    results.append((ticker, score, c, o, contract))
-                except:
-                    continue
-
-            results.sort(key=lambda x: x[1], reverse=True)
-
-            sent_now = 0
-            for ticker, score, c, o, contract in results:
-                if not can_send_more_today():
-                    break
-
-                if stock_in_cooldown(ticker):
-                    continue
-
-                send(msg_pro(ticker, "1h", c, o, contract))
-                send(msg_channel_post(ticker, contract))
-
-                register_contract_signal(ticker, contract)
-                mark_stock_sent(ticker)
-                add_daily_signal()
-                sent_now += 1
-
-                if sent_now >= MAX_SIGNALS_PER_DAY:
-                    break
-
+            await asyncio.to_thread(scanner_cycle)
         except Exception as e:
             send(f"❌ خطأ في الصيّاد: {str(e)}")
 
@@ -1018,7 +1035,10 @@ async def startup_event():
 # =========================
 @app.post("/")
 async def webhook(req: Request):
-    data = await req.json()
+    try:
+        data = await req.json()
+    except Exception:
+        return {"ok": True}
 
     try:
         if "message" in data:
@@ -1031,11 +1051,15 @@ async def webhook(req: Request):
 
             if text == "/start":
                 set_state(user, ticker=None, tf="1d")
-                send("👋 أهلاً بك\nأرسل رمز السهم من قائمتك مثل: NVDA أو SPY\nأو اختر من القائمة 👇", main_menu())
+                send("👋 أهلاً بك\nأرسل رمز السهم من قائمتك مثل: NVDA أو SPY\nأو اختر من القائمة 👇", main_menu(), chat_id=user)
                 return {"ok": True}
 
             if text == "/test":
-                send("✅ البوت شغال 100%")
+                send("✅ البوت شغال 100%", chat_id=user)
+                return {"ok": True}
+
+            if not text:
+                send("❌ أرسل رمز سهم صحيح مثل: NVDA", chat_id=user)
                 return {"ok": True}
 
             parts = text.upper().split()
@@ -1043,27 +1067,31 @@ async def webhook(req: Request):
             tf = parts[1].lower() if len(parts) > 1 else get_state(user)["tf"]
 
             if ticker not in WATCHLIST:
-                send("❌ هذا السهم غير موجود في قائمتك")
+                send("❌ هذا السهم غير موجود في قائمتك", chat_id=user)
+                return {"ok": True}
+
+            if tf not in TF:
+                send("❌ الفريم غير مدعوم", chat_id=user)
                 return {"ok": True}
 
             set_state(user, ticker=ticker, tf=tf)
 
-            df = get_df(ticker, tf)
+            df = await asyncio.to_thread(get_df, ticker, tf)
             if df.empty:
-                send("❌ السهم غير صحيح أو لا توجد بيانات")
+                send("❌ السهم غير صحيح أو لا توجد بيانات", chat_id=user)
                 return {"ok": True}
 
-            c = core_metrics(df, ticker=ticker)
+            c = await asyncio.to_thread(core_metrics, df, ticker)
             if c is None:
-                send("❌ تعذر حساب الارتكاز لهذا الأصل")
+                send("❌ تعذر حساب الارتكاز لهذا الأصل", chat_id=user)
                 return {"ok": True}
 
-            o = options_info_from_massive(ticker, c["price"])
-            contract = choose_best_contract_from_massive(ticker, c)
+            o = await asyncio.to_thread(options_info_from_massive, ticker, c["price"])
+            contract = await asyncio.to_thread(choose_best_contract_from_massive, ticker, c)
 
-            send(msg_pro(ticker, tf, c, o, contract), main_menu())
+            send(msg_pro(ticker, tf, c, o, contract), main_menu(), chat_id=user)
             if contract:
-                send(msg_channel_post(ticker, contract), main_menu())
+                send(msg_channel_post(ticker, contract), main_menu(), chat_id=user)
 
             return {"ok": True}
 
@@ -1080,57 +1108,67 @@ async def webhook(req: Request):
             tf = st.get("tf", "1d")
 
             if data_cb == "tf":
-                send("اختر الفريم 👇", tf_menu())
+                send("اختر الفريم 👇", tf_menu(), chat_id=user)
                 return {"ok": True}
 
             if data_cb.startswith("settf:"):
                 new_tf = data_cb.split(":")[1]
                 set_state(user, tf=new_tf)
-                send(f"تم تغيير الفريم إلى {new_tf}", main_menu())
+                send(f"تم تغيير الفريم إلى {new_tf}", main_menu(), chat_id=user)
                 return {"ok": True}
 
             if data_cb == "back":
-                send("رجوع للقائمة", main_menu())
+                send("رجوع للقائمة", main_menu(), chat_id=user)
                 return {"ok": True}
 
             if not ticker:
-                send("أرسل رمز السهم أولاً مثل: NVDA")
+                send("أرسل رمز السهم أولاً مثل: NVDA", chat_id=user)
                 return {"ok": True}
 
             if ticker not in WATCHLIST:
-                send("❌ هذا السهم غير موجود في قائمتك")
+                send("❌ هذا السهم غير موجود في قائمتك", chat_id=user)
                 return {"ok": True}
 
-            df = get_df(ticker, tf)
+            df = await asyncio.to_thread(get_df, ticker, tf)
             if df.empty:
-                send("❌ لا توجد بيانات")
+                send("❌ لا توجد بيانات", chat_id=user)
                 return {"ok": True}
 
-            c = core_metrics(df, ticker=ticker)
+            c = await asyncio.to_thread(core_metrics, df, ticker)
             if c is None:
-                send("❌ تعذر حساب الارتكاز لهذا الأصل")
+                send("❌ تعذر حساب الارتكاز لهذا الأصل", chat_id=user)
                 return {"ok": True}
 
-            o = options_info_from_massive(ticker, c["price"])
-            contract = choose_best_contract_from_massive(ticker, c)
+            o = await asyncio.to_thread(options_info_from_massive, ticker, c["price"])
+            contract = await asyncio.to_thread(choose_best_contract_from_massive, ticker, c)
 
             if data_cb == "quick":
-                send(msg_quick(ticker, tf, c), main_menu())
+                send(msg_quick(ticker, tf, c), main_menu(), chat_id=user)
             elif data_cb == "pro":
-                send(msg_pro(ticker, tf, c, o, contract), main_menu())
+                send(msg_pro(ticker, tf, c, o, contract), main_menu(), chat_id=user)
             elif data_cb == "gamma":
-                send(msg_gamma(ticker, tf, c, o), main_menu())
+                send(msg_gamma(ticker, tf, c, o), main_menu(), chat_id=user)
             elif data_cb == "sr":
-                send(msg_sr(ticker, tf, c), main_menu())
+                send(msg_sr(ticker, tf, c), main_menu(), chat_id=user)
             elif data_cb == "plan":
-                send(msg_plan(ticker, tf, c), main_menu())
+                send(msg_plan(ticker, tf, c), main_menu(), chat_id=user)
             elif data_cb == "contract":
-                send(msg_contract(ticker, tf, c, contract), main_menu())
+                send(msg_contract(ticker, tf, c, contract), main_menu(), chat_id=user)
 
             return {"ok": True}
 
     except Exception as e:
-        send(f"❌ خطأ: {str(e)}")
+        try:
+            if "message" in data:
+                user = str(data["message"]["chat"]["id"])
+                send(f"❌ خطأ: {str(e)}", chat_id=user)
+            elif "callback_query" in data:
+                user = str(data["callback_query"]["message"]["chat"]["id"])
+                send(f"❌ خطأ: {str(e)}", chat_id=user)
+            else:
+                send(f"❌ خطأ: {str(e)}")
+        except:
+            print(f"[WEBHOOK ERROR] {e}")
 
     return {"ok": True}
 
