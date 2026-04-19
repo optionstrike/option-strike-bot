@@ -49,7 +49,6 @@ UPDATE_STEP_AFTER_TP1 = 0.30
 # =========================
 INDEX_DAILY_PIVOT = {"US500", "SPY", "QQQ", "SPX", "NDX", "US100"}
 
-# إذا عندك قائمة SPACs حقيقية لاحقًا حطها هنا
 SPAC_TICKERS = {
     "NBIS", "CRCL", "CRWV"
 }
@@ -68,16 +67,13 @@ WATCHLIST = list(dict.fromkeys([
     "US500","SPY","QQQ","SPX","NDX","US100"
 ]))
 
-# =========================
-# جلسة requests ثابتة
-# =========================
 HTTP = requests.Session()
 
 # =========================
 # منع التكرار السريع للمستخدم
 # =========================
 _last = {}
-COOLDOWN = 5
+COOLDOWN = 2
 
 def allow(user):
     t = time.time()
@@ -99,7 +95,7 @@ DAILY_SIGNAL_STATE = {
 # =========================
 # تتبع العقود المطروحة
 # =========================
-OPEN_CONTRACT_SIGNALS = {}   # contract_ticker -> state
+OPEN_CONTRACT_SIGNALS = {}
 LAST_DAILY_REPORT_DATE = None
 
 def reset_daily_counter_if_needed():
@@ -130,7 +126,6 @@ def mark_stock_sent(ticker: str):
 # =========================
 def send(msg, keyboard=None, chat_id=None):
     target_chat_id = str(chat_id) if chat_id is not None else CHAT_ID
-
     payload = {
         "chat_id": target_chat_id,
         "text": msg,
@@ -138,7 +133,6 @@ def send(msg, keyboard=None, chat_id=None):
     }
     if keyboard:
         payload["reply_markup"] = keyboard
-
     try:
         r = HTTP.post(API_SEND, json=payload, timeout=20)
         r.raise_for_status()
@@ -221,7 +215,7 @@ def get_df(ticker, tf):
     period, interval = TF.get(tf, ("1y","1d"))
     data_ticker = map_symbol_for_data(ticker)
     s = yf.Ticker(data_ticker)
-    df = s.history(period=period, interval=interval)
+    df = s.history(period=period, interval=interval, auto_adjust=False)
     if df.empty:
         return df
 
@@ -245,7 +239,7 @@ def massive_get(path: str, params=None):
     params = params or {}
     params["apiKey"] = MASSIVE_API_KEY
     url = f"{MASSIVE_BASE}{path}"
-    r = HTTP.get(url, params=params, timeout=25)
+    r = HTTP.get(url, params=params, timeout=20)
     r.raise_for_status()
     return r.json()
 
@@ -376,7 +370,6 @@ def core_metrics(df, ticker=None):
         ref = get_df(ticker, "1d")
         if ref.empty or len(ref) < 2:
             return None
-
         prev = ref.iloc[-2]
         ref_high = float(prev["High"])
         ref_low = float(prev["Low"])
@@ -386,7 +379,6 @@ def core_metrics(df, ticker=None):
         ref = get_df(ticker, "1w")
         if ref.empty or len(ref) < 2:
             return None
-
         prev = ref.iloc[-2]
         ref_high = float(prev["High"])
         ref_low = float(prev["Low"])
@@ -453,7 +445,7 @@ def core_metrics(df, ticker=None):
     }
 
 # =========================
-# معلومات القاما والسيولة من Massive chain
+# معلومات القاما والسيولة
 # =========================
 def options_info_from_massive(ticker, price):
     try:
@@ -506,7 +498,7 @@ def options_info_from_massive(ticker, price):
         }
 
 # =========================
-# اختيار العقد نفسه من Massive
+# اختيار العقد
 # =========================
 def is_spac_ticker(ticker: str) -> bool:
     return ticker in SPAC_TICKERS
@@ -556,7 +548,6 @@ def choose_best_contract_from_massive(ticker: str, c: dict):
         for x in filtered:
             strike_distance = abs(x["strike"] - underlying_price)
             delta_score = abs(abs(x["delta"]) - 0.35)
-
             score = (
                 strike_distance * 3
                 + delta_score * 10
@@ -612,7 +603,7 @@ def choose_best_contract_from_massive(ticker: str, c: dict):
             "oi": best["oi"],
             "success_rate": success_rate,
         }
-    except Exception:
+    except:
         return None
 
 # =========================
@@ -620,24 +611,18 @@ def choose_best_contract_from_massive(ticker: str, c: dict):
 # =========================
 def calc_score(c, o):
     score = 0
-
     if c["direction"].startswith("CALL") or c["direction"].startswith("PUT"):
         score += 35
-
     if c["strongest_trend"] in ["صاعد قوي 🔥", "هابط قوي 🔻"]:
         score += 25
-
     if abs(c["pivot_diff"]) > 0:
         score += 10
-
     if o["prob"] >= 60:
         score += 15
-
     if c["trend"] == "صاعد 📈" and c["direction"].startswith("CALL"):
         score += 10
     if c["trend"] == "هابط 📉" and c["direction"].startswith("PUT"):
         score += 10
-
     return score
 
 # =========================
@@ -855,7 +840,7 @@ Contract Price: {contract['contract_price']:.2f}
 📊 نسبة النجاح: {contract['success_rate']}%"""
 
 # =========================
-# تخزين حالة المستخدم
+# حالة المستخدم
 # =========================
 STATE = {}
 
@@ -871,7 +856,7 @@ def get_state(user):
     return STATE.get(user, {"ticker": None, "tf": "1d"})
 
 # =========================
-# تسجيل العقد المطروح ومتابعته
+# تسجيل العقد
 # =========================
 def register_contract_signal(ticker: str, contract: dict):
     key = contract["option_ticker"]
@@ -912,7 +897,7 @@ def get_live_contract_price(underlying: str, option_ticker: str):
     return None
 
 # =========================
-# نسخة blocking للفحص الخلفي
+# دورات خلفية
 # =========================
 def scanner_cycle():
     reset_daily_counter_if_needed()
@@ -932,10 +917,7 @@ def scanner_cycle():
                 continue
 
             c = core_metrics(df, ticker=ticker)
-            if c is None:
-                continue
-
-            if c["direction"] == "انتظار ⚪":
+            if c is None or c["direction"] == "انتظار ⚪":
                 continue
 
             if not is_entry_ready_now(c):
@@ -992,16 +974,12 @@ def contract_update_cycle():
                 sig["last_update_trigger_price"] = price
                 continue
 
-            if sig["first_update_sent"]:
-                if price >= sig["last_update_trigger_price"] + UPDATE_STEP_AFTER_TP1:
-                    send(msg_contract_update(sig["channel_title"], sig["entry_price"], price))
-                    sig["last_update_trigger_price"] = price
+            if sig["first_update_sent"] and price >= sig["last_update_trigger_price"] + UPDATE_STEP_AFTER_TP1:
+                send(msg_contract_update(sig["channel_title"], sig["entry_price"], price))
+                sig["last_update_trigger_price"] = price
         except Exception as e:
             print(f"[CONTRACT UPDATE ERROR] {option_ticker}: {e}")
 
-# =========================
-# متابعة العقود المطروحة
-# =========================
 async def contract_update_loop():
     await asyncio.sleep(20)
     while True:
@@ -1009,12 +987,8 @@ async def contract_update_loop():
             await asyncio.to_thread(contract_update_cycle)
         except Exception as e:
             send(f"❌ خطأ في متابعة العقود: {str(e)}")
-
         await asyncio.sleep(300)
 
-# =========================
-# الصيّاد التلقائي
-# =========================
 async def scanner_loop():
     await asyncio.sleep(10)
     while True:
@@ -1022,7 +996,6 @@ async def scanner_loop():
             await asyncio.to_thread(scanner_cycle)
         except Exception as e:
             send(f"❌ خطأ في الصيّاد: {str(e)}")
-
         await asyncio.sleep(SCAN_INTERVAL_SECONDS)
 
 @app.on_event("startup")
@@ -1076,6 +1049,10 @@ async def webhook(req: Request):
 
             set_state(user, ticker=ticker, tf=tf)
 
+            # رد فوري يثبت أن البوت صاحي
+            send(f"🚀 جاري تحليل {ticker} على فريم {tf}...", chat_id=user)
+
+            # نبدأ التحليل
             df = await asyncio.to_thread(get_df, ticker, tf)
             if df.empty:
                 send("❌ السهم غير صحيح أو لا توجد بيانات", chat_id=user)
@@ -1086,8 +1063,30 @@ async def webhook(req: Request):
                 send("❌ تعذر حساب الارتكاز لهذا الأصل", chat_id=user)
                 return {"ok": True}
 
-            o = await asyncio.to_thread(options_info_from_massive, ticker, c["price"])
-            contract = await asyncio.to_thread(choose_best_contract_from_massive, ticker, c)
+            # نحاول الخيارات، وإذا علقت أو فشلت نكمل تحليل بدونها
+            try:
+                o = await asyncio.wait_for(
+                    asyncio.to_thread(options_info_from_massive, ticker, c["price"]),
+                    timeout=12
+                )
+            except:
+                o = {
+                    "call": c["price"],
+                    "put": c["price"],
+                    "gamma": c["price"],
+                    "zlow": c["price"],
+                    "zhigh": c["price"],
+                    "prob": 50,
+                    "liq": "—",
+                }
+
+            try:
+                contract = await asyncio.wait_for(
+                    asyncio.to_thread(choose_best_contract_from_massive, ticker, c),
+                    timeout=15
+                )
+            except:
+                contract = None
 
             send(msg_pro(ticker, tf, c, o, contract), main_menu(), chat_id=user)
             if contract:
@@ -1129,6 +1128,8 @@ async def webhook(req: Request):
                 send("❌ هذا السهم غير موجود في قائمتك", chat_id=user)
                 return {"ok": True}
 
+            send(f"⏳ جاري تحديث تحليل {ticker}...", chat_id=user)
+
             df = await asyncio.to_thread(get_df, ticker, tf)
             if df.empty:
                 send("❌ لا توجد بيانات", chat_id=user)
@@ -1139,8 +1140,29 @@ async def webhook(req: Request):
                 send("❌ تعذر حساب الارتكاز لهذا الأصل", chat_id=user)
                 return {"ok": True}
 
-            o = await asyncio.to_thread(options_info_from_massive, ticker, c["price"])
-            contract = await asyncio.to_thread(choose_best_contract_from_massive, ticker, c)
+            try:
+                o = await asyncio.wait_for(
+                    asyncio.to_thread(options_info_from_massive, ticker, c["price"]),
+                    timeout=12
+                )
+            except:
+                o = {
+                    "call": c["price"],
+                    "put": c["price"],
+                    "gamma": c["price"],
+                    "zlow": c["price"],
+                    "zhigh": c["price"],
+                    "prob": 50,
+                    "liq": "—",
+                }
+
+            try:
+                contract = await asyncio.wait_for(
+                    asyncio.to_thread(choose_best_contract_from_massive, ticker, c),
+                    timeout=15
+                )
+            except:
+                contract = None
 
             if data_cb == "quick":
                 send(msg_quick(ticker, tf, c), main_menu(), chat_id=user)
