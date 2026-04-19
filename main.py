@@ -780,3 +780,294 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
     except Exception as e:
         print(f"[CONTRACT PICK ERROR] {ticker}: {e}")
         return None
+# =========================
+# فلترة الصياد
+# =========================
+
+def calc_score(c, o):
+    score = 0
+    if c["direction"].startswith("CALL") or c["direction"].startswith("PUT"):
+        score += 35
+    if c["strongest_trend"] in ["صاعد قوي 🔥", "هابط قوي 🔻"]:
+        score += 25
+    if abs(c["pivot_diff"]) > 0:
+        score += 10
+    if o["prob"] >= 60:
+        score += 15
+    if c["trend"] == "صاعد 📈" and c["direction"].startswith("CALL"):
+        score += 10
+    if c["trend"] == "هابط 📉" and c["direction"].startswith("PUT"):
+        score += 10
+    return score
+
+def is_entry_ready_now(c):
+    if c["direction"] == "انتظار ⚪":
+        return False
+
+    price = c["price"]
+    entry = c["best_entry"]
+    near_entry = abs(price - entry) / max(entry, 1e-9) <= ENTRY_MAX_DISTANCE_PCT
+
+    breakout_call = (
+        c["direction"].startswith("CALL")
+        and price >= c["best_entry"] * (1 - BREAKOUT_BUFFER_PCT)
+        and c["confirmed_side"] == "above"
+    )
+
+    breakout_put = (
+        c["direction"].startswith("PUT")
+        and price <= c["best_entry"] * (1 + BREAKOUT_BUFFER_PCT)
+        and c["confirmed_side"] == "below"
+    )
+
+    return near_entry or breakout_call or breakout_put
+
+# =========================
+# تنسيق التاريخ
+# =========================
+
+def format_arabic_date(date_str: str):
+    try:
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        months = {
+            1: "يناير", 2: "فبراير", 3: "مارس", 4: "أبريل", 5: "مايو", 6: "يونيو",
+            7: "يوليو", 8: "أغسطس", 9: "سبتمبر", 10: "أكتوبر", 11: "نوفمبر", 12: "ديسمبر"
+        }
+        return f"{dt.day} {months[dt.month]} {dt.year}"
+    except:
+        return date_str
+
+# =========================
+# الرسائل
+# =========================
+
+def msg_quick(tk, tf, c):
+    return f"""📊 <b>{tk}</b> | TF: {tf}
+
+💰 السعر: <b>{c['price']:.2f}</b>
+📊 الترند: {c['trend']}
+🔥 الاتجاه الأقوى: {c['strongest_trend']}
+
+📍 الارتكاز {c['pivot_label']}: <b>{c['pivot']:.2f}</b>
+📏 البعد عن الارتكاز: {c['pivot_diff']:+.2f} ({c['pivot_position']})
+
+🔵 دعم: {c['low']:.2f}
+🔴 مقاومة: {c['high']:.2f}
+
+🟢 أهداف CALL:
+1️⃣ {c['call_tp1']:.2f}
+2️⃣ {c['call_tp2']:.2f}
+3️⃣ {c['call_tp3']:.2f}
+
+🔴 أهداف PUT:
+1️⃣ {c['put_tp1']:.2f}
+2️⃣ {c['put_tp2']:.2f}
+3️⃣ {c['put_tp3']:.2f}
+
+📌 دخول: {c['best_entry']:.2f}
+🛑 وقف: {c['sl']:.2f}
+
+📈 القرار: <b>{c['direction']}</b>"""
+
+def msg_pro(tk, tf, c, o, contract=None):
+    base = f"""🔥 <b>{tk} احترافي</b> | TF: {tf}
+
+💰 السعر: <b>{c['price']:.2f}</b>
+📊 الترند: {c['trend']}
+🔥 الاتجاه الأقوى: {c['strongest_trend']}
+
+🔵 دعم {c['pivot_label']}: {c['low']:.2f}
+🔴 مقاومة {c['pivot_label']}: {c['high']:.2f}
+📍 الارتكاز {c['pivot_label']}: <b>{c['pivot']:.2f}</b>
+📏 البعد عن الارتكاز: {c['pivot_diff']:+.2f} ({c['pivot_position']})
+
+🟢 أهداف CALL (فوق الارتكاز):
+1️⃣ {c['call_tp1']:.2f}
+2️⃣ {c['call_tp2']:.2f}
+3️⃣ {c['call_tp3']:.2f}
+
+🔴 أهداف PUT (تحت الارتكاز):
+1️⃣ {c['put_tp1']:.2f}
+2️⃣ {c['put_tp2']:.2f}
+3️⃣ {c['put_tp3']:.2f}
+
+📈 <b>القرار النهائي: {c['direction']}</b>
+
+🧲 <b>معلومات داعمة:</b>
+القاما: {o['gamma']:.2f}
+Magnet: {o['zlow']:.2f} - {o['zhigh']:.2f}
+احتمال الوصول: {o['prob']}%
+سيولة الكول: {o['call']:.2f}
+سيولة البوت: {o['put']:.2f}
+الأقوى: {o['liq']}"""
+
+    if not contract:
+        return base + "\n\n❌ لم يتم العثور على عقد مناسب ضمن حد السعر."
+
+    mode_line = f"\n🎯 الوضع: {contract.get('mode', 'NORMAL')}" if contract.get("mode") else ""
+
+    return base + f"""
+
+💎 <b>العقد المختار:</b>{mode_line}
+الرمز: <code>{contract['option_ticker']}</code>
+النوع: {contract['contract_type'].upper()}
+السترايك: {contract['strike']:.2f}
+الانتهاء: {format_arabic_date(contract['expiration'])}
+سعر العقد: <b>{contract['contract_price']:.2f}</b>
+نطاق الدخول: {contract['entry_high']:.2f} – {contract['entry_low']:.2f}
+
+🎯 أهداف العقد:
+1️⃣ {contract['tp1']:.2f}
+2️⃣ {contract['tp2']:.2f}
+3️⃣ {contract['tp3']:.2f}
+
+🛑 الوقف: {contract['stop_text']}
+📊 نسبة النجاح: <b>{contract['success_rate']}%</b>
+Δ Delta: {contract['delta']:.2f} | Γ Gamma: {contract['gamma']:.4f}
+IV: {contract['iv']:.4f} | OI: {contract['oi']}"""
+
+def msg_channel_post(tk, contract):
+    type_ar = "CALL" if contract["contract_type"] == "call" else "PUT"
+    color = "🟢" if contract["contract_type"] == "call" else "🔴"
+
+    mode_line = ""
+    if contract.get("mode") == "ZERO HERO FRIDAY":
+        mode_line = "\n⚡ <b>الوضع: زيرو هيرو الجمعة</b>"
+
+    return f"""🆕 <b>طرح جديد | {tk}</b>{mode_line}
+
+{color} النوع: <b>{type_ar}</b>
+🎯 السترايك: ${contract['strike']:.2f}
+📅 التاريخ: {format_arabic_date(contract['expiration'])}
+
+💰 نطاق الدخول: {contract['entry_high']:.2f} – {contract['entry_low']:.2f}
+
+📈 الأهداف:
+🥇 {contract['tp1']:.2f}
+🥈 {contract['tp2']:.2f}
+🥉 {contract['tp3']:.2f}
+
+🛑 الوقف: {contract['stop_text']}
+📊 نسبة النجاح: <b>{contract['success_rate']}%</b>
+
+⚠️ تنبيه: هذا الطرح تعليمي
+والقرار النهائي يعود للمتداول
+
+📢 @Option_Strike01"""
+
+def msg_contract_update(title, entry_price, current_price):
+    pnl = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+    emoji = "🚀" if pnl >= 50 else "📈" if pnl >= 0 else "📉"
+    return f"""🔔 <b>تحديث | {title}</b>
+
+📊 سعر الدخول: {entry_price:.2f}
+💰 السعر الحالي: {current_price:.2f}
+{emoji} نسبة الربح: <b>{pnl:+.2f}%</b>
+
+⚠️ تنبيه: هذا الطرح تعليمي
+والقرار النهائي يعود للمتداول.
+
+📢 @Option_Strike01"""
+
+def msg_gamma(tk, tf, c, o):
+    return f"""🧲 <b>{tk} - القاما والسيولة</b> | TF: {tf}
+
+🧲 القاما: {o['gamma']:.2f}
+📍 Magnet: {o['zlow']:.2f} - {o['zhigh']:.2f}
+📊 احتمال الوصول: <b>{o['prob']}%</b>
+
+💰 سيولة الكول: {o['call']:.2f}
+💸 سيولة البوت: {o['put']:.2f}
+🔥 الأقوى: {o['liq']}
+
+📍 الارتكاز {c['pivot_label']}: {c['pivot']:.2f}
+📏 البعد عن الارتكاز: {c['pivot_diff']:+.2f} ({c['pivot_position']})
+
+الاتجاه الأقوى: {c['strongest_trend']}
+السعر الحالي: <b>{c['price']:.2f}</b>"""
+
+def msg_sr(tk, tf, c):
+    return f"""📈 <b>{tk} - دعوم ومقاومات</b> | TF: {tf}
+
+🔵 دعم {c['pivot_label']}: <b>{c['low']:.2f}</b>
+🔴 مقاومة {c['pivot_label']}: <b>{c['high']:.2f}</b>
+
+📍 الارتكاز {c['pivot_label']}: <b>{c['pivot']:.2f}</b>
+📏 البعد عن الارتكاز: {c['pivot_diff']:+.2f} ({c['pivot_position']})
+
+🟢 أهداف CALL (فوق الارتكاز):
+1️⃣ {c['call_tp1']:.2f}
+2️⃣ {c['call_tp2']:.2f}
+3️⃣ {c['call_tp3']:.2f}
+
+🔴 أهداف PUT (تحت الارتكاز):
+1️⃣ {c['put_tp1']:.2f}
+2️⃣ {c['put_tp2']:.2f}
+3️⃣ {c['put_tp3']:.2f}
+
+الاتجاه الأقوى: {c['strongest_trend']}
+السعر الحالي: <b>{c['price']:.2f}</b>"""
+
+def msg_plan(tk, tf, c):
+    return f"""🎯 <b>{tk} - خطة الدخول</b> | TF: {tf}
+
+الاتجاه الأقوى: {c['strongest_trend']}
+📍 الارتكاز {c['pivot_label']}: {c['pivot']:.2f}
+📏 البعد عن الارتكاز: {c['pivot_diff']:+.2f} ({c['pivot_position']})
+
+📌 دخول: <b>{c['best_entry']:.2f}</b>
+🛑 وقف: {c['sl']:.2f}
+
+🟢 أهداف CALL:
+1️⃣ {c['call_tp1']:.2f}
+2️⃣ {c['call_tp2']:.2f}
+3️⃣ {c['call_tp3']:.2f}
+
+🔴 أهداف PUT:
+1️⃣ {c['put_tp1']:.2f}
+2️⃣ {c['put_tp2']:.2f}
+3️⃣ {c['put_tp3']:.2f}
+
+📈 القرار: <b>{c['direction']}</b>"""
+
+def msg_contract(tk, tf, c, contract):
+    if not contract:
+        return "❌ لم يتم العثور على عقد مناسب ضمن حد السعر."
+    mode_line = f"\nMode: {contract.get('mode', 'NORMAL')}" if contract.get("mode") else ""
+    return f"""💎 <b>{tk} - أفضل عقد</b> | TF: {tf}{mode_line}
+
+النوع: {contract['contract_type'].upper()}
+السترايك: {contract['strike']:.2f}
+الانتهاء: {format_arabic_date(contract['expiration'])}
+سعر العقد: <b>{contract['contract_price']:.2f}</b>
+
+الاتجاه الأقوى: {c['strongest_trend']}
+📍 الارتكاز {c['pivot_label']}: {c['pivot']:.2f}
+📏 البعد عن الارتكاز: {c['pivot_diff']:+.2f} ({c['pivot_position']})
+
+📌 نطاق الدخول: {contract['entry_high']:.2f} – {contract['entry_low']:.2f}
+🛑 الوقف: {contract['stop_text']}
+
+🎯 أهداف العقد:
+1️⃣ {contract['tp1']:.2f}
+2️⃣ {contract['tp2']:.2f}
+3️⃣ {contract['tp3']:.2f}
+
+📊 نسبة النجاح: <b>{contract['success_rate']}%</b>"""
+
+# =========================
+# حالة المستخدم
+# =========================
+
+STATE = {}
+
+def set_state(user, ticker=None, tf=None):
+    s = STATE.get(user, {"ticker": None, "tf": "1d"})
+    if ticker:
+        s["ticker"] = ticker
+    if tf:
+        s["tf"] = tf
+    STATE[user] = s
+
+def get_state(user):
+    return STATE.get(user, {"ticker": None, "tf": "1d"})
