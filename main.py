@@ -811,7 +811,45 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
                         ticker, contract["option_ticker"], contract["contract_price"])
             return contract
 
-        logger.info("[CONTRACT DEBUG] %s: no usable contract found under limit %.2f", ticker, limit_price)
+        # =========================
+        # تشخيص + fallback
+        # =========================
+        total_count = len(parsed)
+        same_type = [x for x in parsed if x["contract_type"] == target_type]
+        with_price = [x for x in same_type if x["contract_price"] is not None and x["contract_price"] > 0]
+        under_limit = [x for x in with_price if x["contract_price"] <= limit_price]
+
+        logger.info(
+            "[CONTRACT DEBUG] %s | total=%s | same_type=%s | with_price=%s | under_limit=%s | limit=%.2f",
+            ticker, total_count, len(same_type), len(with_price), len(under_limit), limit_price
+        )
+
+        logger.info("[CONTRACT DEBUG] %s: trying fallback stage3", ticker)
+
+        stage3 = []
+        for x in parsed:
+            if x["contract_type"] != target_type:
+                continue
+            if not x["expiration"]:
+                continue
+            if x["contract_price"] is None or x["contract_price"] <= 0:
+                continue
+            if x["contract_price"] > limit_price:
+                continue
+
+            score = abs(x["contract_price"] - min(limit_price, 2.0))
+            stage3.append((score, x))
+
+        if stage3:
+            stage3.sort(key=lambda z: z[0])
+            best = stage3[0][1]
+            contract = build_contract_from_pick(best, c, target_type, mode="FALLBACK")
+            contract["success_rate"] = calc_success_rate(c, o or {"prob": 50}, contract)
+            logger.info("[CONTRACT DEBUG] %s: stage3 picked %s @ %s",
+                        ticker, contract["option_ticker"], contract["contract_price"])
+            return contract
+
+        logger.info("[CONTRACT DEBUG] %s: no contract even after fallback", ticker)
         return None
 
     except Exception as e:
@@ -975,6 +1013,8 @@ def msg_channel_post(tk, contract):
     mode_line = ""
     if contract.get("mode") == "ZERO HERO FRIDAY":
         mode_line = "\n⚡ الوضع: زيرو هيرو الجمعة"
+    elif contract.get("mode") == "FALLBACK":
+        mode_line = "\n⚠️ الوضع: fallback"
 
     return f"""🆕 طرح جديد | {tk}{mode_line}
 
