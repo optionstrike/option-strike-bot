@@ -2,10 +2,8 @@ from fastapi import FastAPI, Request
 import requests
 import yfinance as yf
 import pandas as pd
-import numpy as np
 import time
 import asyncio
-from urllib.parse import quote_plus
 from datetime import datetime, timedelta
 
 app = FastAPI()
@@ -19,7 +17,6 @@ MASSIVE_API_KEY = "AcbX3y7rKzou3MzUi8EVlETdYLFsVGa2"
 
 API_SEND = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 API_ANSWER = f"https://api.telegram.org/bot{TOKEN}/answerCallbackQuery"
-
 MASSIVE_BASE = "https://api.massive.com"
 
 # =========================
@@ -28,7 +25,7 @@ MASSIVE_BASE = "https://api.massive.com"
 MAX_SIGNALS_PER_DAY = 5
 STOCK_COOLDOWN_DAYS = 3
 TREND_CONFIRM_HOURS = 3
-SCAN_INTERVAL_SECONDS = 3600  # كل ساعة
+SCAN_INTERVAL_SECONDS = 10800  # كل 3 ساعات
 
 # =========================
 # فلتر الدخول المباشر
@@ -37,12 +34,23 @@ ENTRY_MAX_DISTANCE_PCT = 0.015   # 1.5%
 BREAKOUT_BUFFER_PCT = 0.003      # 0.3%
 
 # =========================
-# شروط العقود
+# شروط العقود الأساسية
 # =========================
 MAX_COMPANY_CONTRACT_PRICE = 3.50
 MAX_SPAC_CONTRACT_PRICE = 3.70
 ENTRY_ZONE_WIDTH = 0.60
 UPDATE_STEP_AFTER_TP1 = 0.30
+
+# =========================
+# زيرو هيرو الجمعة
+# =========================
+FRIDAY_ZERO_HERO_ENABLED = True
+ZERO_HERO_ONLY_ON_FRIDAY = True
+ZERO_HERO_MIN_PRICE = 0.20
+ZERO_HERO_MAX_PRICE = 2.00
+ZERO_HERO_MIN_SUCCESS_RATE = 75
+ZERO_HERO_MIN_OI = 100
+ZERO_HERO_MIN_PROB = 65
 
 # =========================
 # أصول الارتكاز اليومي
@@ -67,19 +75,15 @@ WATCHLIST = list(dict.fromkeys([
     "US500","SPY","QQQ","SPX","NDX","US100"
 ]))
 
+# =========================
+# جلسة requests
+# =========================
 HTTP = requests.Session()
 
 # =========================
-# منع التكرار السريع للمستخدم
+# منع التكرار
 # =========================
-_last = {}
-COOLDOWN = 2
-
 def allow(user):
-    t = time.time()
-    if user in _last and t - _last[user] < COOLDOWN:
-        return False
-    _last[user] = t
     return True
 
 # =========================
@@ -96,7 +100,6 @@ DAILY_SIGNAL_STATE = {
 # تتبع العقود المطروحة
 # =========================
 OPEN_CONTRACT_SIGNALS = {}
-LAST_DAILY_REPORT_DATE = None
 
 def reset_daily_counter_if_needed():
     today = datetime.now().date()
@@ -317,7 +320,34 @@ def get_option_last_trade(option_contract: str):
     return data.get("results", {})
 
 # =========================
-# تثبيت الاتجاه 3 ساعات حول الارتكاز
+# أدوات خاصة بالعقود
+# =========================
+def is_spac_ticker(ticker: str) -> bool:
+    return ticker in SPAC_TICKERS
+
+def is_friday_now() -> bool:
+    return datetime.now().weekday() == 4
+
+def contract_price_limit_for_ticker(ticker: str) -> float:
+    return MAX_SPAC_CONTRACT_PRICE if is_spac_ticker(ticker) else MAX_COMPANY_CONTRACT_PRICE
+
+def is_same_day_expiry(expiration_str: str) -> bool:
+    try:
+        exp = datetime.strptime(expiration_str, "%Y-%m-%d").date()
+        return exp == datetime.now().date()
+    except:
+        return False
+
+def is_near_expiry(expiration_str: str, max_days: int = 7) -> bool:
+    try:
+        exp = datetime.strptime(expiration_str, "%Y-%m-%d").date()
+        delta = (exp - datetime.now().date()).days
+        return 0 <= delta <= max_days
+    except:
+        return False
+
+# =========================
+# تثبيت الاتجاه
 # =========================
 def get_confirmed_side_hourly(ticker: str, pivot: float):
     df_1h = get_df(ticker, "1h")
@@ -498,15 +528,23 @@ def options_info_from_massive(ticker, price):
         }
 
 # =========================
+# حساب نسبة نجاح مخصصة
+# =========================
+def calc_success_rate(c: dict, o: dict, contract: dict):
+    return min(92, max(55, int(
+        55
+        + (10 if c["strongest_trend"] in ["صاعد قوي 🔥", "هابط قوي 🔻"] else 0)
+        + (10 if c["direction"] != "انتظار ⚪" else 0)
+        + (8 if abs(c["pivot_diff"]) > 0 else 0)
+        + (5 if contract["oi"] > 1000 else 0)
+        + (4 if abs(contract["delta"]) >= 0.20 else 0)
+        + (5 if o["prob"] >= 65 else 0)
+    )))
+
+# =========================
 # اختيار العقد
 # =========================
-def is_spac_ticker(ticker: str) -> bool:
-    return ticker in SPAC_TICKERS
-
-def contract_price_limit_for_ticker(ticker: str) -> float:
-    return MAX_SPAC_CONTRACT_PRICE if is_spac_ticker(ticker) else MAX_COMPANY_CONTRACT_PRICE
-
-def choose_best_contract_from_massive(ticker: str, c: dict):
+def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
     try:
         chain = get_option_chain_snapshot(ticker)
         if not chain:
@@ -528,6 +566,67 @@ def choose_best_contract_from_massive(ticker: str, c: dict):
 
         limit_price = contract_price_limit_for_ticker(ticker)
         underlying_price = c["price"]
+        prob = o["prob"] if o else 50
+
+        friday_mode = (
+            FRIDAY_ZERO_HERO_ENABLED
+            and ((ZERO_HERO_ONLY_ON_FRIDAY and is_friday_now()) or (not ZERO_HERO_ONLY_ON_FRIDAY))
+        )
+
+        zero_hero_candidates = []
+        if friday_mode and c["strongest_trend"] in ["صاعد قوي 🔥", "هابط قوي 🔻"] and prob >= ZERO_HERO_MIN_PROB:
+            for x in parsed:
+                if x["contract_type"] != target_type:
+                    continue
+                if not x["expiration"]:
+                    continue
+                if x["contract_price"] is None or x["contract_price"] <= 0:
+                    continue
+                if x["contract_price"] < ZERO_HERO_MIN_PRICE or x["contract_price"] > ZERO_HERO_MAX_PRICE:
+                    continue
+                if x["oi"] < ZERO_HERO_MIN_OI:
+                    continue
+                if not (is_same_day_expiry(x["expiration"]) or is_near_expiry(x["expiration"], 2)):
+                    continue
+
+                strike_distance = abs(x["strike"] - underlying_price)
+                delta_score = abs(abs(x["delta"]) - 0.30)
+
+                score = (
+                    strike_distance * 2.5
+                    + delta_score * 8
+                    - min(x["oi"], 100000) / 10000
+                    - min(abs(x["gamma"]), 1.0) * 10
+                    + abs(x["contract_price"] - 1.00) * 1.2
+                )
+                zero_hero_candidates.append((score, x))
+
+            if zero_hero_candidates:
+                zero_hero_candidates.sort(key=lambda z: z[0])
+                best = zero_hero_candidates[0][1]
+
+                contract = {
+                    "option_ticker": best["ticker"],
+                    "strike": round(best["strike"], 2),
+                    "expiration": best["expiration"],
+                    "contract_type": best["contract_type"],
+                    "contract_price": round(float(best["contract_price"]), 2),
+                    "entry_high": round(float(best["contract_price"]), 2),
+                    "entry_low": round(max(0.10, float(best["contract_price"]) - ENTRY_ZONE_WIDTH), 2),
+                    "tp1": round(float(best["contract_price"]) + 0.60, 2),
+                    "tp2": round(float(best["contract_price"]) + 1.20, 2),
+                    "tp3": round(float(best["contract_price"]) + 1.80, 2),
+                    "stop_text": f"إغلاق شمعة ساعة {'تحت' if target_type == 'call' else 'فوق'} {c['pivot']:.2f}",
+                    "delta": round(best["delta"], 2),
+                    "gamma": round(best["gamma"], 4),
+                    "iv": round(best["iv"], 4),
+                    "oi": best["oi"],
+                    "mode": "ZERO HERO FRIDAY"
+                }
+                success_rate = calc_success_rate(c, o or {"prob": 50}, contract)
+                if success_rate >= ZERO_HERO_MIN_SUCCESS_RATE:
+                    contract["success_rate"] = success_rate
+                    return contract
 
         filtered = []
         for x in parsed:
@@ -539,6 +638,8 @@ def choose_best_contract_from_massive(ticker: str, c: dict):
                 continue
             if x["contract_price"] > limit_price:
                 continue
+            if not is_near_expiry(x["expiration"], 14):
+                continue
             filtered.append(x)
 
         if not filtered:
@@ -548,6 +649,7 @@ def choose_best_contract_from_massive(ticker: str, c: dict):
         for x in filtered:
             strike_distance = abs(x["strike"] - underlying_price)
             delta_score = abs(abs(x["delta"]) - 0.35)
+
             score = (
                 strike_distance * 3
                 + delta_score * 10
@@ -576,16 +678,7 @@ def choose_best_contract_from_massive(ticker: str, c: dict):
         else:
             stop_text = f"إغلاق شمعة ساعة فوق {c['pivot']:.2f}"
 
-        success_rate = min(92, max(55, int(
-            55
-            + (10 if c["strongest_trend"] in ["صاعد قوي 🔥", "هابط قوي 🔻"] else 0)
-            + (10 if c["direction"] != "انتظار ⚪" else 0)
-            + (8 if abs(c["pivot_diff"]) > 0 else 0)
-            + (5 if best["oi"] > 1000 else 0)
-            + (4 if abs(best["delta"]) >= 0.20 else 0)
-        )))
-
-        return {
+        contract = {
             "option_ticker": best["ticker"],
             "strike": round(best["strike"], 2),
             "expiration": best["expiration"],
@@ -601,13 +694,17 @@ def choose_best_contract_from_massive(ticker: str, c: dict):
             "gamma": round(best["gamma"], 4),
             "iv": round(best["iv"], 4),
             "oi": best["oi"],
-            "success_rate": success_rate,
+            "mode": "NORMAL"
         }
-    except:
+        contract["success_rate"] = calc_success_rate(c, o or {"prob": 50}, contract)
+        return contract
+
+    except Exception as e:
+        print(f"[CONTRACT PICK ERROR] {ticker}: {e}")
         return None
 
 # =========================
-# فلترة الصيّاد
+# فلترة الصياد
 # =========================
 def calc_score(c, o):
     score = 0
@@ -626,7 +723,7 @@ def calc_score(c, o):
     return score
 
 # =========================
-# فلتر الدخول المباشر
+# فلتر الدخول
 # =========================
 def is_entry_ready_now(c):
     if c["direction"] == "انتظار ⚪":
@@ -666,7 +763,7 @@ def format_arabic_date(date_str: str):
         return date_str
 
 # =========================
-# بناء الرسائل
+# الرسائل
 # =========================
 def msg_quick(tk, tf, c):
     return f"""📊 {tk} | TF: {tf}
@@ -711,9 +808,11 @@ Magnet: {o['zlow']:.2f} - {o['zhigh']:.2f}
     if not contract:
         return base + "\n\n❌ لم يتم العثور على عقد مناسب ضمن حد السعر."
 
+    mode_line = f"\n🎯 الوضع: {contract.get('mode', 'NORMAL')}" if contract.get("mode") else ""
+
     return base + f"""
 
-💎 العقد المختار:
+💎 العقد المختار:{mode_line}
 الرمز: {contract['option_ticker']}
 النوع: {contract['contract_type'].upper()}
 السترايك: {contract['strike']:.2f}
@@ -737,7 +836,11 @@ def msg_channel_post(tk, contract):
     type_ar = "CALL" if contract["contract_type"] == "call" else "PUT"
     color = "🟢" if contract["contract_type"] == "call" else "🔴"
 
-    return f"""🆕 طرح جديد | {tk}
+    mode_line = ""
+    if contract.get("mode") == "ZERO HERO FRIDAY":
+        mode_line = "\n⚡ الوضع: زيرو هيرو الجمعة"
+
+    return f"""🆕 طرح جديد | {tk}{mode_line}
 
 {color} النوع: {type_ar}
 🎯 السترايك: ${contract['strike']:.2f}
@@ -818,7 +921,8 @@ def msg_plan(tk, tf, c):
 def msg_contract(tk, tf, c, contract):
     if not contract:
         return "❌ لم يتم العثور على عقد مناسب ضمن حد السعر."
-    return f"""💎 {tk} Best Contract | TF: {tf}
+    mode_line = f"\nMode: {contract.get('mode', 'NORMAL')}" if contract.get("mode") else ""
+    return f"""💎 {tk} Best Contract | TF: {tf}{mode_line}
 
 Type: {contract['contract_type'].upper()}
 Strike: {contract['strike']:.2f}
@@ -924,7 +1028,7 @@ def scanner_cycle():
                 continue
 
             o = options_info_from_massive(ticker, c["price"])
-            contract = choose_best_contract_from_massive(ticker, c)
+            contract = choose_best_contract_from_massive(ticker, c, o)
             if not contract:
                 continue
 
@@ -968,7 +1072,7 @@ def contract_update_cycle():
             if price > sig["highest_price"]:
                 sig["highest_price"] = price
 
-            if not sig["first_update_sent"] and price >= sig["tp1"]:
+            if (not sig["first_update_sent"]) and price >= sig["tp1"]:
                 send(msg_contract_update(sig["channel_title"], sig["entry_price"], price))
                 sig["first_update_sent"] = True
                 sig["last_update_trigger_price"] = price
@@ -977,6 +1081,7 @@ def contract_update_cycle():
             if sig["first_update_sent"] and price >= sig["last_update_trigger_price"] + UPDATE_STEP_AFTER_TP1:
                 send(msg_contract_update(sig["channel_title"], sig["entry_price"], price))
                 sig["last_update_trigger_price"] = price
+
         except Exception as e:
             print(f"[CONTRACT UPDATE ERROR] {option_ticker}: {e}")
 
@@ -1010,7 +1115,7 @@ async def startup_event():
 async def webhook(req: Request):
     try:
         data = await req.json()
-    except Exception:
+    except:
         return {"ok": True}
 
     try:
@@ -1048,11 +1153,8 @@ async def webhook(req: Request):
                 return {"ok": True}
 
             set_state(user, ticker=ticker, tf=tf)
+            send(f"⏳ جاري تحديث تحليل {ticker}...", chat_id=user)
 
-            # رد فوري يثبت أن البوت صاحي
-            send(f"🚀 جاري تحليل {ticker} على فريم {tf}...", chat_id=user)
-
-            # نبدأ التحليل
             df = await asyncio.to_thread(get_df, ticker, tf)
             if df.empty:
                 send("❌ السهم غير صحيح أو لا توجد بيانات", chat_id=user)
@@ -1063,7 +1165,6 @@ async def webhook(req: Request):
                 send("❌ تعذر حساب الارتكاز لهذا الأصل", chat_id=user)
                 return {"ok": True}
 
-            # نحاول الخيارات، وإذا علقت أو فشلت نكمل تحليل بدونها
             try:
                 o = await asyncio.wait_for(
                     asyncio.to_thread(options_info_from_massive, ticker, c["price"]),
@@ -1082,7 +1183,7 @@ async def webhook(req: Request):
 
             try:
                 contract = await asyncio.wait_for(
-                    asyncio.to_thread(choose_best_contract_from_massive, ticker, c),
+                    asyncio.to_thread(choose_best_contract_from_massive, ticker, c, o),
                     timeout=15
                 )
             except:
@@ -1158,7 +1259,7 @@ async def webhook(req: Request):
 
             try:
                 contract = await asyncio.wait_for(
-                    asyncio.to_thread(choose_best_contract_from_massive, ticker, c),
+                    asyncio.to_thread(choose_best_contract_from_massive, ticker, c, o),
                     timeout=15
                 )
             except:
@@ -1207,5 +1308,10 @@ def home():
         "trend_confirm_hours": TREND_CONFIRM_HOURS,
         "entry_max_distance_pct": ENTRY_MAX_DISTANCE_PCT,
         "breakout_buffer_pct": BREAKOUT_BUFFER_PCT,
+        "max_company_contract_price": MAX_COMPANY_CONTRACT_PRICE,
+        "max_spac_contract_price": MAX_SPAC_CONTRACT_PRICE,
+        "friday_zero_hero_enabled": FRIDAY_ZERO_HERO_ENABLED,
+        "zero_hero_min_price": ZERO_HERO_MIN_PRICE,
+        "zero_hero_max_price": ZERO_HERO_MAX_PRICE,
         "massive_connected": True
     }
