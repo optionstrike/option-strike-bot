@@ -3,7 +3,6 @@ import requests
 import yfinance as yf
 import pandas as pd
 import asyncio
-import os
 import logging
 from datetime import datetime, timedelta
 from typing import Optional
@@ -22,9 +21,9 @@ logger = logging.getLogger("options_bot")
 # =========================
 # بياناتك
 # =========================
-TOKEN = "8619465902:AAHPP9AFiL0fV1lejKtaThLlQ4qZ6qCYgX0"
-CHAT_ID = "8371374055"
-MASSIVE_API_KEY = "AcbX3y7rKzou3MzUi8EVlETdYLFsVGa2"
+TOKEN = "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE"
+CHAT_ID = "PUT_YOUR_CHAT_ID_HERE"
+MASSIVE_API_KEY = "PUT_YOUR_MASSIVE_API_KEY_HERE"
 
 API_SEND = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 API_ANSWER = f"https://api.telegram.org/bot{TOKEN}/answerCallbackQuery"
@@ -48,7 +47,7 @@ BREAKOUT_BUFFER_PCT = 0.003
 # شروط العقود الأساسية
 # =========================
 MAX_COMPANY_CONTRACT_PRICE = 3.50
-MAX_SPAC_CONTRACT_PRICE = 3.70
+MAX_INDEX_CONTRACT_PRICE = 3.70
 ENTRY_ZONE_WIDTH = 0.60
 UPDATE_STEP_AFTER_TP1 = 0.30
 
@@ -66,11 +65,13 @@ ZERO_HERO_MIN_PROB = 65
 # =========================
 # أصول الارتكاز اليومي
 # =========================
-INDEX_DAILY_PIVOT = {"US500", "SPY", "QQQ", "SPX", "NDX", "US100"}
+INDEX_DAILY_PIVOT = {"US500", "SPY", "QQQ", "SPX", "SPXW", "NDX", "US100"}
 
-SPAC_TICKERS = {
-    "NBIS", "CRCL", "CRWV"
-}
+# =========================
+# فئات الرموز
+# =========================
+SPAC_TICKERS = {"NBIS", "CRCL", "CRWV"}
+INDEX_OPTION_TICKERS = {"SPXW", "SPX", "SPY", "QQQ", "US500", "NDX", "US100"}
 
 # =========================
 # قائمة الشركات + المؤشرات
@@ -83,7 +84,7 @@ WATCHLIST = list(dict.fromkeys([
     "FSLR","COST","SHOP","ALB","NBIS","ARM","CRCL","ABBV","HOOD","BABA","ADBE","LULU","ORCL",
     "LLY","TSM","CVNA","COIN","CRWV","CAT","AMD","SNOW","MDB","AMZN","MU","CRM","GE",
     "NVDA","AAPL","GOOGL","MSFT","TSLA","META","AVGO","CRWD","APP","UNH","MSTR","PLTR",
-    "US500","SPY","QQQ","SPX","NDX","US100"
+    "US500","SPY","QQQ","SPX","SPXW","NDX","US100"
 ]))
 
 HTTP = requests.Session()
@@ -229,6 +230,7 @@ TF = {
 def map_symbol_for_data(ticker: str) -> str:
     mapping = {
         "SPX": "^GSPC",
+        "SPXW": "^GSPC",
         "NDX": "^NDX",
         "SPY": "SPY",
         "QQQ": "QQQ",
@@ -352,11 +354,16 @@ def get_option_last_trade(option_contract: str):
 def is_spac_ticker(ticker: str) -> bool:
     return ticker in SPAC_TICKERS
 
+def is_index_option_ticker(ticker: str) -> bool:
+    return ticker in INDEX_OPTION_TICKERS
+
 def is_friday_now() -> bool:
     return now_local().weekday() == 4
 
 def contract_price_limit_for_ticker(ticker: str) -> float:
-    return MAX_SPAC_CONTRACT_PRICE if is_spac_ticker(ticker) else MAX_COMPANY_CONTRACT_PRICE
+    if is_index_option_ticker(ticker):
+        return MAX_INDEX_CONTRACT_PRICE
+    return MAX_COMPANY_CONTRACT_PRICE
 
 def days_to_expiry(expiration_str: str) -> Optional[int]:
     try:
@@ -415,23 +422,19 @@ def get_confirmed_side_hourly(ticker: str, pivot: float):
         }
         return side
 
-    # لو نفس الاتجاه الحالي المثبت
     if prev["side"] == side:
         prev["candidate_side"] = side
         prev["candidate_since"] = now_local()
         return side
 
-    # لو الحالة محايدة نحتفظ بالاتجاه السابق
     if side == "neutral":
         return prev["side"]
 
-    # بدأ مرشح جديد
     if prev.get("candidate_side") != side:
         prev["candidate_side"] = side
         prev["candidate_since"] = now_local()
         return prev["side"]
 
-    # إذا استمر المرشح الجديد بما يكفي نثبته
     if now_local() - prev["candidate_since"] >= timedelta(hours=TREND_CONFIRM_HOURS):
         prev["side"] = side
         prev["confirmed_at"] = now_local()
@@ -476,9 +479,16 @@ def core_metrics(df, ticker=None):
     pivot = (ref_high + ref_low + ref_close) / 3.0
     ref_range = ref_high - ref_low
 
-    tp1 = pivot + ref_range * 0.5
-    tp2 = pivot + ref_range
-    tp3 = ref_high + ref_range
+    # أهداف الكول
+    call_tp1 = pivot + ref_range * 0.5
+    call_tp2 = pivot + ref_range
+    call_tp3 = ref_high + ref_range
+
+    # أهداف البوت
+    put_tp1 = pivot - ref_range * 0.5
+    put_tp2 = pivot - ref_range
+    put_tp3 = ref_low - ref_range
+
     sl = pivot
 
     pivot_diff = price - pivot
@@ -526,9 +536,12 @@ def core_metrics(df, ticker=None):
         "pivot_label": pivot_label,
         "pivot_diff": pivot_diff,
         "pivot_position": pivot_position,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
+        "call_tp1": call_tp1,
+        "call_tp2": call_tp2,
+        "call_tp3": call_tp3,
+        "put_tp1": put_tp1,
+        "put_tp2": put_tp2,
+        "put_tp3": put_tp3,
         "sl": sl,
         "trend": trend,
         "strongest_trend": strongest_trend,
@@ -632,8 +645,9 @@ def calc_success_rate(c: dict, o: dict, contract: dict):
 
 # =========================
 # اختيار العقد
-# ملاحظة:
-# حسب طلبك: لا نجبر السقف السعري إذا كان هناك عقد فرصته أعلى لتحقيق TP1
+# شركات <= 3.50
+# SPX/SPXW والمؤشرات <= 3.70
+# قرب السترايك له وزن أقل، وجودة العقد أهم
 # =========================
 def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
     try:
@@ -692,11 +706,11 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
                 delta_score = abs(abs(x["delta"]) - 0.30)
 
                 score = (
-                    strike_distance_pct * 18
-                    + delta_score * 5
-                    - min(x["oi"], 100000) / 12000
-                    - min(abs(x["gamma"]), 1.0) * 6
-                    + abs(x["contract_price"] - 1.00) * 0.6
+                    strike_distance_pct * 8
+                    + delta_score * 8
+                    - min(x["oi"], 100000) / 10000
+                    - min(abs(x["gamma"]), 1.0) * 7
+                    + abs(x["contract_price"] - 1.00) * 0.5
                 )
                 zero_hero_pool.append((score, x))
 
@@ -712,9 +726,8 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
                     return contract
 
         # =========================
-        # المرحلة 1: تفضيل العقود الأقرب لتحقيق TP1
-        # لا نمنع العقد بسبب تجاوز السقف السعري
-        # لكن نعطي أفضلية بسيطة للعقود المعقولة سعريًا
+        # المرحلة 1: أفضل عقد داخل حد السعر
+        # لا نشدد على قرب السترايك
         # =========================
         stage1 = []
         for x in parsed:
@@ -723,6 +736,8 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
             if not x["expiration"]:
                 continue
             if x["contract_price"] is None or x["contract_price"] <= 0:
+                continue
+            if x["contract_price"] > limit_price:
                 continue
 
             dte = days_to_expiry(x["expiration"])
@@ -733,25 +748,24 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
 
             strike_distance_pct = abs(x["strike"] - underlying_price) / max(underlying_price, 1e-9)
             delta_score = abs(abs(x["delta"]) - 0.35)
-            dte_penalty = min(dte, 45) / 25
 
-            # penalty خفيف فقط إذا تجاوز السقف السعري، وليس إقصاء
-            price_penalty = max(0.0, x["contract_price"] - limit_price) * 0.20
-
-            # أولوية الوصول للهدف الأول:
-            # - ديلتا مناسبة
-            # - قرب نسبي من السعر
-            # - OI جيد
-            # - Gamma داعم
-            # - مدة معقولة
             score = (
-                strike_distance_pct * 22
-                + delta_score * 5
-                + dte_penalty
-                + price_penalty
-                - min(x["oi"], 100000) / 15000
-                - min(abs(x["gamma"]), 1.0) * 4
+                strike_distance_pct * 6
+                + delta_score * 12
+                + min(dte, 45) / 18
+                - min(x["oi"], 100000) / 9000
+                - min(abs(x["gamma"]), 1.0) * 6
+                + x["contract_price"] * 0.15
             )
+
+            if 0.22 <= abs(x["delta"]) <= 0.45:
+                score -= 2.5
+
+            if x["oi"] >= 500:
+                score -= 1.5
+            if x["oi"] >= 1500:
+                score -= 1.5
+
             stage1.append((score, x))
 
         if stage1:
@@ -764,7 +778,7 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
             return contract
 
         # =========================
-        # المرحلة 2: fallback مرن جدًا
+        # المرحلة 2: مرونة أكثر لكن داخل حد السعر فقط
         # =========================
         stage2 = []
         for x in parsed:
@@ -774,16 +788,22 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
                 continue
             if x["contract_price"] is None or x["contract_price"] <= 0:
                 continue
+            if x["contract_price"] > limit_price:
+                continue
 
             dte = days_to_expiry(x["expiration"])
             if dte is None or dte < 0:
                 continue
 
             strike_distance_pct = abs(x["strike"] - underlying_price) / max(underlying_price, 1e-9)
+            delta_score = abs(abs(x["delta"]) - 0.30)
+
             score = (
-                strike_distance_pct * 25
-                + min(max(dte, 0), 60) / 40
-                - min(x["oi"], 100000) / 20000
+                strike_distance_pct * 5
+                + delta_score * 10
+                + min(max(dte, 0), 60) / 20
+                - min(x["oi"], 100000) / 12000
+                + x["contract_price"] * 0.10
             )
             stage2.append((score, x))
 
@@ -796,7 +816,7 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
                         ticker, contract["option_ticker"], contract["contract_price"])
             return contract
 
-        logger.info("[CONTRACT DEBUG] %s: no usable contract found", ticker)
+        logger.info("[CONTRACT DEBUG] %s: no usable contract found under limit %.2f", ticker, limit_price)
         return None
 
     except Exception as e:
@@ -882,6 +902,16 @@ def msg_quick(tk, tf, c):
 📌 دخول: {c['best_entry']:.2f}
 🛑 وقف: {c['sl']:.2f}
 
+🎯 أهداف الكول:
+1) {c['call_tp1']:.2f}
+2) {c['call_tp2']:.2f}
+3) {c['call_tp3']:.2f}
+
+🎯 أهداف البوت:
+1) {c['put_tp1']:.2f}
+2) {c['put_tp2']:.2f}
+3) {c['put_tp3']:.2f}
+
 📈 القرار: {c['direction']}"""
 
 def msg_pro(tk, tf, c, o, contract=None):
@@ -897,6 +927,16 @@ def msg_pro(tk, tf, c, o, contract=None):
 📏 البعد عن الارتكاز: {c['pivot_diff']:+.2f} ({c['pivot_position']})
 
 📈 القرار النهائي: {c['direction']}
+
+🎯 أهداف الكول:
+1) {c['call_tp1']:.2f}
+2) {c['call_tp2']:.2f}
+3) {c['call_tp3']:.2f}
+
+🎯 أهداف البوت:
+1) {c['put_tp1']:.2f}
+2) {c['put_tp2']:.2f}
+3) {c['put_tp3']:.2f}
 
 🧲 معلومات داعمة:
 القاما المرجحة: {o['gamma']:.2f}
@@ -1014,10 +1054,15 @@ def msg_plan(tk, tf, c):
 📌 دخول: {c['best_entry']:.2f}
 🛑 وقف: {c['sl']:.2f}
 
-🎯 أهداف:
-1) {c['tp1']:.2f}
-2) {c['tp2']:.2f}
-3) {c['tp3']:.2f}
+🎯 أهداف الكول:
+1) {c['call_tp1']:.2f}
+2) {c['call_tp2']:.2f}
+3) {c['call_tp3']:.2f}
+
+🎯 أهداف البوت:
+1) {c['put_tp1']:.2f}
+2) {c['put_tp2']:.2f}
+3) {c['put_tp3']:.2f}
 
 📈 القرار: {c['direction']}"""
 
@@ -1425,7 +1470,7 @@ def home():
         "entry_max_distance_pct": ENTRY_MAX_DISTANCE_PCT,
         "breakout_buffer_pct": BREAKOUT_BUFFER_PCT,
         "max_company_contract_price": MAX_COMPANY_CONTRACT_PRICE,
-        "max_spac_contract_price": MAX_SPAC_CONTRACT_PRICE,
+        "max_index_contract_price": MAX_INDEX_CONTRACT_PRICE,
         "friday_zero_hero_enabled": FRIDAY_ZERO_HERO_ENABLED,
         "zero_hero_min_price": ZERO_HERO_MIN_PRICE,
         "zero_hero_max_price": ZERO_HERO_MAX_PRICE,
