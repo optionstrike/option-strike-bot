@@ -20,18 +20,11 @@ logging.basicConfig(
 logger = logging.getLogger("options_bot")
 
 # =========================
-# بياناتك - من البيئة فقط
+# بياناتك
 # =========================
-TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-MASSIVE_API_KEY = os.getenv("MASSIVE_API_KEY", "").strip()
-
-if not TOKEN:
-    raise RuntimeError("Missing TELEGRAM_TOKEN in environment variables")
-if not CHAT_ID:
-    raise RuntimeError("Missing TELEGRAM_CHAT_ID in environment variables")
-if not MASSIVE_API_KEY:
-    raise RuntimeError("Missing MASSIVE_API_KEY in environment variables")
+TOKEN = "8619465902:AAHPP9AFiL0fV1lejKtaThLlQ4qZ6qCYgX0"
+CHAT_ID = "8371374055"
+MASSIVE_API_KEY = "AcbX3y7rKzou3MzUi8EVlETdYLFsVGa2"
 
 API_SEND = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 API_ANSWER = f"https://api.telegram.org/bot{TOKEN}/answerCallbackQuery"
