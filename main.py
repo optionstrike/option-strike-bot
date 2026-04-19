@@ -328,19 +328,33 @@ def is_friday_now() -> bool:
 def contract_price_limit_for_ticker(ticker: str) -> float:
     return MAX_SPAC_CONTRACT_PRICE if is_spac_ticker(ticker) else MAX_COMPANY_CONTRACT_PRICE
 
-def is_same_day_expiry(expiration_str: str) -> bool:
-    try:
-        exp = datetime.strptime(expiration_str, "%Y-%m-%d").date()
-        return exp == datetime.now().date()
-    except:
-        return False
-
 def days_to_expiry(expiration_str: str):
     try:
         exp = datetime.strptime(expiration_str, "%Y-%m-%d").date()
         return (exp - datetime.now().date()).days
     except:
         return None
+
+def build_contract_from_pick(best, c, target_type, mode="NORMAL"):
+    contract_price = round(float(best["contract_price"]), 2)
+    return {
+        "option_ticker": best["ticker"],
+        "strike": round(best["strike"], 2),
+        "expiration": best["expiration"],
+        "contract_type": best["contract_type"],
+        "contract_price": contract_price,
+        "entry_high": contract_price,
+        "entry_low": round(max(0.10, contract_price - ENTRY_ZONE_WIDTH), 2),
+        "tp1": round(contract_price + 0.60, 2),
+        "tp2": round(contract_price + 1.20, 2),
+        "tp3": round(contract_price + 1.80, 2),
+        "stop_text": f"إغلاق شمعة ساعة {'تحت' if target_type == 'call' else 'فوق'} {c['pivot']:.2f}",
+        "delta": round(best["delta"], 2),
+        "gamma": round(best["gamma"], 4),
+        "iv": round(best["iv"], 4),
+        "oi": best["oi"],
+        "mode": mode
+    }
 
 # =========================
 # تثبيت الاتجاه
@@ -544,12 +558,14 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
     try:
         chain = get_option_chain_snapshot(ticker)
         if not chain:
+            print(f"[CONTRACT DEBUG] {ticker}: empty chain")
             return None
 
         parsed = [parse_contract_meta(x) for x in chain]
         parsed = [x for x in parsed if x["ticker"] and x["contract_price"] is not None]
 
         if not parsed:
+            print(f"[CONTRACT DEBUG] {ticker}: no parsed contracts")
             return None
 
         direction = c["direction"]
@@ -558,6 +574,7 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
         elif direction.startswith("PUT"):
             target_type = "put"
         else:
+            print(f"[CONTRACT DEBUG] {ticker}: no direction")
             return None
 
         underlying_price = c["price"]
@@ -572,8 +589,8 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
             and ((ZERO_HERO_ONLY_ON_FRIDAY and is_friday_now()) or (not ZERO_HERO_ONLY_ON_FRIDAY))
         )
 
-        zero_hero_pool = []
         if friday_mode and c["strongest_trend"] in ["صاعد قوي 🔥", "هابط قوي 🔻"] and prob >= ZERO_HERO_MIN_PROB:
+            zero_hero_pool = []
             for x in parsed:
                 if x["contract_type"] != target_type:
                     continue
@@ -594,46 +611,28 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
                 delta_score = abs(abs(x["delta"]) - 0.30)
 
                 score = (
-                    strike_distance_pct * 25
-                    + delta_score * 6
+                    strike_distance_pct * 18
+                    + delta_score * 5
                     - min(x["oi"], 100000) / 12000
-                    - min(abs(x["gamma"]), 1.0) * 8
-                    + abs(x["contract_price"] - 1.00) * 0.8
+                    - min(abs(x["gamma"]), 1.0) * 6
+                    + abs(x["contract_price"] - 1.00) * 0.6
                 )
                 zero_hero_pool.append((score, x))
 
             if zero_hero_pool:
                 zero_hero_pool.sort(key=lambda z: z[0])
                 best = zero_hero_pool[0][1]
-
-                contract_price = round(float(best["contract_price"]), 2)
-                contract = {
-                    "option_ticker": best["ticker"],
-                    "strike": round(best["strike"], 2),
-                    "expiration": best["expiration"],
-                    "contract_type": best["contract_type"],
-                    "contract_price": contract_price,
-                    "entry_high": contract_price,
-                    "entry_low": round(max(0.10, contract_price - ENTRY_ZONE_WIDTH), 2),
-                    "tp1": round(contract_price + 0.60, 2),
-                    "tp2": round(contract_price + 1.20, 2),
-                    "tp3": round(contract_price + 1.80, 2),
-                    "stop_text": f"إغلاق شمعة ساعة {'تحت' if target_type == 'call' else 'فوق'} {c['pivot']:.2f}",
-                    "delta": round(best["delta"], 2),
-                    "gamma": round(best["gamma"], 4),
-                    "iv": round(best["iv"], 4),
-                    "oi": best["oi"],
-                    "mode": "ZERO HERO FRIDAY"
-                }
+                contract = build_contract_from_pick(best, c, target_type, mode="ZERO HERO FRIDAY")
                 success_rate = calc_success_rate(c, o or {"prob": 50}, contract)
                 if success_rate >= ZERO_HERO_MIN_SUCCESS_RATE:
                     contract["success_rate"] = success_rate
+                    print(f"[CONTRACT DEBUG] {ticker}: zero hero picked {contract['option_ticker']} @ {contract['contract_price']}")
                     return contract
 
         # =========================
-        # الوضع العادي
+        # المرحلة 1: عقود ضمن الحد + مرنة + سيولة جيدة
         # =========================
-        filtered = []
+        stage1 = []
         for x in parsed:
             if x["contract_type"] != target_type:
                 continue
@@ -647,68 +646,66 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
             dte = days_to_expiry(x["expiration"])
             if dte is None or dte < 0 or dte > 45:
                 continue
+            if x["oi"] < 10:
+                continue
 
-            filtered.append(x)
-
-        if not filtered:
-            return None
-
-        candidates = []
-        for x in filtered:
             strike_distance_pct = abs(x["strike"] - underlying_price) / max(underlying_price, 1e-9)
             delta_score = abs(abs(x["delta"]) - 0.35)
-            dte = days_to_expiry(x["expiration"])
-            dte_penalty = 0 if dte is None else min(max(dte, 0), 45) / 20
+            dte_penalty = min(dte, 45) / 25
 
             score = (
-                strike_distance_pct * 30
-                + delta_score * 6
+                strike_distance_pct * 22
+                + delta_score * 5
                 + dte_penalty
                 - min(x["oi"], 100000) / 15000
-                - min(abs(x["gamma"]), 1.0) * 5
-                + abs(x["contract_price"] - min(limit_price, x["contract_price"])) * 0.15
+                - min(abs(x["gamma"]), 1.0) * 4
+                + abs(x["contract_price"] - limit_price) * 0.10
             )
-            candidates.append((score, x))
+            stage1.append((score, x))
 
-        if not candidates:
-            return None
+        if stage1:
+            stage1.sort(key=lambda z: z[0])
+            best = stage1[0][1]
+            contract = build_contract_from_pick(best, c, target_type, mode="NORMAL")
+            contract["success_rate"] = calc_success_rate(c, o or {"prob": 50}, contract)
+            print(f"[CONTRACT DEBUG] {ticker}: stage1 picked {contract['option_ticker']} @ {contract['contract_price']}")
+            return contract
 
-        candidates.sort(key=lambda z: z[0])
-        best = candidates[0][1]
+        # =========================
+        # المرحلة 2: أي عقد ضمن الحد السعري فقط
+        # =========================
+        stage2 = []
+        for x in parsed:
+            if x["contract_type"] != target_type:
+                continue
+            if not x["expiration"]:
+                continue
+            if x["contract_price"] is None or x["contract_price"] <= 0:
+                continue
+            if x["contract_price"] > limit_price:
+                continue
 
-        contract_price = round(float(best["contract_price"]), 2)
-        entry_high = contract_price
-        entry_low = round(max(0.10, contract_price - ENTRY_ZONE_WIDTH), 2)
+            dte = days_to_expiry(x["expiration"])
+            if dte is None or dte < 0:
+                continue
 
-        tp1 = round(contract_price + 0.60, 2)
-        tp2 = round(contract_price + 1.20, 2)
-        tp3 = round(contract_price + 1.80, 2)
+            score = (
+                abs(x["contract_price"] - limit_price) * 1.5
+                - min(x["oi"], 100000) / 20000
+                + min(max(dte, 0), 60) / 40
+            )
+            stage2.append((score, x))
 
-        if target_type == "call":
-            stop_text = f"إغلاق شمعة ساعة تحت {c['pivot']:.2f}"
-        else:
-            stop_text = f"إغلاق شمعة ساعة فوق {c['pivot']:.2f}"
+        if stage2:
+            stage2.sort(key=lambda z: z[0])
+            best = stage2[0][1]
+            contract = build_contract_from_pick(best, c, target_type, mode="NORMAL")
+            contract["success_rate"] = calc_success_rate(c, o or {"prob": 50}, contract)
+            print(f"[CONTRACT DEBUG] {ticker}: stage2 picked {contract['option_ticker']} @ {contract['contract_price']}")
+            return contract
 
-        contract = {
-            "option_ticker": best["ticker"],
-            "strike": round(best["strike"], 2),
-            "expiration": best["expiration"],
-            "contract_type": best["contract_type"],
-            "contract_price": contract_price,
-            "entry_high": entry_high,
-            "entry_low": entry_low,
-            "tp1": tp1,
-            "tp2": tp2,
-            "tp3": tp3,
-            "stop_text": stop_text,
-            "delta": round(best["delta"], 2),
-            "gamma": round(best["gamma"], 4),
-            "iv": round(best["iv"], 4),
-            "oi": best["oi"],
-            "mode": "NORMAL"
-        }
-        contract["success_rate"] = calc_success_rate(c, o or {"prob": 50}, contract)
-        return contract
+        print(f"[CONTRACT DEBUG] {ticker}: no contract under price limit {limit_price}")
+        return None
 
     except Exception as e:
         print(f"[CONTRACT PICK ERROR] {ticker}: {e}")
