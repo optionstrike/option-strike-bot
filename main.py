@@ -330,7 +330,16 @@ def parse_contract_meta(item):
         "underlying_price": parse_underlying_price_from_snapshot(item),
     }
 
+def normalize_option_underlying(underlying: str) -> str:
+    mapping = {
+        "SPXW": "SPX",
+        "US500": "SPY",
+        "US100": "QQQ",
+    }
+    return mapping.get(underlying, underlying)
+
 def get_option_chain_snapshot(underlying: str):
+    underlying = normalize_option_underlying(underlying)
     data = massive_get(f"/v3/snapshot/options/{underlying}")
     results = data.get("results", [])
     if isinstance(results, dict):
@@ -341,6 +350,7 @@ def get_option_chain_snapshot(underlying: str):
     return results
 
 def get_option_contract_snapshot(underlying: str, option_contract: str):
+    underlying = normalize_option_underlying(underlying)
     data = massive_get(f"/v3/snapshot/options/{underlying}/{option_contract}")
     return data.get("results", data)
 
@@ -479,12 +489,10 @@ def core_metrics(df, ticker=None):
     pivot = (ref_high + ref_low + ref_close) / 3.0
     ref_range = ref_high - ref_low
 
-    # أهداف الكول
     call_tp1 = pivot + ref_range * 0.5
     call_tp2 = pivot + ref_range
     call_tp3 = ref_high + ref_range
 
-    # أهداف البوت
     put_tp1 = pivot - ref_range * 0.5
     put_tp2 = pivot - ref_range
     put_tp3 = ref_low - ref_range
@@ -645,9 +653,6 @@ def calc_success_rate(c: dict, o: dict, contract: dict):
 
 # =========================
 # اختيار العقد
-# شركات <= 3.50
-# SPX/SPXW والمؤشرات <= 3.70
-# قرب السترايك له وزن أقل، وجودة العقد أهم
 # =========================
 def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
     try:
@@ -676,9 +681,6 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
         prob = o["prob"] if o else 50
         limit_price = contract_price_limit_for_ticker(ticker)
 
-        # =========================
-        # زيرو هيرو الجمعة
-        # =========================
         friday_mode = (
             FRIDAY_ZERO_HERO_ENABLED
             and ((ZERO_HERO_ONLY_ON_FRIDAY and is_friday_now()) or (not ZERO_HERO_ONLY_ON_FRIDAY))
@@ -725,10 +727,6 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
                                 ticker, contract["option_ticker"], contract["contract_price"])
                     return contract
 
-        # =========================
-        # المرحلة 1: أفضل عقد داخل حد السعر
-        # لا نشدد على قرب السترايك
-        # =========================
         stage1 = []
         for x in parsed:
             if x["contract_type"] != target_type:
@@ -777,9 +775,6 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
                         ticker, contract["option_ticker"], contract["contract_price"])
             return contract
 
-        # =========================
-        # المرحلة 2: مرونة أكثر لكن داخل حد السعر فقط
-        # =========================
         stage2 = []
         for x in parsed:
             if x["contract_type"] != target_type:
@@ -1280,7 +1275,7 @@ async def webhook(req: Request):
 
             if text == "/start":
                 set_state(user, ticker=None, tf="1d")
-                send("👋 أهلاً بك\nأرسل رمز السهم من قائمتك مثل: NVDA أو SPY\nأو اختر من القائمة 👇", main_menu(), chat_id=user)
+                send("👋 أهلاً بك\nأرسل رمز السهم من قائمتك مثل: NVDA أو SPY أو SPXW\nأو اختر من القائمة 👇", main_menu(), chat_id=user)
                 return {"ok": True}
 
             if text == "/test":
@@ -1288,7 +1283,7 @@ async def webhook(req: Request):
                 return {"ok": True}
 
             if not text:
-                send("❌ أرسل رمز سهم صحيح مثل: NVDA", chat_id=user)
+                send("❌ أرسل رمز سهم صحيح مثل: NVDA أو SPXW", chat_id=user)
                 return {"ok": True}
 
             parts = text.upper().split()
@@ -1304,14 +1299,18 @@ async def webhook(req: Request):
                 return {"ok": True}
 
             set_state(user, ticker=ticker, tf=tf)
-            send(f"⏳ جاري تحديث تحليل {ticker}...", chat_id=user)
+            send("⏳ يتم التحميل...", chat_id=user)
 
             df = await asyncio.to_thread(get_df, ticker, tf)
+            logger.info("Fetched df for %s tf=%s rows=%s", ticker, tf, 0 if df.empty else len(df))
+
             if df.empty:
                 send("❌ السهم غير صحيح أو لا توجد بيانات", chat_id=user)
                 return {"ok": True}
 
             c = await asyncio.to_thread(core_metrics, df, ticker)
+            logger.info("Computed core metrics for %s", ticker)
+
             if c is None:
                 send("❌ تعذر حساب الارتكاز لهذا الأصل", chat_id=user)
                 return {"ok": True}
@@ -1321,6 +1320,7 @@ async def webhook(req: Request):
                     asyncio.to_thread(options_info_from_massive, ticker, c["price"]),
                     timeout=12
                 )
+                logger.info("Fetched options info for %s", ticker)
             except Exception as e:
                 logger.warning("options_info timeout/fail for %s: %s", ticker, e)
                 o = {
@@ -1339,6 +1339,7 @@ async def webhook(req: Request):
                     asyncio.to_thread(choose_best_contract_from_massive, ticker, c, o),
                     timeout=15
                 )
+                logger.info("Picked contract for %s: %s", ticker, contract["option_ticker"] if contract else "None")
             except Exception as e:
                 logger.warning("choose_best_contract timeout/fail for %s: %s", ticker, e)
                 contract = None
@@ -1379,21 +1380,25 @@ async def webhook(req: Request):
                 return {"ok": True}
 
             if not ticker:
-                send("أرسل رمز السهم أولاً مثل: NVDA", chat_id=user)
+                send("أرسل رمز السهم أولاً مثل: NVDA أو SPXW", chat_id=user)
                 return {"ok": True}
 
             if ticker not in WATCHLIST:
                 send("❌ هذا السهم غير موجود في قائمتك", chat_id=user)
                 return {"ok": True}
 
-            send(f"⏳ جاري تحديث تحليل {ticker}...", chat_id=user)
+            send("⏳ يتم التحميل...", chat_id=user)
 
             df = await asyncio.to_thread(get_df, ticker, tf)
+            logger.info("Fetched df for %s tf=%s rows=%s", ticker, tf, 0 if df.empty else len(df))
+
             if df.empty:
                 send("❌ لا توجد بيانات", chat_id=user)
                 return {"ok": True}
 
             c = await asyncio.to_thread(core_metrics, df, ticker)
+            logger.info("Computed core metrics for %s", ticker)
+
             if c is None:
                 send("❌ تعذر حساب الارتكاز لهذا الأصل", chat_id=user)
                 return {"ok": True}
@@ -1403,6 +1408,7 @@ async def webhook(req: Request):
                     asyncio.to_thread(options_info_from_massive, ticker, c["price"]),
                     timeout=12
                 )
+                logger.info("Fetched options info for %s", ticker)
             except Exception as e:
                 logger.warning("options_info timeout/fail for %s: %s", ticker, e)
                 o = {
@@ -1421,6 +1427,7 @@ async def webhook(req: Request):
                     asyncio.to_thread(choose_best_contract_from_massive, ticker, c, o),
                     timeout=15
                 )
+                logger.info("Picked contract for %s: %s", ticker, contract["option_ticker"] if contract else "None")
             except Exception as e:
                 logger.warning("choose_best_contract timeout/fail for %s: %s", ticker, e)
                 contract = None
