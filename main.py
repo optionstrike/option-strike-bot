@@ -580,3 +580,207 @@ def core_metrics(df, ticker=None):
         "ema20": ema20,
         "ema50": ema50
     }
+# =========================
+# القاما والسيولة
+# =========================
+
+def options_info_from_massive(ticker, price):
+    try:
+        chain = get_option_chain_snapshot(ticker)
+        if not chain:
+            raise Exception("empty chain")
+
+        parsed = [parse_contract_meta(x) for x in chain]
+        parsed = [x for x in parsed if x["ticker"] and x["contract_price"] is not None]
+
+        if not parsed:
+            raise Exception("no valid contracts")
+
+        calls = [x for x in parsed if x["contract_type"] == "call"]
+        puts = [x for x in parsed if x["contract_type"] == "put"]
+
+        best_call_oi = max(calls, key=lambda x: x["oi"]) if calls else None
+        best_put_oi = max(puts, key=lambda x: x["oi"]) if puts else None
+
+        call_strike = best_call_oi["strike"] if best_call_oi else price
+        put_strike = best_put_oi["strike"] if best_put_oi else price
+
+        gamma = best_call_oi["strike"] if best_call_oi else price
+        zone_low = gamma - 0.5
+        zone_high = gamma + 0.5
+
+        dist = abs(price - gamma)
+        prob = max(50, 85 - int(dist))
+
+        liquidity = "CALL 🟢" if call_strike > price else "PUT 🔴"
+
+        return {
+            "call": call_strike,
+            "put": put_strike,
+            "gamma": gamma,
+            "zlow": zone_low,
+            "zhigh": zone_high,
+            "prob": prob,
+            "liq": liquidity,
+        }
+
+    except Exception as e:
+        print(f"[OPTIONS INFO ERROR] {ticker}: {e}")
+        return {
+            "call": price,
+            "put": price,
+            "gamma": price,
+            "zlow": price,
+            "zhigh": price,
+            "prob": 50,
+            "liq": "—",
+        }
+
+# =========================
+# نسبة النجاح
+# =========================
+
+def calc_success_rate(c: dict, o: dict, contract: dict):
+    return min(92, max(55, int(
+        55
+        + (10 if c["strongest_trend"] in ["صاعد قوي 🔥", "هابط قوي 🔻"] else 0)
+        + (10 if c["direction"] != "انتظار ⚪" else 0)
+        + (8 if abs(c["pivot_diff"]) > 0 else 0)
+        + (5 if contract["oi"] > 1000 else 0)
+        + (4 if abs(contract["delta"]) >= 0.20 else 0)
+        + (5 if o["prob"] >= 65 else 0)
+    )))
+
+# =========================
+# اختيار العقد
+# =========================
+
+def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
+    try:
+        chain = get_option_chain_snapshot(ticker)
+        if not chain:
+            return None
+
+        parsed = [parse_contract_meta(x) for x in chain]
+        parsed = [x for x in parsed if x["ticker"] and x["contract_price"] is not None]
+
+        if not parsed:
+            return None
+
+        direction = c["direction"]
+        target_type = "call" if direction.startswith("CALL") else "put"
+
+        underlying_price = c["price"]
+        limit_price = contract_price_limit_for_ticker(ticker)
+
+        candidates = []
+
+        for x in parsed:
+            if x["contract_type"] != target_type:
+                continue
+            if not x["expiration"]:
+                continue
+            if x["contract_price"] is None or x["contract_price"] <= 0:
+                continue
+
+            dte = days_to_expiry(x["expiration"])
+            if dte is None or dte < 0:
+                continue
+
+            strike_distance = abs(x["strike"] - underlying_price)
+            score = strike_distance - (x["oi"] * 0.001)
+
+            candidates.append((score, x))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda z: z[0])
+        best = candidates[0][1]
+
+        contract = build_contract_from_pick(best, c, target_type, mode="NORMAL")
+        contract["success_rate"] = calc_success_rate(c, o or {"prob": 50}, contract)
+
+        return contract
+
+    except Exception as e:
+        print(f"[CONTRACT ERROR] {ticker}: {e}")
+        return None
+
+# =========================
+# الرسائل
+# =========================
+
+def msg_quick(tk, tf, c):
+    return f"""📊 <b>{tk}</b> | TF: {tf}
+
+💰 السعر: <b>{c['price']:.2f}</b>
+📊 الترند: {c['trend']}
+🔥 الاتجاه الأقوى: {c['strongest_trend']}
+
+📍 الارتكاز {c['pivot_label']}: <b>{c['pivot']:.2f}</b>
+
+📈 القرار: <b>{c['direction']}</b>"""
+
+def msg_pro(tk, tf, c, o, contract=None):
+    base = f"""🔥 <b>{tk}</b> | TF: {tf}
+
+💰 السعر: <b>{c['price']:.2f}</b>
+📊 الترند: {c['trend']}
+🔥 الاتجاه الأقوى: {c['strongest_trend']}
+
+📍 الارتكاز: <b>{c['pivot']:.2f}</b>
+
+📈 القرار: <b>{c['direction']}</b>
+
+🧲 القاما: {o['gamma']:.2f}
+📊 الاحتمال: {o['prob']}%
+"""
+
+    if not contract:
+        return base + "\n❌ لا يوجد عقد مناسب"
+
+    return base + f"""
+
+💎 العقد:
+{contract['option_ticker']}
+سعر: {contract['contract_price']:.2f}
+
+🎯 الأهداف:
+{contract['tp1']} / {contract['tp2']} / {contract['tp3']}
+
+📊 النجاح: {contract['success_rate']}%
+"""
+
+def msg_channel_post(tk, contract):
+    type_ar = "CALL" if contract["contract_type"] == "call" else "PUT"
+    color = "🟢" if contract["contract_type"] == "call" else "🔴"
+
+    return f"""🆕 طرح جديد | {tk}
+
+{color} النوع: {type_ar}
+🎯 {contract['strike']}
+📅 {contract['expiration']}
+
+💰 الدخول: {contract['entry_high']} - {contract['entry_low']}
+
+🎯 الأهداف:
+{contract['tp1']} / {contract['tp2']} / {contract['tp3']}
+
+🛑 الوقف: {contract['stop_text']}
+
+📊 النجاح: {contract['success_rate']}%
+
+📢 @Option_Strike01"""
+
+def msg_contract_update(title, entry_price, current_price):
+    pnl = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+    emoji = "🚀" if pnl >= 50 else "📈" if pnl >= 0 else "📉"
+
+    return f"""🔔 تحديث | {title}
+
+📊 الدخول: {entry_price:.2f}
+💰 الحالي: {current_price:.2f}
+{emoji} الربح: {pnl:.2f}%
+
+📢 @Option_Strike01"""
