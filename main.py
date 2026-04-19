@@ -20,7 +20,7 @@ API_ANSWER = f"https://api.telegram.org/bot{TOKEN}/answerCallbackQuery"
 MASSIVE_BASE = "https://api.massive.com"
 
 # =========================
-# إعدادات الصيّاد
+# إعدادات الصياد
 # =========================
 MAX_SIGNALS_PER_DAY = 5
 STOCK_COOLDOWN_DAYS = 3
@@ -30,8 +30,8 @@ SCAN_INTERVAL_SECONDS = 10800  # كل 3 ساعات
 # =========================
 # فلتر الدخول المباشر
 # =========================
-ENTRY_MAX_DISTANCE_PCT = 0.015   # 1.5%
-BREAKOUT_BUFFER_PCT = 0.003      # 0.3%
+ENTRY_MAX_DISTANCE_PCT = 0.015
+BREAKOUT_BUFFER_PCT = 0.003
 
 # =========================
 # شروط العقود الأساسية
@@ -75,9 +75,6 @@ WATCHLIST = list(dict.fromkeys([
     "US500","SPY","QQQ","SPX","NDX","US100"
 ]))
 
-# =========================
-# جلسة requests
-# =========================
 HTTP = requests.Session()
 
 # =========================
@@ -215,7 +212,7 @@ def map_symbol_for_data(ticker: str) -> str:
     return mapping.get(ticker, ticker)
 
 def get_df(ticker, tf):
-    period, interval = TF.get(tf, ("1y","1d"))
+    period, interval = TF.get(tf, ("1y", "1d"))
     data_ticker = map_symbol_for_data(ticker)
     s = yf.Ticker(data_ticker)
     df = s.history(period=period, interval=interval, auto_adjust=False)
@@ -226,11 +223,11 @@ def get_df(ticker, tf):
 
     if tf == "4h":
         df = df.resample("4H").agg({
-            "Open":"first",
-            "High":"max",
-            "Low":"min",
-            "Close":"last",
-            "Volume":"sum"
+            "Open": "first",
+            "High": "max",
+            "Low": "min",
+            "Close": "last",
+            "Volume": "sum"
         }).dropna()
 
     return df
@@ -338,13 +335,12 @@ def is_same_day_expiry(expiration_str: str) -> bool:
     except:
         return False
 
-def is_near_expiry(expiration_str: str, max_days: int = 7) -> bool:
+def days_to_expiry(expiration_str: str):
     try:
         exp = datetime.strptime(expiration_str, "%Y-%m-%d").date()
-        delta = (exp - datetime.now().date()).days
-        return 0 <= delta <= max_days
+        return (exp - datetime.now().date()).days
     except:
-        return False
+        return None
 
 # =========================
 # تثبيت الاتجاه
@@ -528,7 +524,7 @@ def options_info_from_massive(ticker, price):
         }
 
 # =========================
-# حساب نسبة نجاح مخصصة
+# حساب نسبة نجاح
 # =========================
 def calc_success_rate(c: dict, o: dict, contract: dict):
     return min(92, max(55, int(
@@ -564,16 +560,19 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
         else:
             return None
 
-        limit_price = contract_price_limit_for_ticker(ticker)
         underlying_price = c["price"]
         prob = o["prob"] if o else 50
+        limit_price = contract_price_limit_for_ticker(ticker)
 
+        # =========================
+        # زيرو هيرو الجمعة
+        # =========================
         friday_mode = (
             FRIDAY_ZERO_HERO_ENABLED
             and ((ZERO_HERO_ONLY_ON_FRIDAY and is_friday_now()) or (not ZERO_HERO_ONLY_ON_FRIDAY))
         )
 
-        zero_hero_candidates = []
+        zero_hero_pool = []
         if friday_mode and c["strongest_trend"] in ["صاعد قوي 🔥", "هابط قوي 🔻"] and prob >= ZERO_HERO_MIN_PROB:
             for x in parsed:
                 if x["contract_type"] != target_type:
@@ -582,40 +581,43 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
                     continue
                 if x["contract_price"] is None or x["contract_price"] <= 0:
                     continue
-                if x["contract_price"] < ZERO_HERO_MIN_PRICE or x["contract_price"] > ZERO_HERO_MAX_PRICE:
+                if not (ZERO_HERO_MIN_PRICE <= x["contract_price"] <= ZERO_HERO_MAX_PRICE):
                     continue
                 if x["oi"] < ZERO_HERO_MIN_OI:
                     continue
-                if not (is_same_day_expiry(x["expiration"]) or is_near_expiry(x["expiration"], 2)):
+
+                dte = days_to_expiry(x["expiration"])
+                if dte is None or dte < 0 or dte > 3:
                     continue
 
-                strike_distance = abs(x["strike"] - underlying_price)
+                strike_distance_pct = abs(x["strike"] - underlying_price) / max(underlying_price, 1e-9)
                 delta_score = abs(abs(x["delta"]) - 0.30)
 
                 score = (
-                    strike_distance * 2.5
-                    + delta_score * 8
-                    - min(x["oi"], 100000) / 10000
-                    - min(abs(x["gamma"]), 1.0) * 10
-                    + abs(x["contract_price"] - 1.00) * 1.2
+                    strike_distance_pct * 25
+                    + delta_score * 6
+                    - min(x["oi"], 100000) / 12000
+                    - min(abs(x["gamma"]), 1.0) * 8
+                    + abs(x["contract_price"] - 1.00) * 0.8
                 )
-                zero_hero_candidates.append((score, x))
+                zero_hero_pool.append((score, x))
 
-            if zero_hero_candidates:
-                zero_hero_candidates.sort(key=lambda z: z[0])
-                best = zero_hero_candidates[0][1]
+            if zero_hero_pool:
+                zero_hero_pool.sort(key=lambda z: z[0])
+                best = zero_hero_pool[0][1]
 
+                contract_price = round(float(best["contract_price"]), 2)
                 contract = {
                     "option_ticker": best["ticker"],
                     "strike": round(best["strike"], 2),
                     "expiration": best["expiration"],
                     "contract_type": best["contract_type"],
-                    "contract_price": round(float(best["contract_price"]), 2),
-                    "entry_high": round(float(best["contract_price"]), 2),
-                    "entry_low": round(max(0.10, float(best["contract_price"]) - ENTRY_ZONE_WIDTH), 2),
-                    "tp1": round(float(best["contract_price"]) + 0.60, 2),
-                    "tp2": round(float(best["contract_price"]) + 1.20, 2),
-                    "tp3": round(float(best["contract_price"]) + 1.80, 2),
+                    "contract_price": contract_price,
+                    "entry_high": contract_price,
+                    "entry_low": round(max(0.10, contract_price - ENTRY_ZONE_WIDTH), 2),
+                    "tp1": round(contract_price + 0.60, 2),
+                    "tp2": round(contract_price + 1.20, 2),
+                    "tp3": round(contract_price + 1.80, 2),
                     "stop_text": f"إغلاق شمعة ساعة {'تحت' if target_type == 'call' else 'فوق'} {c['pivot']:.2f}",
                     "delta": round(best["delta"], 2),
                     "gamma": round(best["gamma"], 4),
@@ -628,6 +630,9 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
                     contract["success_rate"] = success_rate
                     return contract
 
+        # =========================
+        # الوضع العادي
+        # =========================
         filtered = []
         for x in parsed:
             if x["contract_type"] != target_type:
@@ -638,8 +643,11 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
                 continue
             if x["contract_price"] > limit_price:
                 continue
-            if not is_near_expiry(x["expiration"], 14):
+
+            dte = days_to_expiry(x["expiration"])
+            if dte is None or dte < 0 or dte > 45:
                 continue
+
             filtered.append(x)
 
         if not filtered:
@@ -647,15 +655,18 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
 
         candidates = []
         for x in filtered:
-            strike_distance = abs(x["strike"] - underlying_price)
+            strike_distance_pct = abs(x["strike"] - underlying_price) / max(underlying_price, 1e-9)
             delta_score = abs(abs(x["delta"]) - 0.35)
+            dte = days_to_expiry(x["expiration"])
+            dte_penalty = 0 if dte is None else min(max(dte, 0), 45) / 20
 
             score = (
-                strike_distance * 3
-                + delta_score * 10
-                - min(x["oi"], 100000) / 12000
-                - min(abs(x["gamma"]), 1.0) * 8
-                + abs(x["contract_price"] - min(limit_price, x["contract_price"])) * 0.1
+                strike_distance_pct * 30
+                + delta_score * 6
+                + dte_penalty
+                - min(x["oi"], 100000) / 15000
+                - min(abs(x["gamma"]), 1.0) * 5
+                + abs(x["contract_price"] - min(limit_price, x["contract_price"])) * 0.15
             )
             candidates.append((score, x))
 
@@ -1100,7 +1111,7 @@ async def scanner_loop():
         try:
             await asyncio.to_thread(scanner_cycle)
         except Exception as e:
-            send(f"❌ خطأ في الصيّاد: {str(e)}")
+            send(f"❌ خطأ في الصياد: {str(e)}")
         await asyncio.sleep(SCAN_INTERVAL_SECONDS)
 
 @app.on_event("startup")
