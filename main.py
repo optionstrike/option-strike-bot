@@ -18,16 +18,21 @@ TOKEN = "8619465902:AAEDTuUFEEEgIq-sjr5-d4oCaiyuMzFSYPs"
 CHAT_ID = "8371374055"
 MASSIVE_API_KEY = "AcbX3y7rKzou3MzUi8EVlETdYLFsVGa2"
 
+# مفتاح الأخبار الاقتصادية - غيّره لاحقاً
+FMP_API_KEY = "xQ7wdkVapeynP4FsDL4dBLMisFkbN2qL"
+
 API_SEND = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 API_ANSWER = f"https://api.telegram.org/bot{TOKEN}/answerCallbackQuery"
 
 MASSIVE_BASE = "https://api.polygon.io"
+FMP_BASE = "https://financialmodelingprep.com/stable"
 
 # =========================
 # حماية الويب هوك
 # =========================
 
 TELEGRAM_SECRET_TOKEN = "OPTION_STRIKE_SECRET_2026_555"
+TRADINGVIEW_SECRET = "OPTION_STRIKE_TV_2026"
 
 # =========================
 # كاش + منع تكرار التحديثات
@@ -38,6 +43,12 @@ ANALYSIS_CACHE_TTL_SECONDS = 45
 
 PROCESSED_UPDATES = {}
 PROCESSED_UPDATES_TTL_SECONDS = 600
+
+EARNINGS_CACHE = {}
+EARNINGS_CACHE_TTL_SECONDS = 600
+
+ECON_CACHE = {}
+ECON_CACHE_TTL_SECONDS = 300
 
 # =========================
 # إعدادات الصياد
@@ -63,6 +74,36 @@ MAX_COMPANY_CONTRACT_PRICE = 3.50
 MAX_SPAC_CONTRACT_PRICE = 3.70
 ENTRY_ZONE_WIDTH = 0.60
 UPDATE_STEP_AFTER_TP1 = 0.30
+
+# =========================
+# أهداف العقود الجديدة
+# =========================
+
+CONTRACT_TP1_ADD = 0.60
+CONTRACT_TARGET_LOOKBACK_DAYS = 10
+CONTRACT_TARGET_MIN_GAP = 0.12
+
+# =========================
+# الأخبار الاقتصادية
+# =========================
+
+ECON_NEWS_ALERT_ENABLED = True
+ECON_NEWS_ALERT_MINUTES_BEFORE = 5
+ECON_NEWS_ONLY_IMPORTANT = True
+
+IMPORTANT_EVENT_KEYWORDS = [
+    "cpi", "inflation", "interest rate", "fomc", "federal reserve", "fed",
+    "unemployment", "jobless", "non farm", "nonfarm", "payroll", "nfp",
+    "pmi", "retail sales", "ppi", "powell", "trump", "consumer confidence",
+    "gdp", "core cpi", "core pce", "oil inventories", "crude oil", "rate decision"
+]
+
+# =========================
+# إعلانات الشركات
+# =========================
+
+EARNINGS_LOOKAHEAD_DAYS = 7
+EARNINGS_MAX_BUTTONS = 20
 
 # =========================
 # زيرو هيرو
@@ -96,6 +137,8 @@ MAX_DTE_DAYS = 30
 INDEX_MAX_DTE_DAYS = 7
 
 MARKET_TZ = ZoneInfo("America/New_York")
+RIYADH_TZ = ZoneInfo("Asia/Riyadh")
+
 MARKET_OPEN_HOUR = 9
 MARKET_OPEN_MINUTE = 30
 NO_ENTRY_FIRST_MINUTES = 30
@@ -130,6 +173,8 @@ DAILY_SIGNAL_STATE = {
 }
 
 OPEN_CONTRACT_SIGNALS = {}
+SIGNAL_HISTORY = []
+ECON_ALERT_SENT = set()
 
 # =========================
 # أدوات حماية ومساعدة
@@ -171,9 +216,33 @@ def set_cached_analysis(ticker: str, tf: str, value):
         "value": value
     }
 
+def cleanup_generic_cache(cache: dict, ttl_seconds: int):
+    now = datetime.now()
+    for key in list(cache.keys()):
+        cached = cache[key]
+        if now - cached["ts"] > timedelta(seconds=ttl_seconds):
+            del cache[key]
+
+def get_cached_item(cache: dict, ttl_seconds: int, key: str):
+    cleanup_generic_cache(cache, ttl_seconds)
+    cached = cache.get(key)
+    if not cached:
+        return None
+    return cached["value"]
+
+def set_cached_item(cache: dict, key: str, value):
+    cache[key] = {"ts": datetime.now(), "value": value}
+
 def request_has_valid_secret(req: Request):
     secret_header = req.headers.get("x-telegram-bot-api-secret-token", "")
     return secret_header == TELEGRAM_SECRET_TOKEN
+
+def is_tradingview_payload(data):
+    if not isinstance(data, dict):
+        return False
+    if data.get("secret") == TRADINGVIEW_SECRET and "ticker" in data and "signal" in data:
+        return True
+    return False
 
 def looks_like_telegram_update(data):
     if not isinstance(data, dict):
@@ -225,82 +294,192 @@ def is_in_no_entry_window():
 
     return market_open <= now_et < no_entry_end
 
+def parse_float(x, default=None):
+    try:
+        if x is None or x == "":
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+def round_price(x):
+    try:
+        return round(float(x), 2)
+    except Exception:
+        return x
 # =========================
-# إرسال تلغرام
+# FMP API (الأخبار الاقتصادية)
 # =========================
 
-def send(msg, keyboard=None, chat_id=None):
-    target_chat_id = str(chat_id) if chat_id else CHAT_ID
-
-    payload = {
-        "chat_id": target_chat_id,
-        "text": msg,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
-
-    if keyboard:
-        payload["reply_markup"] = keyboard
+def fmp_get(path: str, params=None):
+    params = params or {}
+    params["apikey"] = FMP_API_KEY
+    url = f"{FMP_BASE}{path}"
 
     try:
-        r = HTTP.post(API_SEND, json=payload, timeout=20)
+        r = HTTP.get(url, params=params, timeout=20)
         r.raise_for_status()
         return r.json()
     except Exception as e:
-        print(f"[SEND ERROR] {e}")
+        print(f"[FMP ERROR] {e}")
+        return []
 
-def answer_callback(cb_id, text=""):
+# =========================
+# جلب الأخبار الاقتصادية
+# =========================
+
+def get_economic_calendar():
+    cache_key = "econ_calendar"
+
+    cached = get_cached_item(ECON_CACHE, ECON_CACHE_TTL_SECONDS, cache_key)
+    if cached:
+        return cached
+
     try:
-        HTTP.post(API_ANSWER, json={
-            "callback_query_id": cb_id,
-            "text": text
-        }, timeout=10)
+        today = datetime.now().strftime("%Y-%m-%d")
+        future = (datetime.now() + timedelta(days=3)).strftime("%Y-%m-%d")
+
+        data = fmp_get("/economic_calendar", {
+            "from": today,
+            "to": future
+        })
+
+        if isinstance(data, list):
+            set_cached_item(ECON_CACHE, cache_key, data)
+            return data
+
+        return []
+
     except Exception as e:
-        print(f"[CALLBACK ERROR] {e}")
+        print(f"[ECON FETCH ERROR] {e}")
+        return []
 
 # =========================
-# لوحة الأزرار الرئيسية
+# فلترة الأخبار المهمة
 # =========================
 
-def main_menu():
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "📊 تحليل سريع", "callback_data": "quick"},
-                {"text": "🔥 تحليل احترافي", "callback_data": "pro"},
-            ],
-            [
-                {"text": "🧲 القاما والسيولة", "callback_data": "gamma"},
-                {"text": "📈 دعوم ومقاومات", "callback_data": "sr"},
-            ],
-            [
-                {"text": "🎯 خطة دخول", "callback_data": "plan"},
-                {"text": "💎 أفضل عقد", "callback_data": "contract"},
-            ],
-            [
-                {"text": "📂 العقود المفتوحة", "callback_data": "open_contracts"},
-                {"text": "📋 التقرير اليومي", "callback_data": "daily_report"},
-            ],
-            [
-                {"text": "📰 أخبار السوق", "callback_data": "news"},
-                {"text": "⚙️ تغيير الفريم", "callback_data": "tf"},
-            ]
-        ]
-    }
+def is_important_event(event_name: str):
+    if not event_name:
+        return False
 
-def tf_menu():
-    tfs = ["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"]
-    rows = []
-    row = []
-    for i, tf in enumerate(tfs, 1):
-        row.append({"text": tf, "callback_data": f"settf:{tf}"})
-        if i % 4 == 0:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    rows.append([{"text": "⬅️ رجوع", "callback_data": "back"}])
-    return {"inline_keyboard": rows}
+    name = event_name.lower()
+
+    for keyword in IMPORTANT_EVENT_KEYWORDS:
+        if keyword in name:
+            return True
+
+    return False
+
+# =========================
+# تنسيق الخبر
+# =========================
+
+def format_econ_event(event):
+    name = event.get("event", "خبر")
+    country = event.get("country", "")
+    impact = event.get("impact", "")
+
+    date_str = event.get("date", "")
+    time_str = event.get("time", "")
+
+    try:
+        dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M:%S")
+        dt_riyadh = dt.replace(tzinfo=ZoneInfo("UTC")).astimezone(RIYADH_TZ)
+        time_display = dt_riyadh.strftime("%H:%M")
+    except:
+        time_display = time_str
+
+    impact_emoji = "🔥" if impact == "High" else "⚠️" if impact == "Medium" else "ℹ️"
+
+    return f"{impact_emoji} {name}\n🌍 {country} | ⏰ {time_display}"
+
+# =========================
+# تنبيه قبل الخبر
+# =========================
+
+def check_economic_news_alerts():
+    if not ECON_NEWS_ALERT_ENABLED:
+        return
+
+    events = get_economic_calendar()
+    now = datetime.now(ZoneInfo("UTC"))
+
+    for event in events:
+        try:
+            name = event.get("event", "")
+            if ECON_NEWS_ONLY_IMPORTANT and not is_important_event(name):
+                continue
+
+            date_str = event.get("date", "")
+            time_str = event.get("time", "")
+
+            if not date_str or not time_str:
+                continue
+
+            event_dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M:%S")
+            event_dt = event_dt.replace(tzinfo=ZoneInfo("UTC"))
+
+            alert_time = event_dt - timedelta(minutes=ECON_NEWS_ALERT_MINUTES_BEFORE)
+
+            event_id = f"{name}_{event_dt}"
+
+            if event_id in ECON_ALERT_SENT:
+                continue
+
+            if alert_time <= now <= event_dt:
+                msg = f"""🚨 <b>تنبيه خبر اقتصادي</b>
+
+{format_econ_event(event)}
+
+⏳ بعد {ECON_NEWS_ALERT_MINUTES_BEFORE} دقائق
+
+⚠️ السوق قد يكون متذبذب
+"""
+
+                send(msg, chat_id=CHAT_ID)
+                ECON_ALERT_SENT.add(event_id)
+
+        except Exception as e:
+            print(f"[ECON ALERT ERROR] {e}")
+
+# =========================
+# حلقة الأخبار الاقتصادية
+# =========================
+
+async def econ_news_loop():
+    await asyncio.sleep(15)
+
+    while True:
+        try:
+            await asyncio.to_thread(check_economic_news_alerts)
+        except Exception as e:
+            print(f"[ECON LOOP ERROR] {e}")
+
+        await asyncio.sleep(60) 
+# =========================
+# Massive / Polygon API
+# =========================
+
+def massive_get(path: str, params=None):
+    params = params or {}
+    params["apiKey"] = MASSIVE_API_KEY
+    url = f"{MASSIVE_BASE}{path}"
+    try:
+        r = HTTP.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"[API ERROR] {path}: {e}")
+        return {}
+
+def safe_get(d, *keys, default=None):
+    cur = d
+    for k in keys:
+        if isinstance(cur, dict) and k in cur:
+            cur = cur[k]
+        else:
+            return default
+    return cur
 
 # =========================
 # الفريمات
@@ -349,84 +528,6 @@ def get_df(ticker, tf):
             "Volume": "sum"
         }).dropna()
     return df
-
-# =========================
-# Massive / Polygon API
-# =========================
-
-def massive_get(path: str, params=None):
-    params = params or {}
-    params["apiKey"] = MASSIVE_API_KEY
-    url = f"{MASSIVE_BASE}{path}"
-    try:
-        r = HTTP.get(url, params=params, timeout=20)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        print(f"[API ERROR] {path}: {e}")
-        return {}
-
-def safe_get(d, *keys, default=None):
-    cur = d
-    for k in keys:
-        if isinstance(cur, dict) and k in cur:
-            cur = cur[k]
-        else:
-            return default
-    return cur
-
-# =========================
-# أخبار السوق
-# =========================
-
-def get_market_news(ticker: str = None, limit: int = 5):
-    try:
-        params = {"limit": limit, "order": "desc", "sort": "published_utc"}
-        if ticker:
-            params["ticker"] = ticker
-        data = massive_get("/v2/reference/news", params=params)
-        results = data.get("results", [])
-        return results
-    except Exception as e:
-        print(f"[NEWS ERROR] {e}")
-        return []
-
-def format_news_message(ticker: str = None):
-    news = get_market_news(ticker, limit=5)
-    if not news:
-        return "❌ لا توجد أخبار متاحة حالياً"
-
-    label = f"أخبار {ticker}" if ticker else "أخبار السوق العامة"
-    msg = f"📰 <b>{label}</b>\n{'─' * 30}\n\n"
-
-    for i, item in enumerate(news, 1):
-        title_en = item.get("title", "بدون عنوان")
-        try:
-            title = GoogleTranslator(source="auto", target="ar").translate(title_en)
-        except Exception:
-            title = title_en
-
-        publisher = safe_get(item, "publisher", "name", default="")
-        published = item.get("published_utc", "")
-        url = item.get("article_url", "")
-
-        try:
-            dt = datetime.fromisoformat(published.replace("Z", "+00:00"))
-            date_str = dt.strftime("%d/%m %H:%M")
-        except Exception:
-            date_str = ""
-
-        msg += f"<b>{i}. {title}</b>\n"
-        if publisher:
-            msg += f"📌 {publisher}"
-        if date_str:
-            msg += f" | 🕐 {date_str}"
-        msg += "\n"
-        if url:
-            msg += f"🔗 <a href='{url}'>اقرأ المزيد</a>\n"
-        msg += "\n"
-
-    return msg
 
 # =========================
 # بيانات العقود
@@ -507,6 +608,19 @@ def get_option_last_trade(option_contract: str):
     except Exception:
         return {}
 
+def get_option_aggregate_bars(option_ticker: str, days: int = CONTRACT_TARGET_LOOKBACK_DAYS):
+    try:
+        to_date = datetime.now(MARKET_TZ).date()
+        from_date = to_date - timedelta(days=days)
+        data = massive_get(
+            f"/v2/aggs/ticker/{option_ticker}/range/1/hour/{from_date.strftime('%Y-%m-%d')}/{to_date.strftime('%Y-%m-%d')}",
+            params={"adjusted": "true", "sort": "asc", "limit": 5000}
+        )
+        return data.get("results", []) or []
+    except Exception as e:
+        print(f"[OPTION BARS ERROR] {option_ticker}: {e}")
+        return []
+
 # =========================
 # أدوات خاصة بالعقود
 # =========================
@@ -527,8 +641,59 @@ def days_to_expiry(expiration_str: str):
     except Exception:
         return None
 
+def derive_contract_targets_from_chart(option_ticker: str, contract_price: float):
+    tp1 = round_price(contract_price + CONTRACT_TP1_ADD)
+    fallback_tp2 = round_price(contract_price + 1.20)
+    fallback_tp3 = round_price(contract_price + 1.80)
+
+    bars = get_option_aggregate_bars(option_ticker, CONTRACT_TARGET_LOOKBACK_DAYS)
+    if not bars:
+        return tp1, fallback_tp2, fallback_tp3
+
+    highs = []
+    swings = []
+
+    for bar in bars:
+        h = parse_float(bar.get("h"))
+        if h is not None and h > contract_price:
+            highs.append(round(h, 2))
+
+    for i in range(1, len(bars) - 1):
+        prev_h = parse_float(bars[i - 1].get("h"))
+        cur_h = parse_float(bars[i].get("h"))
+        next_h = parse_float(bars[i + 1].get("h"))
+        if prev_h is None or cur_h is None or next_h is None:
+            continue
+        if cur_h > contract_price and cur_h >= prev_h and cur_h >= next_h:
+            swings.append(round(cur_h, 2))
+
+    candidates = sorted(set(swings or highs))
+
+    min_tp2 = max(tp1 + CONTRACT_TARGET_MIN_GAP, contract_price + 0.70)
+    min_tp3 = max(min_tp2 + CONTRACT_TARGET_MIN_GAP, contract_price + 1.10)
+
+    tp2 = next((x for x in candidates if x >= min_tp2), None)
+    if tp2 is None:
+        tp2 = fallback_tp2
+
+    tp3 = next((x for x in candidates if x > tp2 and x >= min_tp3), None)
+    if tp3 is None:
+        if highs:
+            mx = max(highs)
+            tp3 = mx if mx > tp2 else fallback_tp3
+        else:
+            tp3 = fallback_tp3
+
+    if tp2 <= tp1:
+        tp2 = round_price(tp1 + CONTRACT_TARGET_MIN_GAP)
+    if tp3 <= tp2:
+        tp3 = round_price(tp2 + CONTRACT_TARGET_MIN_GAP)
+
+    return round_price(tp1), round_price(tp2), round_price(tp3)
+
 def build_contract_from_pick(best, c, target_type, mode="NORMAL"):
     contract_price = round(float(best["contract_price"]), 2)
+    tp1, tp2, tp3 = derive_contract_targets_from_chart(best["ticker"], contract_price)
     return {
         "option_ticker": best["ticker"],
         "strike": round(best["strike"], 2),
@@ -537,9 +702,9 @@ def build_contract_from_pick(best, c, target_type, mode="NORMAL"):
         "contract_price": contract_price,
         "entry_high": contract_price,
         "entry_low": round(max(0.10, contract_price - ENTRY_ZONE_WIDTH), 2),
-        "tp1": round(contract_price + 0.60, 2),
-        "tp2": round(contract_price + 1.20, 2),
-        "tp3": round(contract_price + 1.80, 2),
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
         "stop_text": f"إغلاق شمعة ساعة {'تحت' if target_type == 'call' else 'فوق'} {c['pivot']:.2f}",
         "delta": round(best["delta"], 2),
         "gamma": round(best["gamma"], 4),
@@ -969,8 +1134,7 @@ def is_entry_ready_now(c):
     )
 
     return near_entry or breakout_call or breakout_put
-
-# =========================
+   # =========================
 # تنسيق التاريخ
 # =========================
 
@@ -984,6 +1148,46 @@ def format_arabic_date(date_str: str):
         return f"{dt.day} {months[dt.month]} {dt.year}"
     except Exception:
         return date_str
+
+def format_short_date(date_str: str):
+    try:
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        return dt.strftime("%d/%m")
+    except Exception:
+        return date_str
+
+# =========================
+# إرسال تلغرام
+# =========================
+
+def send(msg, keyboard=None, chat_id=None):
+    target_chat_id = str(chat_id) if chat_id else CHAT_ID
+
+    payload = {
+        "chat_id": target_chat_id,
+        "text": msg,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+
+    if keyboard:
+        payload["reply_markup"] = keyboard
+
+    try:
+        r = HTTP.post(API_SEND, json=payload, timeout=20)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"[SEND ERROR] {e}")
+
+def answer_callback(cb_id, text=""):
+    try:
+        HTTP.post(API_ANSWER, json={
+            "callback_query_id": cb_id,
+            "text": text
+        }, timeout=10)
+    except Exception as e:
+        print(f"[CALLBACK ERROR] {e}")
 
 # =========================
 # الرسائل
@@ -1252,22 +1456,260 @@ def msg_daily_report():
 
     return msg
 
+def msg_earnings_list(events, mode: str):
+    title_map = {
+        "all": "إعلانات الأسبوع",
+        "pre": "إعلانات قبل الافتتاح",
+        "post": "إعلانات بعد الإغلاق"
+    }
+    title = title_map.get(mode, "إعلانات الشركات")
+
+    if not events:
+        return f"📆 <b>{title}</b>\n\n❌ لا توجد شركات مطابقة حالياً."
+
+    return f"📆 <b>{title}</b>\n\n📊 العدد: {len(events)}\nاختر الشركة من الأزرار بالأسفل 👇"
+
+def fmt_billions(n):
+    try:
+        n = float(n)
+        if abs(n) >= 1_000_000_000:
+            return f"{n / 1_000_000_000:.2f}B"
+        if abs(n) >= 1_000_000:
+            return f"{n / 1_000_000:.2f}M"
+        return f"{n:.2f}"
+    except Exception:
+        return "—"
+
+def pct_change_safe(new_val, old_val):
+    try:
+        if new_val is None or old_val is None:
+            return None
+        new_val = float(new_val)
+        old_val = float(old_val)
+        if old_val == 0:
+            return None
+        return ((new_val - old_val) / abs(old_val)) * 100
+    except Exception:
+        return None
+
+def analyze_earnings_financials(event: dict):
+    score = 0
+
+    estimated_eps = event.get("estimated_eps")
+    previous_eps = event.get("previous_eps")
+    estimated_revenue = event.get("estimated_revenue")
+    previous_revenue = event.get("previous_revenue")
+
+    eps_growth = pct_change_safe(estimated_eps, previous_eps)
+    rev_growth = pct_change_safe(estimated_revenue, previous_revenue)
+
+    if eps_growth is not None:
+        score += 15 if eps_growth > 0 else -15 if eps_growth < 0 else 0
+    if rev_growth is not None:
+        score += 12 if rev_growth > 0 else -12 if rev_growth < 0 else 0
+
+    if score >= 15:
+        bias = "إيجابي"
+    elif score <= -15:
+        bias = "سلبي"
+    else:
+        bias = "محايد"
+
+    return {
+        "bias": bias,
+        "score": score,
+        "eps_growth": eps_growth,
+        "rev_growth": rev_growth,
+        "estimated_eps": estimated_eps,
+        "previous_eps": previous_eps,
+        "estimated_revenue": estimated_revenue,
+        "previous_revenue": previous_revenue
+    }
+
+def build_earnings_trade_view(ticker: str, c: dict, o: dict, contract: dict, event: dict):
+    financial = analyze_earnings_financials(event)
+    tech_score = calc_score(c, o)
+    final_score = tech_score + financial["score"] * 0.4
+
+    if contract and final_score >= 75:
+        opportunity = "✅ فرصة مناسبة"
+        entry_style = "قبل الإعلان بحذر"
+    elif contract and final_score >= 60:
+        opportunity = "⚠️ مراقبة فقط"
+        entry_style = "بعد الإعلان بتأكيد"
+    else:
+        opportunity = "❌ لا يوجد عقد مناسب"
+        entry_style = "تجنب"
+
+    expected = "CALL 🟢" if c["direction"].startswith("CALL") else "PUT 🔴"
+
+    return {
+        "financial": financial,
+        "tech_score": tech_score,
+        "final_score": round(final_score, 1),
+        "opportunity": opportunity,
+        "entry_style": entry_style,
+        "expected": expected
+    }
+
+def msg_earnings_analysis(ticker: str, event: dict, c: dict, o: dict, contract: dict, trade_view: dict):
+    financial = trade_view["financial"]
+    return f"""📆 <b>تحليل إعلان | {ticker}</b>
+
+📅 التاريخ: {format_arabic_date(event.get('date', ''))}
+🕐 الوقت: {event.get('time', 'غير محدد')}
+⏰ التوقيت: {event.get('session_label', 'غير محدد')}
+
+💹 <b>التحليل المالي:</b>
+التقييم المالي: <b>{financial['bias']}</b>
+نمو EPS المتوقع: {"—" if financial['eps_growth'] is None else f"{financial['eps_growth']:+.2f}%"}
+نمو الإيرادات المتوقع: {"—" if financial['rev_growth'] is None else f"{financial['rev_growth']:+.2f}%"}
+EPS السابق: {financial['previous_eps'] if financial['previous_eps'] is not None else '—'}
+EPS المتوقع: {financial['estimated_eps'] if financial['estimated_eps'] is not None else '—'}
+الإيرادات السابقة: {fmt_billions(financial['previous_revenue'])}
+الإيرادات المتوقعة: {fmt_billions(financial['estimated_revenue'])}
+
+📈 <b>التحليل الفني:</b>
+السعر: <b>{c['price']:.2f}</b>
+الترند: {c['trend']}
+الاتجاه الأقوى: {c['strongest_trend']}
+القرار الفني: <b>{c['direction']}</b>
+
+🎯 <b>النتيجة:</b>
+التوقع: <b>{trade_view['expected']}</b>
+نوع الدخول: <b>{trade_view['entry_style']}</b>
+الفرصة: <b>{trade_view['opportunity']}</b>
+السكور الفني: {trade_view['tech_score']}
+السكور النهائي: <b>{trade_view['final_score']}</b>
+
+{"❌ لا يوجد عقد مناسب حالياً لهذه الفرصة." if not contract else f'''💎 <b>العقد المقترح:</b>
+الرمز: <code>{contract['option_ticker']}</code>
+النوع: {contract['contract_type'].upper()}
+السترايك: {contract['strike']:.2f}
+الانتهاء: {format_arabic_date(contract['expiration'])}
+سعر العقد: <b>{contract['contract_price']:.2f}</b>
+نطاق الدخول: {contract['entry_high']:.2f} – {contract['entry_low']:.2f}
+
+🎯 أهداف العقد:
+1️⃣ {contract['tp1']:.2f}
+2️⃣ {contract['tp2']:.2f}
+3️⃣ {contract['tp3']:.2f}
+
+🛑 الوقف: {contract['stop_text']}
+📊 نسبة النجاح: <b>{contract['success_rate']}%</b>'''}"""
+
 # =========================
-# حالة المستخدم
+# التقرير الأسبوعي
 # =========================
 
-STATE = {}
+def get_week_start(dt=None):
+    now = dt or datetime.now(MARKET_TZ)
+    return (now - timedelta(days=now.weekday())).date()
 
-def set_state(user, ticker=None, tf=None):
-    s = STATE.get(user, {"ticker": None, "tf": "1d"})
-    if ticker is not None:
-        s["ticker"] = ticker
-    if tf is not None:
-        s["tf"] = tf
-    STATE[user] = s
+def msg_weekly_report():
+    week_start = get_week_start()
+    week_end = week_start + timedelta(days=6)
 
-def get_state(user):
-    return STATE.get(user, {"ticker": None, "tf": "1d"})
+    week_rows = [x for x in SIGNAL_HISTORY if x.get("created_at") and week_start <= x["created_at"].date() <= week_end]
+
+    if not week_rows:
+        return (
+            f"🗓 <b>التقرير الأسبوعي</b>\n\n"
+            f"الفترة: {week_start.strftime('%d/%m')} - {week_end.strftime('%d/%m')}\n"
+            f"❌ لا توجد عقود مسجلة هذا الأسبوع."
+        )
+
+    total = len(week_rows)
+    wins = 0
+    losses = 0
+    call_count = 0
+    put_count = 0
+    tp1_hits = 0
+    tp2_hits = 0
+    tp3_hits = 0
+
+    best_row = None
+    worst_row = None
+    total_pnl = 0.0
+
+    for row in week_rows:
+        entry = row.get("entry_price", 0) or 0
+        high = row.get("highest_price", entry) or entry
+        pnl = ((high - entry) / entry) * 100 if entry > 0 else 0.0
+        total_pnl += pnl
+
+        if high >= row.get("tp1", 10**9):
+            tp1_hits += 1
+        if high >= row.get("tp2", 10**9):
+            tp2_hits += 1
+        if high >= row.get("tp3", 10**9):
+            tp3_hits += 1
+
+        if pnl > 0:
+            wins += 1
+        else:
+            losses += 1
+
+        if row.get("contract_type") == "call":
+            call_count += 1
+        else:
+            put_count += 1
+
+        if best_row is None or pnl > best_row["pnl"]:
+            best_row = {"row": row, "pnl": pnl}
+        if worst_row is None or pnl < worst_row["pnl"]:
+            worst_row = {"row": row, "pnl": pnl}
+
+    success_rate = (wins / total) * 100 if total else 0
+    avg_pnl = total_pnl / total if total else 0
+
+    msg = f"""🗓 <b>التقرير الأسبوعي</b>
+
+📅 الفترة: {week_start.strftime('%d/%m')} - {week_end.strftime('%d/%m')}
+
+📊 إجمالي العقود: {total}
+✅ الرابحة: {wins}
+❌ الخاسرة: {losses}
+📈 نسبة النجاح: <b>{success_rate:.2f}%</b>
+
+📦 توزيع العقود:
+🟢 Call: {call_count}
+🔴 Put: {put_count}
+
+🎯 تحقيق الأهداف:
+TP1: {tp1_hits}/{total}
+TP2: {tp2_hits}/{total}
+TP3: {tp3_hits}/{total}
+
+📉 متوسط الأداء: {avg_pnl:+.2f}%"""
+
+    if best_row:
+        r = best_row["row"]
+        msg += f"""
+
+🏆 <b>أفضل عقد بالأسبوع</b>
+{r['ticker']} | {'CALL' if r['contract_type'] == 'call' else 'PUT'}
+دخول: {r['entry_price']:.2f}
+الأعلى: {r['highest_price']:.2f}
+الربح: {best_row['pnl']:+.2f}%"""
+
+    if worst_row:
+        r = worst_row["row"]
+        msg += f"""
+
+📉 <b>أضعف عقد بالأسبوع</b>
+{r['ticker']} | {'CALL' if r['contract_type'] == 'call' else 'PUT'}
+دخول: {r['entry_price']:.2f}
+الأعلى: {r['highest_price']:.2f}
+النتيجة: {worst_row['pnl']:+.2f}%"""
+
+    msg += """
+
+⚠️ تنبيه: هذا التقرير تعليمي
+والقرار النهائي يعود للمتداول.
+
+📢 @Option_Strike01"""
+    return msg
 
 # =========================
 # تسجيل العقد
@@ -1275,7 +1717,7 @@ def get_state(user):
 
 def register_contract_signal(ticker: str, contract: dict):
     key = contract["option_ticker"]
-    OPEN_CONTRACT_SIGNALS[key] = {
+    row = {
         "ticker": ticker,
         "option_ticker": contract["option_ticker"],
         "contract_type": contract["contract_type"],
@@ -1291,6 +1733,8 @@ def register_contract_signal(ticker: str, contract: dict):
         "created_at": datetime.now(),
         "channel_title": f"{ticker} ${contract['strike']:.2f} {'كول' if contract['contract_type'] == 'call' else 'بوت'}"
     }
+    OPEN_CONTRACT_SIGNALS[key] = row
+    SIGNAL_HISTORY.append(row)
 
 def get_live_contract_price(underlying: str, option_ticker: str):
     try:
@@ -1308,6 +1752,263 @@ def get_live_contract_price(underlying: str, option_ticker: str):
     except Exception:
         pass
     return None
+
+# =========================
+# الأخبار الاقتصادية - تجهيز وعرض
+# =========================
+
+def normalize_impact_label(raw):
+    if raw is None:
+        return "غير محدد"
+    s = str(raw).strip().lower()
+    if s in ["high", "3", "3.0", "h"]:
+        return "🔥 عالي"
+    if s in ["medium", "2", "2.0", "m"]:
+        return "⚠️ متوسط"
+    if s in ["low", "1", "1.0", "l"]:
+        return "منخفض"
+    if "high" in s:
+        return "🔥 عالي"
+    if "medium" in s:
+        return "⚠️ متوسط"
+    if "low" in s:
+        return "منخفض"
+    return str(raw)
+
+def parse_event_datetime(item):
+    candidates = [
+        item.get("date"),
+        item.get("datetime"),
+        item.get("eventDate"),
+        item.get("timestamp")
+    ]
+    for c in candidates:
+        if not c:
+            continue
+        try:
+            s = str(c).replace("Z", "+00:00")
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=MARKET_TZ)
+            return dt.astimezone(RIYADH_TZ)
+        except Exception:
+            try:
+                dt = datetime.strptime(str(c), "%Y-%m-%d %H:%M:%S")
+                dt = dt.replace(tzinfo=MARKET_TZ)
+                return dt.astimezone(RIYADH_TZ)
+            except Exception:
+                pass
+    return None
+
+def is_important_event_name(name: str) -> bool:
+    if not name:
+        return False
+    n = name.lower()
+    return any(k in n for k in IMPORTANT_EVENT_KEYWORDS)
+
+def get_economic_calendar_cached(day_from: str, day_to: str):
+    key = f"econ:{day_from}:{day_to}"
+    cached = get_cached_item(ECON_CACHE, ECON_CACHE_TTL_SECONDS, key)
+    if cached is not None:
+        return cached
+
+    rows = fmp_get("/economic-calendar", params={"from": day_from, "to": day_to})
+    if not isinstance(rows, list):
+        rows = []
+
+    cleaned = []
+    for item in rows:
+        name = item.get("event") or item.get("title") or item.get("name") or ""
+        impact_label = normalize_impact_label(item.get("impact"))
+        if ECON_NEWS_ONLY_IMPORTANT:
+            if not is_important_event_name(name):
+                continue
+            if impact_label not in ["🔥 عالي", "⚠️ متوسط"]:
+                continue
+
+        dt = parse_event_datetime(item)
+        cleaned.append({
+            "name": name,
+            "country": item.get("country", ""),
+            "impact": impact_label,
+            "actual": item.get("actual"),
+            "previous": item.get("previous"),
+            "estimate": item.get("estimate"),
+            "date_obj": dt,
+            "raw": item
+        })
+
+    cleaned.sort(key=lambda x: x["date_obj"] or datetime.now(RIYADH_TZ))
+    set_cached_item(ECON_CACHE, key, cleaned)
+    return cleaned
+
+def get_economic_events(mode: str):
+    today = datetime.now(RIYADH_TZ).date()
+
+    if mode == "today":
+        start = today
+        end = today
+    elif mode == "week":
+        start = today
+        end = today + timedelta(days=6)
+    else:
+        start = today + timedelta(days=7)
+        end = today + timedelta(days=13)
+
+    return get_economic_calendar_cached(start.isoformat(), end.isoformat())
+
+def format_event_value(v):
+    if v is None or v == "":
+        return "—"
+    return str(v)
+
+def format_economic_message(mode: str):
+    title_map = {
+        "today": "أخبار اليوم",
+        "week": "أخبار الأسبوع",
+        "nextweek": "أخبار الأسبوع القادم"
+    }
+    title = title_map.get(mode, "الأخبار المهمة")
+    events = get_economic_events(mode)
+
+    if not events:
+        return f"📰 <b>{title}</b>\n\n❌ لا توجد أخبار مهمة حالياً."
+
+    msg = f"📰 <b>{title}</b>\n{'─' * 30}\n\n"
+
+    for i, ev in enumerate(events[:20], 1):
+        dt = ev["date_obj"]
+        time_str = dt.strftime("%d/%m %H:%M") if dt else "غير محدد"
+        msg += (
+            f"<b>{i}. {ev['name']}</b>\n"
+            f"🕐 {time_str}\n"
+            f"📍 الدولة: {ev['country'] or '—'}\n"
+            f"📊 التأثير: {ev['impact']}\n"
+            f"السابق: {format_event_value(ev['previous'])} | المتوقع: {format_event_value(ev['estimate'])} | الفعلي: {format_event_value(ev['actual'])}\n"
+            f"⚠️ يفضل تجنب الدخول قبل الخبر\n\n"
+        )
+
+    return msg
+
+def get_upcoming_economic_alerts():
+    if not ECON_NEWS_ALERT_ENABLED:
+        return []
+
+    now = datetime.now(RIYADH_TZ)
+    start = now.date().isoformat()
+    end = (now.date() + timedelta(days=1)).isoformat()
+
+    rows = get_economic_calendar_cached(start, end)
+    alerts = []
+
+    for ev in rows:
+        dt = ev["date_obj"]
+        if not dt:
+            continue
+        minutes_left = (dt - now).total_seconds() / 60.0
+        if 0 <= minutes_left <= ECON_NEWS_ALERT_MINUTES_BEFORE + 1:
+            if abs(minutes_left - ECON_NEWS_ALERT_MINUTES_BEFORE) <= 1.2:
+                key = f"{ev['name']}|{dt.isoformat()}"
+                if key not in ECON_ALERT_SENT:
+                    alerts.append((key, ev))
+    return alerts
+
+def economic_alert_cycle():
+    alerts = get_upcoming_economic_alerts()
+    for key, ev in alerts:
+        dt = ev["date_obj"]
+        time_str = dt.strftime("%d/%m %H:%M") if dt else "غير محدد"
+        send(
+            f"⏰ <b>تنبيه خبر مهم بعد {ECON_NEWS_ALERT_MINUTES_BEFORE} دقائق</b>\n\n"
+            f"📰 الخبر: {ev['name']}\n"
+            f"🕐 الوقت: {time_str}\n"
+            f"📊 التأثير: {ev['impact']}\n"
+            f"السابق: {format_event_value(ev['previous'])}\n"
+            f"المتوقع: {format_event_value(ev['estimate'])}\n\n"
+            f"⚠️ يفضل تجنب الدخول قبل الخبر",
+            chat_id=CHAT_ID
+        )
+        ECON_ALERT_SENT.add(key)
+
+# =========================
+# إعلانات الشركات
+# =========================
+
+def classify_earnings_session(time_str: str):
+    if not time_str:
+        return "غير محدد"
+
+    try:
+        hh, mm, ss = [int(x) for x in time_str.split(":")]
+        total = hh * 3600 + mm * 60 + ss
+        if total < (9 * 3600 + 30 * 60):
+            return "قبل الافتتاح"
+        if total >= (16 * 3600):
+            return "بعد الإغلاق"
+        return "أثناء السوق"
+    except Exception:
+        return "غير محدد"
+
+def get_earnings_for_date(date_str: str):
+    key = f"earnings:{date_str}"
+    cached = get_cached_item(EARNINGS_CACHE, EARNINGS_CACHE_TTL_SECONDS, key)
+    if cached is not None:
+        return cached
+
+    try:
+        data = massive_get("/benzinga/v1/earnings", params={"date": date_str, "limit": 500})
+        results = data.get("results", []) or []
+        filtered = []
+
+        for item in results:
+            ticker = (item.get("ticker") or "").upper().strip()
+            if not ticker or ticker not in WATCHLIST:
+                continue
+
+            item["ticker"] = ticker
+            item["session_label"] = classify_earnings_session(item.get("time", ""))
+            filtered.append(item)
+
+        filtered.sort(key=lambda x: (x.get("date", ""), x.get("time", "") or "99:99:99", x.get("ticker", "")))
+        set_cached_item(EARNINGS_CACHE, key, filtered)
+        return filtered
+    except Exception as e:
+        print(f"[EARNINGS ERROR] {date_str}: {e}")
+        return []
+
+def get_weekly_earnings_events(days: int = EARNINGS_LOOKAHEAD_DAYS):
+    today = datetime.now(MARKET_TZ).date()
+    events = []
+    seen = set()
+
+    for i in range(days):
+        d = today + timedelta(days=i)
+        rows = get_earnings_for_date(d.isoformat())
+        for item in rows:
+            k = (item.get("ticker"), item.get("date"), item.get("time"), item.get("session_label"))
+            if k in seen:
+                continue
+            seen.add(k)
+            events.append(item)
+
+    events.sort(key=lambda x: (x.get("date", ""), x.get("time", "") or "99:99:99", x.get("ticker", "")))
+    return events
+
+def filter_earnings_events(events, mode: str):
+    if mode == "pre":
+        return [x for x in events if x.get("session_label") == "قبل الافتتاح"]
+    if mode == "post":
+        return [x for x in events if x.get("session_label") == "بعد الإغلاق"]
+    return events
+
+def get_ticker_earnings_event_in_week(ticker: str, target_date: str = None):
+    events = get_weekly_earnings_events(EARNINGS_LOOKAHEAD_DAYS)
+    matches = [x for x in events if x.get("ticker") == ticker]
+    if target_date:
+        exact = [x for x in matches if x.get("date") == target_date]
+        if exact:
+            return exact[0]
+    return matches[0] if matches else None
 
 # =========================
 # دورة الصياد
@@ -1329,7 +2030,7 @@ def scanner_cycle():
             if stock_in_cooldown(ticker):
                 continue
 
-            df = get_df(ticker, "1h")
+                df = get_df(ticker, "1h")
             if df.empty or len(df) < 20:
                 continue
 
@@ -1399,6 +2100,10 @@ def contract_update_cycle():
         except Exception as e:
             print(f"[CONTRACT UPDATE ERROR] {option_ticker}: {e}")
 
+# =========================
+# اللوبات
+# =========================
+
 async def contract_update_loop():
     await asyncio.sleep(20)
     while True:
@@ -1417,11 +2122,123 @@ async def scanner_loop():
             send(f"❌ خطأ في الصياد: {str(e)}", chat_id=CHAT_ID)
         await asyncio.sleep(SCAN_INTERVAL_SECONDS)
 
+async def economic_alert_loop():
+    await asyncio.sleep(30)
+    while True:
+        try:
+            await asyncio.to_thread(economic_alert_cycle)
+        except Exception as e:
+            send(f"❌ خطأ في تنبيهات الأخبار: {str(e)}", chat_id=CHAT_ID)
+        await asyncio.sleep(60)
+
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(scanner_loop())
     asyncio.create_task(contract_update_loop())
-    send("✅ البوت شغال ومتصل!\n🔍 الصياد يبدأ بعد 10 ثواني…", chat_id=CHAT_ID)
+    asyncio.create_task(economic_alert_loop())
+    send("✅ البوت شغال ومتصل!\n🔍 الصياد يبدأ بعد 10 ثواني…", chat_id=CHAT_ID) 
+# =========================
+# لوحة الأزرار الرئيسية
+# =========================
+
+def main_menu():
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📊 تحليل سريع", "callback_data": "quick"},
+                {"text": "🔥 تحليل احترافي", "callback_data": "pro"},
+            ],
+            [
+                {"text": "🧲 القاما والسيولة", "callback_data": "gamma"},
+                {"text": "📈 دعوم ومقاومات", "callback_data": "sr"},
+            ],
+            [
+                {"text": "🎯 خطة دخول", "callback_data": "plan"},
+                {"text": "💎 أفضل عقد", "callback_data": "contract"},
+            ],
+            [
+                {"text": "📂 العقود المفتوحة", "callback_data": "open_contracts"},
+                {"text": "📋 التقرير اليومي", "callback_data": "daily_report"},
+            ],
+            [
+                {"text": "📆 إعلانات الشركات", "callback_data": "earnings_menu"},
+                {"text": "🗓 التقرير الأسبوعي", "callback_data": "weekly_report"},
+            ],
+            [
+                {"text": "📰 الأخبار المهمة", "callback_data": "econ_menu"},
+                {"text": "⚙️ تغيير الفريم", "callback_data": "tf"},
+            ]
+        ]
+    }
+
+def tf_menu():
+    tfs = ["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"]
+    rows = []
+    row = []
+
+    for i, tf in enumerate(tfs, 1):
+        row.append({"text": tf, "callback_data": f"settf:{tf}"})
+        if i % 4 == 0:
+            rows.append(row)
+            row = []
+
+    if row:
+        rows.append(row)
+
+    rows.append([{"text": "⬅️ رجوع", "callback_data": "back"}])
+    return {"inline_keyboard": rows}
+
+def earnings_menu():
+    return {
+        "inline_keyboard": [
+            [{"text": "📅 إعلانات الأسبوع", "callback_data": "earnings_week:all"}],
+            [{"text": "🌅 قبل الافتتاح", "callback_data": "earnings_week:pre"}],
+            [{"text": "🌙 بعد الإغلاق", "callback_data": "earnings_week:post"}],
+            [{"text": "⬅️ رجوع", "callback_data": "back"}]
+        ]
+    }
+
+def econ_menu():
+    return {
+        "inline_keyboard": [
+            [{"text": "📅 أخبار اليوم", "callback_data": "econ:today"}],
+            [{"text": "🗓 أخبار الأسبوع", "callback_data": "econ:week"}],
+            [{"text": "📆 أخبار الأسبوع القادم", "callback_data": "econ:nextweek"}],
+            [{"text": "⬅️ رجوع", "callback_data": "back"}]
+        ]
+    }
+
+def earnings_list_keyboard(events):
+    rows = []
+    for item in events[:EARNINGS_MAX_BUTTONS]:
+        ticker = item.get("ticker", "")
+        date_str = item.get("date", "")
+        session_label = item.get("session_label", "غير محدد")
+        label = f"{ticker} | {session_label} | {format_short_date(date_str)}"
+        rows.append([{
+            "text": label[:60],
+            "callback_data": f"earnpick:{ticker}:{date_str}"
+        }])
+
+    rows.append([{"text": "⬅️ رجوع", "callback_data": "earnings_menu"}])
+    return {"inline_keyboard": rows}
+
+# =========================
+# حالة المستخدم
+# =========================
+
+STATE = {}
+
+def set_state(user, ticker=None, tf=None):
+    s = STATE.get(user, {"ticker": None, "tf": "1d"})
+    if ticker is not None:
+        s["ticker"] = ticker
+    if tf is not None:
+        s["tf"] = tf
+    STATE[user] = s
+
+def get_state(user):
+    return STATE.get(user, {"ticker": None, "tf": "1d"})
 
 # =========================
 # مساعد لتحليل السهم
@@ -1460,7 +2277,7 @@ async def analyze_ticker(ticker: str, tf: str, user: str, announce: bool = True,
     try:
         contract = await asyncio.wait_for(
             asyncio.to_thread(choose_best_contract_from_massive, ticker, c, o),
-            timeout=15
+            timeout=20
         )
     except Exception:
         contract = None
@@ -1468,6 +2285,75 @@ async def analyze_ticker(ticker: str, tf: str, user: str, announce: bool = True,
     result = (c, o, contract)
     set_cached_analysis(ticker, tf, result)
     return result
+
+# =========================
+# TradingView
+# =========================
+
+def normalize_signal_value(signal: str):
+    s = str(signal or "").strip().lower()
+    if s in {"buy", "long", "call"}:
+        return "CALL"
+    if s in {"sell", "short", "put"}:
+        return "PUT"
+    return s.upper()
+
+def process_tradingview_signal(payload: dict):
+    try:
+        ticker = str(payload.get("ticker", "")).upper().strip()
+        signal = normalize_signal_value(payload.get("signal", ""))
+        tf = str(payload.get("interval", "1h")).lower()
+
+        if not ticker:
+            send("❌ TradingView: لا يوجد ticker في الرسالة", chat_id=CHAT_ID)
+            return {"ok": True}
+
+        if ticker not in WATCHLIST:
+            send(f"❌ TradingView: السهم {ticker} غير موجود في القائمة", chat_id=CHAT_ID)
+            return {"ok": True}
+
+        if tf not in TF:
+            tf = "1h"
+
+        df = get_df(ticker, tf)
+        if df.empty:
+            send(f"❌ TradingView: لا توجد بيانات لـ {ticker}", chat_id=CHAT_ID)
+            return {"ok": True}
+
+        c = core_metrics(df, ticker=ticker)
+        if c is None:
+            send(f"❌ TradingView: تعذر حساب الارتكاز لـ {ticker}", chat_id=CHAT_ID)
+            return {"ok": True}
+
+        if signal == "CALL":
+            c["direction"] = "CALL 🟢"
+        elif signal == "PUT":
+            c["direction"] = "PUT 🔴"
+
+        o = options_info_from_massive(ticker, c["price"])
+        contract = choose_best_contract_from_massive(ticker, c, o)
+
+        send(
+            f"📡 <b>تنبيه TradingView</b>\n"
+            f"السهم: <b>{ticker}</b>\n"
+            f"الإشارة: <b>{signal}</b>\n"
+            f"الفريم: <b>{tf}</b>",
+            chat_id=CHAT_ID
+        )
+
+        if contract:
+            send(msg_pro(ticker, tf, c, o, contract), chat_id=CHAT_ID)
+            time.sleep(1)
+            send(msg_channel_post(ticker, contract), chat_id=CHAT_ID)
+            register_contract_signal(ticker, contract)
+        else:
+            send(msg_pro(ticker, tf, c, o, None), chat_id=CHAT_ID)
+
+        return {"ok": True}
+
+    except Exception as e:
+        send(f"❌ TradingView Error: {str(e)}", chat_id=CHAT_ID)
+        return {"ok": True}
 
 # =========================
 # Webhook
@@ -1480,6 +2366,11 @@ async def webhook(req: Request):
     except Exception:
         return {"ok": True}
 
+    # دعم TradingView على نفس الرابط
+    if is_tradingview_payload(data):
+        return await asyncio.to_thread(process_tradingview_signal, data)
+
+    # Telegram only
     if not request_has_valid_secret(req):
         print("[WEBHOOK BLOCKED] Invalid Telegram secret token")
         return {"ok": True}
@@ -1488,8 +2379,10 @@ async def webhook(req: Request):
         print("[WEBHOOK BLOCKED] Invalid update shape")
         return {"ok": True}
 
-    if is_duplicate_update(data.get("update_id")):
-        return {"ok": True}
+    incoming_text = str(safe_get(data, "message", "text", default="") or "").strip()
+    if incoming_text != "/start":
+        if is_duplicate_update(data.get("update_id")):
+            return {"ok": True}
 
     try:
         if "message" in data:
@@ -1503,16 +2396,18 @@ async def webhook(req: Request):
             if text == "/start":
                 set_state(user, ticker=None, tf="1d")
                 send(
-                    "👋 أهلاً بك في بوت التداول!\n\n"
-                    "📌 أرسل رمز السهم مثل: <code>NVDA</code> أو <code>AAPL</code>\n"
-                    "ثم اضغط على أي زر من القائمة 👇",
+                    "🔥 <b>مرحباً بك في عالم اوبشن سترايك</b>\n\n"
+                    "📊 بوت احترافي لتحليل الأسهم واختيار أفضل العقود\n\n"
+                    "⚡ ماذا تحتاج الآن؟ اختر من القائمة بالأسفل 👇\n\n"
+                    "💡 يمكنك إرسال رمز سهم مباشرة مثل:\n"
+                    "<code>NVDA</code> أو <code>AAPL</code>",
                     main_menu(),
                     chat_id=user
                 )
                 return {"ok": True}
 
             if text == "/test":
-                send("✅ البوت شغال 100%\n🔗 متصل بـ Polygon API", chat_id=user)
+                send("✅ البوت شغال 100%\n🔗 متصل بالـ APIs", chat_id=user)
                 return {"ok": True}
 
             if text == "/scan":
@@ -1529,7 +2424,11 @@ async def webhook(req: Request):
             tf = parts[1].lower() if len(parts) > 1 else get_state(user)["tf"]
 
             if ticker not in WATCHLIST:
-                send(f"❌ السهم <b>{ticker}</b> غير موجود في القائمة\n\nأمثلة: NVDA, AAPL, TSLA, SPY", chat_id=user)
+                send(
+                    f"❌ السهم <b>{ticker}</b> غير موجود في القائمة\n\n"
+                    f"أمثلة: NVDA, AAPL, TSLA, SPY",
+                    chat_id=user
+                )
                 return {"ok": True}
 
             if tf not in TF:
@@ -1561,6 +2460,60 @@ async def webhook(req: Request):
                 send("⚙️ اختر الفريم الزمني 👇", tf_menu(), chat_id=user)
                 return {"ok": True}
 
+            if data_cb == "earnings_menu":
+                send("📆 اختر نوع إعلانات الشركات 👇", earnings_menu(), chat_id=user)
+                return {"ok": True}
+
+            if data_cb.startswith("earnings_week:"):
+                mode = data_cb.split(":")[1]
+                events = await asyncio.to_thread(get_weekly_earnings_events, EARNINGS_LOOKAHEAD_DAYS)
+                events = filter_earnings_events(events, mode)
+                send(msg_earnings_list(events, mode), earnings_list_keyboard(events), chat_id=user)
+                return {"ok": True}
+
+            if data_cb.startswith("earnpick:"):
+                try:
+                    _, tk, event_date = data_cb.split(":")
+                except Exception:
+                    send("❌ تعذر قراءة بيانات الإعلان", main_menu(), chat_id=user)
+                    return {"ok": True}
+
+                send(f"⏳ جاري دراسة إعلان <b>{tk}</b>...", chat_id=user)
+
+                event = await asyncio.to_thread(get_ticker_earnings_event_in_week, tk, event_date)
+                if not event:
+                    send("❌ لم يتم العثور على بيانات الإعلان لهذه الشركة هذا الأسبوع.", earnings_menu(), chat_id=user)
+                    return {"ok": True}
+
+                c, o, contract = await analyze_ticker(tk, "1h", user, announce=False, use_cache=False)
+                if c is None:
+                    send("❌ تعذر تحليل السهم حالياً", earnings_menu(), chat_id=user)
+                    return {"ok": True}
+
+                trade_view = build_earnings_trade_view(tk, c, o, contract, event)
+                send(msg_earnings_analysis(tk, event, c, o, contract, trade_view), main_menu(), chat_id=user)
+                return {"ok": True}
+
+            if data_cb == "weekly_report":
+                send(msg_weekly_report(), main_menu(), chat_id=user)
+                return {"ok": True}
+
+            if data_cb == "econ_menu":
+                send("📰 اختر قسم الأخبار المهمة 👇", econ_menu(), chat_id=user)
+                return {"ok": True}
+
+            if data_cb == "econ:today":
+                send(format_economic_message("today"), main_menu(), chat_id=user)
+                return {"ok": True}
+
+            if data_cb == "econ:week":
+                send(format_economic_message("week"), main_menu(), chat_id=user)
+                return {"ok": True}
+
+            if data_cb == "econ:nextweek":
+                send(format_economic_message("nextweek"), main_menu(), chat_id=user)
+                return {"ok": True}
+
             if data_cb.startswith("settf:"):
                 new_tf = data_cb.split(":")[1]
                 if new_tf not in TF:
@@ -1589,12 +2542,6 @@ async def webhook(req: Request):
 
             if data_cb == "daily_report":
                 send(msg_daily_report(), main_menu(), chat_id=user)
-                return {"ok": True}
-
-            if data_cb == "news":
-                send("⏳ جاري تحميل الأخبار...", chat_id=user)
-                news_msg = await asyncio.to_thread(format_news_message, ticker)
-                send(news_msg, main_menu(), chat_id=user)
                 return {"ok": True}
 
             if not ticker:
@@ -1637,6 +2584,7 @@ async def webhook(req: Request):
                 send(f"❌ خطأ: {str(e)}", chat_id=err_user)
         except Exception:
             pass
+
         print(f"[WEBHOOK ERROR] {e}")
 
     return {"ok": True}
@@ -1649,7 +2597,7 @@ async def webhook(req: Request):
 def home():
     return {
         "status": "LIVE ✅",
-        "api": "Polygon.io",
+        "api": "Polygon.io + FMP",
         "watchlist_count": len(WATCHLIST),
         "daily_limit": MAX_SIGNALS_PER_DAY,
         "stock_cooldown_days": STOCK_COOLDOWN_DAYS,
@@ -1660,11 +2608,16 @@ def home():
         "zero_hero_price_range": f"{ZERO_HERO_MIN_PRICE} - {ZERO_HERO_MAX_PRICE}",
         "features": [
             "أهداف CALL و PUT منفصلة",
-            "أخبار السوق",
             "جميع الفريمات",
             "زيرو هيرو الجمعة",
             "صياد 5 شركات يومياً",
             "عقود لجميع الأسهم",
-            "جميع الأزرار تعمل"
+            "إعلانات الشركات",
+            "التقرير الأسبوعي",
+            "TP1 ثابت + TP2/TP3 من شارت العقد",
+            "الأخبار الاقتصادية المهمة",
+            "تنبيه قبل الخبر بـ 5 دقائق",
+            "TradingView webhook",
+            "/start سريع وثابت"
         ]
     }
