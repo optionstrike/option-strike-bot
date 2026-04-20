@@ -646,3 +646,499 @@ def core_metrics(df, ticker=None):
         "ema20": ema20,
         "ema50": ema50
     }
+# =========================
+# القاما والسيولة
+# =========================
+
+def options_info_from_massive(ticker, price):
+    try:
+        chain = get_option_chain_snapshot(ticker)
+        if not chain:
+            raise Exception("empty chain")
+
+        parsed = [parse_contract_meta(x) for x in chain]
+        parsed = [x for x in parsed if x["ticker"] and x["contract_price"] is not None]
+
+        if not parsed:
+            raise Exception("no valid contracts")
+
+        calls = [x for x in parsed if x["contract_type"] == "call"]
+        puts = [x for x in parsed if x["contract_type"] == "put"]
+
+        best_call_oi = max(calls, key=lambda x: x["oi"]) if calls else None
+        best_put_oi = max(puts, key=lambda x: x["oi"]) if puts else None
+
+        call_strike = best_call_oi["strike"] if best_call_oi else price
+        put_strike = best_put_oi["strike"] if best_put_oi else price
+
+        gamma = best_call_oi["strike"] if best_call_oi else price
+        zone_low = gamma - 0.5
+        zone_high = gamma + 0.5
+
+        dist = abs(price - gamma)
+        prob = max(50, 85 - int(dist))
+
+        liquidity = "CALL 🟢" if call_strike > price else "PUT 🔴"
+
+        return {
+            "call": call_strike,
+            "put": put_strike,
+            "gamma": gamma,
+            "zlow": zone_low,
+            "zhigh": zone_high,
+            "prob": prob,
+            "liq": liquidity,
+        }
+    except Exception as e:
+        print(f"[OPTIONS INFO ERROR] {ticker}: {e}")
+        return {
+            "call": price, "put": price, "gamma": price,
+            "zlow": price, "zhigh": price, "prob": 50, "liq": "—",
+        }
+
+# =========================
+# نسبة النجاح
+# =========================
+
+def calc_success_rate(c: dict, o: dict, contract: dict):
+    return min(92, max(55, int(
+        55
+        + (10 if c["strongest_trend"] in ["صاعد قوي 🔥", "هابط قوي 🔻"] else 0)
+        + (10 if c["direction"] != "انتظار ⚪" else 0)
+        + (8 if abs(c["pivot_diff"]) > 0 else 0)
+        + (5 if contract["oi"] > 1000 else 0)
+        + (4 if abs(contract["delta"]) >= 0.20 else 0)
+        + (5 if o["prob"] >= 65 else 0)
+    )))
+
+# =========================
+# اختيار العقد
+# =========================
+
+def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
+    try:
+        chain = get_option_chain_snapshot(ticker)
+        if not chain:
+            return None
+
+        parsed = [parse_contract_meta(x) for x in chain]
+        parsed = [x for x in parsed if x["ticker"] and x["contract_price"] is not None]
+
+        if not parsed:
+            return None
+
+        direction = c["direction"]
+        if direction.startswith("CALL"):
+            target_type = "call"
+        else:
+            target_type = "put"
+
+        underlying_price = c["price"]
+        prob = o["prob"] if o else 50
+        limit_price = contract_price_limit_for_ticker(ticker)
+
+        friday_mode = (
+            FRIDAY_ZERO_HERO_ENABLED
+            and ((ZERO_HERO_ONLY_ON_FRIDAY and is_friday_now()) or (not ZERO_HERO_ONLY_ON_FRIDAY))
+        )
+
+        if friday_mode and c["strongest_trend"] in ["صاعد قوي 🔥", "هابط قوي 🔻"] and prob >= ZERO_HERO_MIN_PROB:
+            zero_hero_pool = []
+            for x in parsed:
+                if x["contract_type"] != target_type:
+                    continue
+                if not x["expiration"]:
+                    continue
+                if x["contract_price"] is None or x["contract_price"] <= 0:
+                    continue
+                if not (ZERO_HERO_MIN_PRICE <= x["contract_price"] <= ZERO_HERO_MAX_PRICE):
+                    continue
+                if x["oi"] < ZERO_HERO_MIN_OI:
+                    continue
+                dte = days_to_expiry(x["expiration"])
+                if dte is None or dte < 0 or dte > 3:
+                    continue
+                strike_distance_pct = abs(x["strike"] - underlying_price) / max(underlying_price, 1e-9)
+                delta_score = abs(abs(x["delta"]) - 0.30)
+                score = (
+                    strike_distance_pct * 18
+                    + delta_score * 5
+                    - min(x["oi"], 100000) / 12000
+                    - min(abs(x["gamma"]), 1.0) * 6
+                    + abs(x["contract_price"] - 1.00) * 0.6
+                )
+                zero_hero_pool.append((score, x))
+
+            if zero_hero_pool:
+                zero_hero_pool.sort(key=lambda z: z[0])
+                best = zero_hero_pool[0][1]
+                contract = build_contract_from_pick(best, c, target_type, mode="ZERO HERO FRIDAY")
+                success_rate = calc_success_rate(c, o or {"prob": 50}, contract)
+                if success_rate >= ZERO_HERO_MIN_SUCCESS_RATE:
+                    contract["success_rate"] = success_rate
+                    return contract
+
+        stage1 = []
+        for x in parsed:
+            if x["contract_type"] != target_type:
+                continue
+            if not x["expiration"]:
+                continue
+            if x["contract_price"] is None or x["contract_price"] <= 0:
+                continue
+            if x["contract_price"] > limit_price:
+                continue
+            dte = days_to_expiry(x["expiration"])
+            if dte is None or dte < 0 or dte > 45:
+                continue
+            if x["oi"] < 10:
+                continue
+            strike_distance_pct = abs(x["strike"] - underlying_price) / max(underlying_price, 1e-9)
+            delta_score = abs(abs(x["delta"]) - 0.35)
+            dte_penalty = min(dte, 45) / 25
+            score = (
+                strike_distance_pct * 22
+                + delta_score * 5
+                + dte_penalty
+                - min(x["oi"], 100000) / 15000
+                - min(abs(x["gamma"]), 1.0) * 4
+                + abs(x["contract_price"] - limit_price) * 0.10
+            )
+            stage1.append((score, x))
+
+        if stage1:
+            stage1.sort(key=lambda z: z[0])
+            best = stage1[0][1]
+            contract = build_contract_from_pick(best, c, target_type, mode="NORMAL")
+            contract["success_rate"] = calc_success_rate(c, o or {"prob": 50}, contract)
+            return contract
+
+        stage2 = []
+        for x in parsed:
+            if x["contract_type"] != target_type:
+                continue
+            if not x["expiration"]:
+                continue
+            if x["contract_price"] is None or x["contract_price"] <= 0:
+                continue
+            if x["contract_price"] > limit_price:
+                continue
+            dte = days_to_expiry(x["expiration"])
+            if dte is None or dte < 0:
+                continue
+            score = (
+                abs(x["contract_price"] - limit_price) * 1.5
+                - min(x["oi"], 100000) / 20000
+                + min(max(dte, 0), 60) / 40
+            )
+            stage2.append((score, x))
+
+        if stage2:
+            stage2.sort(key=lambda z: z[0])
+            best = stage2[0][1]
+            contract = build_contract_from_pick(best, c, target_type, mode="NORMAL")
+            contract["success_rate"] = calc_success_rate(c, o or {"prob": 50}, contract)
+            return contract
+
+        stage3 = []
+        for x in parsed:
+            if x["contract_type"] != target_type:
+                continue
+            if not x["expiration"]:
+                continue
+            if x["contract_price"] is None or x["contract_price"] <= 0:
+                continue
+            dte = days_to_expiry(x["expiration"])
+            if dte is None or dte < 0:
+                continue
+            strike_distance_pct = abs(x["strike"] - underlying_price) / max(underlying_price, 1e-9)
+            score = strike_distance_pct * 10 - min(x["oi"], 100000) / 20000
+            stage3.append((score, x))
+
+        if stage3:
+            stage3.sort(key=lambda z: z[0])
+            best = stage3[0][1]
+            contract = build_contract_from_pick(best, c, target_type, mode="BEST AVAILABLE")
+            contract["success_rate"] = calc_success_rate(c, o or {"prob": 50}, contract)
+            return contract
+
+        return None
+
+    except Exception as e:
+        print(f"[CONTRACT PICK ERROR] {ticker}: {e}")
+        return None
+
+# =========================
+# فلترة الصياد
+# =========================
+
+def calc_score(c, o):
+    score = 0
+    if c["direction"].startswith("CALL") or c["direction"].startswith("PUT"):
+        score += 35
+    if c["strongest_trend"] in ["صاعد قوي 🔥", "هابط قوي 🔻"]:
+        score += 25
+    if abs(c["pivot_diff"]) > 0:
+        score += 10
+    if o["prob"] >= 60:
+        score += 15
+    if c["trend"] == "صاعد 📈" and c["direction"].startswith("CALL"):
+        score += 10
+    if c["trend"] == "هابط 📉" and c["direction"].startswith("PUT"):
+        score += 10
+    return score
+
+def is_entry_ready_now(c):
+    if c["direction"] == "انتظار ⚪":
+        return False
+
+    price = c["price"]
+    entry = c["best_entry"]
+    near_entry = abs(price - entry) / max(entry, 1e-9) <= ENTRY_MAX_DISTANCE_PCT
+
+    breakout_call = (
+        c["direction"].startswith("CALL")
+        and price >= c["best_entry"] * (1 - BREAKOUT_BUFFER_PCT)
+        and c["confirmed_side"] == "above"
+    )
+
+    breakout_put = (
+        c["direction"].startswith("PUT")
+        and price <= c["best_entry"] * (1 + BREAKOUT_BUFFER_PCT)
+        and c["confirmed_side"] == "below"
+    )
+
+    return near_entry or breakout_call or breakout_put
+
+# =========================
+# تنسيق التاريخ
+# =========================
+
+def format_arabic_date(date_str: str):
+    try:
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        months = {
+            1: "يناير", 2: "فبراير", 3: "مارس", 4: "أبريل", 5: "مايو", 6: "يونيو",
+            7: "يوليو", 8: "أغسطس", 9: "سبتمبر", 10: "أكتوبر", 11: "نوفمبر", 12: "ديسمبر"
+        }
+        return f"{dt.day} {months[dt.month]} {dt.year}"
+    except Exception:
+        return date_str
+
+# =========================
+# الرسائل
+# =========================
+
+def msg_quick(tk, tf, c):
+    return f"""📊 <b>{tk}</b> | TF: {tf}
+
+💰 السعر: <b>{c['price']:.2f}</b>
+📊 الترند: {c['trend']}
+🔥 الاتجاه الأقوى: {c['strongest_trend']}
+
+📍 الارتكاز {c['pivot_label']}: <b>{c['pivot']:.2f}</b>
+📏 البعد عن الارتكاز: {c['pivot_diff']:+.2f} ({c['pivot_position']})
+
+🔵 دعم: {c['low']:.2f}
+🔴 مقاومة: {c['high']:.2f}
+
+🟢 أهداف CALL:
+1️⃣ {c['call_tp1']:.2f}
+2️⃣ {c['call_tp2']:.2f}
+3️⃣ {c['call_tp3']:.2f}
+
+🔴 أهداف PUT:
+1️⃣ {c['put_tp1']:.2f}
+2️⃣ {c['put_tp2']:.2f}
+3️⃣ {c['put_tp3']:.2f}
+
+📌 دخول: {c['best_entry']:.2f}
+🛑 وقف: {c['sl']:.2f}
+
+📈 القرار: <b>{c['direction']}</b>"""
+
+def msg_pro(tk, tf, c, o, contract=None):
+    base = f"""🔥 <b>{tk} احترافي</b> | TF: {tf}
+
+💰 السعر: <b>{c['price']:.2f}</b>
+📊 الترند: {c['trend']}
+🔥 الاتجاه الأقوى: {c['strongest_trend']}
+
+🔵 دعم {c['pivot_label']}: {c['low']:.2f}
+🔴 مقاومة {c['pivot_label']}: {c['high']:.2f}
+📍 الارتكاز {c['pivot_label']}: <b>{c['pivot']:.2f}</b>
+📏 البعد عن الارتكاز: {c['pivot_diff']:+.2f} ({c['pivot_position']})
+
+🟢 أهداف CALL (فوق الارتكاز):
+1️⃣ {c['call_tp1']:.2f}
+2️⃣ {c['call_tp2']:.2f}
+3️⃣ {c['call_tp3']:.2f}
+
+🔴 أهداف PUT (تحت الارتكاز):
+1️⃣ {c['put_tp1']:.2f}
+2️⃣ {c['put_tp2']:.2f}
+3️⃣ {c['put_tp3']:.2f}
+
+📈 <b>القرار النهائي: {c['direction']}</b>
+
+🧲 <b>معلومات داعمة:</b>
+القاما: {o['gamma']:.2f}
+Magnet: {o['zlow']:.2f} - {o['zhigh']:.2f}
+احتمال الوصول: {o['prob']}%
+سيولة الكول: {o['call']:.2f}
+سيولة البوت: {o['put']:.2f}
+الأقوى: {o['liq']}"""
+
+    if not contract:
+        return base + "\n\n❌ لم يتم العثور على عقد متاح."
+
+    mode_line = f"\n🎯 الوضع: {contract.get('mode', 'NORMAL')}" if contract.get("mode") else ""
+
+    return base + f"""
+
+💎 <b>العقد المختار:</b>{mode_line}
+الرمز: <code>{contract['option_ticker']}</code>
+النوع: {contract['contract_type'].upper()}
+السترايك: {contract['strike']:.2f}
+الانتهاء: {format_arabic_date(contract['expiration'])}
+سعر العقد: <b>{contract['contract_price']:.2f}</b>
+نطاق الدخول: {contract['entry_high']:.2f} – {contract['entry_low']:.2f}
+
+🎯 أهداف العقد:
+1️⃣ {contract['tp1']:.2f}
+2️⃣ {contract['tp2']:.2f}
+3️⃣ {contract['tp3']:.2f}
+
+🛑 الوقف: {contract['stop_text']}
+📊 نسبة النجاح: <b>{contract['success_rate']}%</b>
+Δ Delta: {contract['delta']:.2f} | Γ Gamma: {contract['gamma']:.4f}
+IV: {contract['iv']:.4f} | OI: {contract['oi']}"""
+
+def msg_channel_post(tk, contract):
+    type_ar = "CALL" if contract["contract_type"] == "call" else "PUT"
+    color = "🟢" if contract["contract_type"] == "call" else "🔴"
+
+    mode_line = ""
+    if contract.get("mode") == "ZERO HERO FRIDAY":
+        mode_line = "\n⚡ <b>الوضع: زيرو هيرو الجمعة</b>"
+
+    return f"""🆕 <b>طرح جديد | {tk}</b>{mode_line}
+
+{color} النوع: <b>{type_ar}</b>
+🎯 السترايك: ${contract['strike']:.2f}
+📅 التاريخ: {format_arabic_date(contract['expiration'])}
+
+💰 نطاق الدخول: {contract['entry_high']:.2f} – {contract['entry_low']:.2f}
+
+📈 الأهداف:
+🥇 {contract['tp1']:.2f}
+🥈 {contract['tp2']:.2f}
+🥉 {contract['tp3']:.2f}
+
+🛑 الوقف: {contract['stop_text']}
+📊 نسبة النجاح: <b>{contract['success_rate']}%</b>
+
+⚠️ تنبيه: هذا الطرح تعليمي
+والقرار النهائي يعود للمتداول
+
+📢 @Option_Strike01"""
+
+def msg_contract_update(title, entry_price, current_price):
+    pnl = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+    emoji = "🚀" if pnl >= 50 else "📈" if pnl >= 0 else "📉"
+    return f"""🔔 <b>تحديث | {title}</b>
+
+📊 سعر الدخول: {entry_price:.2f}
+💰 السعر الحالي: {current_price:.2f}
+{emoji} نسبة الربح: <b>{pnl:+.2f}%</b>
+
+⚠️ تنبيه: هذا الطرح تعليمي
+والقرار النهائي يعود للمتداول.
+
+📢 @Option_Strike01"""
+
+def msg_gamma(tk, tf, c, o):
+    return f"""🧲 <b>{tk} - القاما والسيولة</b> | TF: {tf}
+
+🧲 القاما: {o['gamma']:.2f}
+📍 Magnet: {o['zlow']:.2f} - {o['zhigh']:.2f}
+📊 احتمال الوصول: <b>{o['prob']}%</b>
+
+💰 سيولة الكول: {o['call']:.2f}
+💸 سيولة البوت: {o['put']:.2f}
+🔥 الأقوى: {o['liq']}
+
+📍 الارتكاز {c['pivot_label']}: {c['pivot']:.2f}
+📏 البعد عن الارتكاز: {c['pivot_diff']:+.2f} ({c['pivot_position']})
+
+الاتجاه الأقوى: {c['strongest_trend']}
+السعر الحالي: <b>{c['price']:.2f}</b>"""
+
+def msg_sr(tk, tf, c):
+    return f"""📈 <b>{tk} - دعوم ومقاومات</b> | TF: {tf}
+
+🔵 دعم {c['pivot_label']}: <b>{c['low']:.2f}</b>
+🔴 مقاومة {c['pivot_label']}: <b>{c['high']:.2f}</b>
+
+📍 الارتكاز {c['pivot_label']}: <b>{c['pivot']:.2f}</b>
+📏 البعد عن الارتكاز: {c['pivot_diff']:+.2f} ({c['pivot_position']})
+
+🟢 أهداف CALL (فوق الارتكاز):
+1️⃣ {c['call_tp1']:.2f}
+2️⃣ {c['call_tp2']:.2f}
+3️⃣ {c['call_tp3']:.2f}
+
+🔴 أهداف PUT (تحت الارتكاز):
+1️⃣ {c['put_tp1']:.2f}
+2️⃣ {c['put_tp2']:.2f}
+3️⃣ {c['put_tp3']:.2f}
+
+الاتجاه الأقوى: {c['strongest_trend']}
+السعر الحالي: <b>{c['price']:.2f}</b>"""
+
+def msg_plan(tk, tf, c):
+    return f"""🎯 <b>{tk} - خطة الدخول</b> | TF: {tf}
+
+الاتجاه الأقوى: {c['strongest_trend']}
+📍 الارتكاز {c['pivot_label']}: {c['pivot']:.2f}
+📏 البعد عن الارتكاز: {c['pivot_diff']:+.2f} ({c['pivot_position']})
+
+📌 دخول: <b>{c['best_entry']:.2f}</b>
+🛑 وقف: {c['sl']:.2f}
+
+🟢 أهداف CALL:
+1️⃣ {c['call_tp1']:.2f}
+2️⃣ {c['call_tp2']:.2f}
+3️⃣ {c['call_tp3']:.2f}
+
+🔴 أهداف PUT:
+1️⃣ {c['put_tp1']:.2f}
+2️⃣ {c['put_tp2']:.2f}
+3️⃣ {c['put_tp3']:.2f}
+
+📈 القرار: <b>{c['direction']}</b>"""
+
+def msg_contract(tk, tf, c, contract):
+    if not contract:
+        return "❌ لم يتم العثور على عقد متاح لهذا السهم."
+    mode_line = f"\nMode: {contract.get('mode', 'NORMAL')}" if contract.get("mode") else ""
+    return f"""💎 <b>{tk} - أفضل عقد</b> | TF: {tf}{mode_line}
+
+النوع: {contract['contract_type'].upper()}
+السترايك: {contract['strike']:.2f}
+الانتهاء: {format_arabic_date(contract['expiration'])}
+سعر العقد: <b>{contract['contract_price']:.2f}</b>
+
+الاتجاه الأقوى: {c['strongest_trend']}
+📍 الارتكاز {c['pivot_label']}: {c['pivot']:.2f}
+📏 البعد عن الارتكاز: {c['pivot_diff']:+.2f} ({c['pivot_position']})
+
+📌 نطاق الدخول: {contract['entry_high']:.2f} – {contract['entry_low']:.2f}
+🛑 الوقف: {contract['stop_text']}
+
+🎯 أهداف العقد:
+1️⃣ {contract['tp1']:.2f}
+2️⃣ {contract['tp2']:.2f}
+3️⃣ {contract['tp3']:.2f}
+
+📊 نسبة النجاح: <b>{contract['success_rate']}%</b>"""
