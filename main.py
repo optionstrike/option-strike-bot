@@ -1825,7 +1825,7 @@ def get_economic_calendar_cached(day_from: str, day_to: str):
     if cached is not None:
         return cached
 
-    rows = fmp_get("/economic-calendar", params={"from": day_from, "to": day_to})
+    rows = fmp_get("/economic-calendar", params={"from": day_from, "to": day_to})  # fixed endpoint
     if not isinstance(rows, list):
         rows = []
 
@@ -1977,17 +1977,23 @@ def get_earnings_for_date(date_str: str):
         return cached
 
     try:
-        data = massive_get("/benzinga/v1/earnings", params={"date": date_str, "limit": 1000})
-        results = data.get("results", []) or []
+        data = fmp_get("/earning_calendar", params={"from": date_str, "to": date_str})
+        results = data if isinstance(data, list) else []
         filtered = []
 
         for item in results:
-            ticker = (item.get("ticker") or "").upper().strip()
+            ticker = (item.get("symbol") or "").upper().strip()
             if not ticker or ticker not in WATCHLIST:
                 continue
 
             item["ticker"] = ticker
+            item["date"] = item.get("date", date_str)
+            item["time"] = item.get("time", "")
             item["session_label"] = classify_earnings_session(item.get("time", ""), item)
+            item["estimated_eps"] = item.get("epsEstimated")
+            item["previous_eps"] = item.get("eps")
+            item["estimated_revenue"] = item.get("revenueEstimated")
+            item["previous_revenue"] = item.get("revenue")
             filtered.append(item)
 
         filtered.sort(key=lambda x: (x.get("date", ""), x.get("time", "") or "99:99:99", x.get("ticker", "")))
