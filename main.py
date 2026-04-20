@@ -5,6 +5,7 @@ import pandas as pd
 import time
 import asyncio
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from deep_translator import GoogleTranslator
 
 app = FastAPI()
@@ -45,7 +46,7 @@ PROCESSED_UPDATES_TTL_SECONDS = 600
 MAX_SIGNALS_PER_DAY = 5
 STOCK_COOLDOWN_DAYS = 3
 TREND_CONFIRM_HOURS = 3
-SCAN_INTERVAL_SECONDS = 10800
+SCAN_INTERVAL_SECONDS = 3600
 
 # =========================
 # فلتر الدخول
@@ -92,6 +93,12 @@ INDEX_TICKERS = {"US500", "SPY", "QQQ", "SPX", "NDX", "US100"}
 
 MIN_DTE_DAYS = 1
 MAX_DTE_DAYS = 30
+INDEX_MAX_DTE_DAYS = 7
+
+MARKET_TZ = ZoneInfo("America/New_York")
+MARKET_OPEN_HOUR = 9
+MARKET_OPEN_MINUTE = 30
+NO_ENTRY_FIRST_MINUTES = 30
 
 # =========================
 # قائمة الأسهم
@@ -201,6 +208,22 @@ def stock_in_cooldown(ticker: str) -> bool:
 
 def mark_stock_sent(ticker: str):
     LAST_SENT_STOCK[ticker] = datetime.now()
+
+def is_in_no_entry_window():
+    now_et = datetime.now(MARKET_TZ)
+
+    if now_et.weekday() >= 5:
+        return False
+
+    market_open = now_et.replace(
+        hour=MARKET_OPEN_HOUR,
+        minute=MARKET_OPEN_MINUTE,
+        second=0,
+        microsecond=0
+    )
+    no_entry_end = market_open + timedelta(minutes=NO_ENTRY_FIRST_MINUTES)
+
+    return market_open <= now_et < no_entry_end
 
 # =========================
 # إرسال تلغرام
@@ -804,10 +827,11 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
                 continue
             if x["contract_price"] > limit_price:
                 continue
+
             dte = days_to_expiry(x["expiration"])
 
             if ticker in INDEX_TICKERS or is_spac_ticker(ticker):
-                if dte is None or dte != 0:
+                if dte is None or dte < 0 or dte > INDEX_MAX_DTE_DAYS:
                     continue
             else:
                 if dte is None or dte < MIN_DTE_DAYS or dte > MAX_DTE_DAYS:
@@ -817,7 +841,7 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
                 continue
             strike_distance_pct = abs(x["strike"] - underlying_price) / max(underlying_price, 1e-9)
             delta_score = abs(abs(x["delta"]) - 0.35)
-            dte_penalty = min(dte, 45) / 25
+            dte_penalty = min(max(dte, 0), 45) / 25
             score = (
                 strike_distance_pct * 22
                 + delta_score * 5
@@ -845,10 +869,11 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
                 continue
             if x["contract_price"] > limit_price:
                 continue
+
             dte = days_to_expiry(x["expiration"])
 
             if ticker in INDEX_TICKERS or is_spac_ticker(ticker):
-                if dte is None or dte != 0:
+                if dte is None or dte < 0 or dte > INDEX_MAX_DTE_DAYS:
                     continue
             else:
                 if dte is None or dte < MIN_DTE_DAYS or dte > MAX_DTE_DAYS:
@@ -876,10 +901,11 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
                 continue
             if x["contract_price"] is None or x["contract_price"] <= 0:
                 continue
+
             dte = days_to_expiry(x["expiration"])
 
             if ticker in INDEX_TICKERS or is_spac_ticker(ticker):
-                if dte is None or dte != 0:
+                if dte is None or dte < 0 or dte > INDEX_MAX_DTE_DAYS:
                     continue
             else:
                 if dte is None or dte < MIN_DTE_DAYS or dte > MAX_DTE_DAYS:
@@ -1290,6 +1316,10 @@ def get_live_contract_price(underlying: str, option_ticker: str):
 def scanner_cycle():
     reset_daily_counter_if_needed()
     if not can_send_more_today():
+        return
+
+    if is_in_no_entry_window():
+        print("[SCANNER] داخل أول نصف ساعة من الافتتاح - لا يوجد دخول حالياً")
         return
 
     results = []
