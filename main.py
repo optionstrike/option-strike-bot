@@ -12,7 +12,7 @@ app = FastAPI()
 # بياناتك
 # =========================
 
-TOKEN = "8619465902:AAEE0dvsBCneu6c2aQQnarRFI_Jzw8O7VRE"
+TOKEN = "8619465902:AAEEOdvsBCneu6c2aQQnarRFI_Jzw8O7VRE"
 CHAT_ID = "8371374055"
 MASSIVE_API_KEY = "AcbX3y7rKzou3MzUi8EVlETdYLFsVGa2"
 
