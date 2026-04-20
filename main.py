@@ -1,4 +1,4 @@
-FROM fastapi import FastAPI, Request
+from fastapi import FastAPI, Request
 import requests
 import yfinance as yf
 import pandas as pd
@@ -2748,4 +2748,3 @@ def home():
             "/start سريع وثابت"
         ]
     }
-
