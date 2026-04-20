@@ -5,6 +5,7 @@ import pandas as pd
 import time
 import asyncio
 from datetime import datetime, timedelta
+from deep_translator import GoogleTranslator
 
 app = FastAPI()
 
@@ -86,6 +87,11 @@ SPAC_TICKERS = {
     "SMCI", "ARM", "CRWD", "ENPH", "FSLR", "BE", "ALB", "SHOP", "PYPL",
     "BIDU", "PDD", "BABA", "LULU", "ULTA", "ADBE"
 }
+
+INDEX_TICKERS = {"US500", "SPY", "QQQ", "SPX", "NDX", "US100"}
+
+MIN_DTE_DAYS = 1
+MAX_DTE_DAYS = 30
 
 # =========================
 # قائمة الأسهم
@@ -249,6 +255,10 @@ def main_menu():
                 {"text": "💎 أفضل عقد", "callback_data": "contract"},
             ],
             [
+                {"text": "📂 العقود المفتوحة", "callback_data": "open_contracts"},
+                {"text": "📋 التقرير اليومي", "callback_data": "daily_report"},
+            ],
+            [
                 {"text": "📰 أخبار السوق", "callback_data": "news"},
                 {"text": "⚙️ تغيير الفريم", "callback_data": "tf"},
             ]
@@ -367,7 +377,12 @@ def format_news_message(ticker: str = None):
     msg = f"📰 <b>{label}</b>\n{'─' * 30}\n\n"
 
     for i, item in enumerate(news, 1):
-        title = item.get("title", "بدون عنوان")
+        title_en = item.get("title", "بدون عنوان")
+        try:
+            title = GoogleTranslator(source="auto", target="ar").translate(title_en)
+        except Exception:
+            title = title_en
+
         publisher = safe_get(item, "publisher", "name", default="")
         published = item.get("published_utc", "")
         url = item.get("article_url", "")
@@ -578,11 +593,11 @@ def core_metrics(df, ticker=None):
 
     call_tp1 = pivot + ref_range * 0.5
     call_tp2 = pivot + ref_range
-    call_tp3 = ref_high + ref_range * 0.5
+    call_tp3 = ref_high + ref_range
 
     put_tp1 = pivot - ref_range * 0.5
     put_tp2 = pivot - ref_range
-    put_tp3 = ref_low - ref_range * 0.5
+    put_tp3 = ref_low - ref_range
 
     pivot_diff = price - pivot
     if pivot_diff > 0:
@@ -646,6 +661,7 @@ def core_metrics(df, ticker=None):
         "ema20": ema20,
         "ema50": ema50
     }
+
 # =========================
 # القاما والسيولة
 # =========================
@@ -756,7 +772,7 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
                 if x["oi"] < ZERO_HERO_MIN_OI:
                     continue
                 dte = days_to_expiry(x["expiration"])
-                if dte is None or dte < 0 or dte > 3:
+                if dte is None or dte != 0:
                     continue
                 strike_distance_pct = abs(x["strike"] - underlying_price) / max(underlying_price, 1e-9)
                 delta_score = abs(abs(x["delta"]) - 0.30)
@@ -789,8 +805,14 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
             if x["contract_price"] > limit_price:
                 continue
             dte = days_to_expiry(x["expiration"])
-            if dte is None or dte < 0 or dte > 45:
-                continue
+
+            if ticker in INDEX_TICKERS or is_spac_ticker(ticker):
+                if dte is None or dte != 0:
+                    continue
+            else:
+                if dte is None or dte < MIN_DTE_DAYS or dte > MAX_DTE_DAYS:
+                    continue
+
             if x["oi"] < 10:
                 continue
             strike_distance_pct = abs(x["strike"] - underlying_price) / max(underlying_price, 1e-9)
@@ -824,8 +846,14 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
             if x["contract_price"] > limit_price:
                 continue
             dte = days_to_expiry(x["expiration"])
-            if dte is None or dte < 0:
-                continue
+
+            if ticker in INDEX_TICKERS or is_spac_ticker(ticker):
+                if dte is None or dte != 0:
+                    continue
+            else:
+                if dte is None or dte < MIN_DTE_DAYS or dte > MAX_DTE_DAYS:
+                    continue
+
             score = (
                 abs(x["contract_price"] - limit_price) * 1.5
                 - min(x["oi"], 100000) / 20000
@@ -849,8 +877,14 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
             if x["contract_price"] is None or x["contract_price"] <= 0:
                 continue
             dte = days_to_expiry(x["expiration"])
-            if dte is None or dte < 0:
-                continue
+
+            if ticker in INDEX_TICKERS or is_spac_ticker(ticker):
+                if dte is None or dte != 0:
+                    continue
+            else:
+                if dte is None or dte < MIN_DTE_DAYS or dte > MAX_DTE_DAYS:
+                    continue
+
             strike_distance_pct = abs(x["strike"] - underlying_price) / max(underlying_price, 1e-9)
             score = strike_distance_pct * 10 - min(x["oi"], 100000) / 20000
             stage3.append((score, x))
@@ -1142,6 +1176,56 @@ def msg_contract(tk, tf, c, contract):
 3️⃣ {contract['tp3']:.2f}
 
 📊 نسبة النجاح: <b>{contract['success_rate']}%</b>"""
+
+def msg_open_contracts():
+    if not OPEN_CONTRACT_SIGNALS:
+        return "📂 لا توجد عقود مفتوحة حالياً."
+
+    msg = "📂 <b>العقود المفتوحة</b>\n\n"
+
+    for i, (_, sig) in enumerate(OPEN_CONTRACT_SIGNALS.items(), 1):
+        msg += (
+            f"{i}. <b>{sig['ticker']}</b>\n"
+            f"العقد: <code>{sig['option_ticker']}</code>\n"
+            f"النوع: {'CALL' if sig['contract_type'] == 'call' else 'PUT'}\n"
+            f"سعر الدخول: {sig['entry_price']:.2f}\n"
+            f"أعلى سعر: {sig['highest_price']:.2f}\n"
+            f"TP1: {sig['tp1']:.2f} | TP2: {sig['tp2']:.2f} | TP3: {sig['tp3']:.2f}\n"
+            f"تم التحديث الأول: {'نعم' if sig['first_update_sent'] else 'لا'}\n"
+            f"وقت الإضافة: {sig['created_at'].strftime('%d/%m %H:%M')}\n\n"
+        )
+
+    return msg
+
+def msg_daily_report():
+    reset_daily_counter_if_needed()
+
+    msg = (
+        f"📋 <b>التقرير اليومي</b>\n\n"
+        f"📊 عدد الإشارات اليوم: {DAILY_SIGNAL_STATE['count']}/{MAX_SIGNALS_PER_DAY}\n"
+        f"📂 العقود المفتوحة حالياً: {len(OPEN_CONTRACT_SIGNALS)}\n"
+        f"📈 الأسهم في القائمة: {len(WATCHLIST)}\n\n"
+    )
+
+    if OPEN_CONTRACT_SIGNALS:
+        best_sig = max(
+            OPEN_CONTRACT_SIGNALS.values(),
+            key=lambda x: ((x['highest_price'] - x['entry_price']) / x['entry_price']) if x['entry_price'] > 0 else 0
+        )
+        best_pnl = ((best_sig["highest_price"] - best_sig["entry_price"]) / best_sig["entry_price"]) * 100 if best_sig["entry_price"] > 0 else 0
+
+        msg += (
+            f"🏆 <b>أفضل عقد اليوم</b>\n"
+            f"{best_sig['ticker']} | {'CALL' if best_sig['contract_type'] == 'call' else 'PUT'}\n"
+            f"سعر الدخول: {best_sig['entry_price']:.2f}\n"
+            f"أعلى سعر: {best_sig['highest_price']:.2f}\n"
+            f"نسبة الربح: {best_pnl:+.2f}%\n"
+        )
+    else:
+        msg += "ℹ️ لا توجد عقود مفتوحة لعرض أفضل أداء حالياً."
+
+    return msg
+
 # =========================
 # حالة المستخدم
 # =========================
@@ -1467,6 +1551,14 @@ async def webhook(req: Request):
 
             if data_cb == "back":
                 send("🏠 القائمة الرئيسية", main_menu(), chat_id=user)
+                return {"ok": True}
+
+            if data_cb == "open_contracts":
+                send(msg_open_contracts(), main_menu(), chat_id=user)
+                return {"ok": True}
+
+            if data_cb == "daily_report":
+                send(msg_daily_report(), main_menu(), chat_id=user)
                 return {"ok": True}
 
             if data_cb == "news":
