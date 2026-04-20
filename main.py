@@ -103,7 +103,7 @@ IMPORTANT_EVENT_KEYWORDS = [
 # =========================
 
 EARNINGS_LOOKAHEAD_DAYS = 7
-EARNINGS_MAX_BUTTONS = 20
+EARNINGS_MAX_BUTTONS = 100
 
 # =========================
 # زيرو هيرو
@@ -307,6 +307,7 @@ def round_price(x):
         return round(float(x), 2)
     except Exception:
         return x
+
 # =========================
 # FMP API (الأخبار الاقتصادية)
 # =========================
@@ -455,7 +456,7 @@ async def econ_news_loop():
         except Exception as e:
             print(f"[ECON LOOP ERROR] {e}")
 
-        await asyncio.sleep(60) 
+        await asyncio.sleep(60)
 # =========================
 # Massive / Polygon API
 # =========================
@@ -641,10 +642,24 @@ def days_to_expiry(expiration_str: str):
     except Exception:
         return None
 
-def derive_contract_targets_from_chart(option_ticker: str, contract_price: float):
+def derive_dynamic_target_fallbacks(contract_price: float):
     tp1 = round_price(contract_price + CONTRACT_TP1_ADD)
-    fallback_tp2 = round_price(contract_price + 1.20)
-    fallback_tp3 = round_price(contract_price + 1.80)
+
+    dynamic_add_2 = max(contract_price * 0.35, 0.90)
+    dynamic_add_3 = max(contract_price * 0.65, 1.50)
+
+    tp2 = round_price(contract_price + dynamic_add_2)
+    tp3 = round_price(contract_price + dynamic_add_3)
+
+    if tp2 <= tp1:
+        tp2 = round_price(tp1 + 0.25)
+    if tp3 <= tp2:
+        tp3 = round_price(tp2 + 0.35)
+
+    return tp1, tp2, tp3
+
+def derive_contract_targets_from_chart(option_ticker: str, contract_price: float):
+    tp1, fallback_tp2, fallback_tp3 = derive_dynamic_target_fallbacks(contract_price)
 
     bars = get_option_aggregate_bars(option_ticker, CONTRACT_TARGET_LOOKBACK_DAYS)
     if not bars:
@@ -669,8 +684,8 @@ def derive_contract_targets_from_chart(option_ticker: str, contract_price: float
 
     candidates = sorted(set(swings or highs))
 
-    min_tp2 = max(tp1 + CONTRACT_TARGET_MIN_GAP, contract_price + 0.70)
-    min_tp3 = max(min_tp2 + CONTRACT_TARGET_MIN_GAP, contract_price + 1.10)
+    min_tp2 = max(tp1 + CONTRACT_TARGET_MIN_GAP, round_price(contract_price + max(contract_price * 0.22, 0.55)))
+    min_tp3 = max(min_tp2 + CONTRACT_TARGET_MIN_GAP, round_price(contract_price + max(contract_price * 0.40, 0.95)))
 
     tp2 = next((x for x in candidates if x >= min_tp2), None)
     if tp2 is None:
@@ -687,7 +702,7 @@ def derive_contract_targets_from_chart(option_ticker: str, contract_price: float
     if tp2 <= tp1:
         tp2 = round_price(tp1 + CONTRACT_TARGET_MIN_GAP)
     if tp3 <= tp2:
-        tp3 = round_price(tp2 + CONTRACT_TARGET_MIN_GAP)
+        tp3 = round_price(tp2 + max(CONTRACT_TARGET_MIN_GAP, 0.20))
 
     return round_price(tp1), round_price(tp2), round_price(tp3)
 
@@ -914,7 +929,6 @@ def calc_success_rate(c: dict, o: dict, contract: dict):
         + (4 if abs(contract["delta"]) >= 0.20 else 0)
         + (5 if o["prob"] >= 65 else 0)
     )))
-
 # =========================
 # اختيار العقد
 # =========================
@@ -1134,7 +1148,8 @@ def is_entry_ready_now(c):
     )
 
     return near_entry or breakout_call or breakout_put
-   # =========================
+
+# =========================
 # تنسيق التاريخ
 # =========================
 
@@ -1306,7 +1321,6 @@ def msg_channel_post(tk, contract):
 والقرار النهائي يعود للمتداول
 
 📢 @Option_Strike01"""
-
 def msg_contract_update(title, entry_price, current_price):
     pnl = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
     emoji = "🚀" if pnl >= 50 else "📈" if pnl >= 0 else "📉"
@@ -1326,7 +1340,7 @@ def msg_gamma(tk, tf, c, o):
 
 🧲 القاما: {o['gamma']:.2f}
 📍 Magnet: {o['zlow']:.2f} - {o['zhigh']:.2f}
-📊 احتمال الوصول: <b>{o['prob']}%</b>
+📊 احتمال الوصول: <b>{o['prob']}</b>%
 
 💰 سيولة الكول: {o['call']:.2f}
 💸 سيولة البوت: {o['put']:.2f}
@@ -1752,7 +1766,6 @@ def get_live_contract_price(underlying: str, option_ticker: str):
     except Exception:
         pass
     return None
-
 # =========================
 # الأخبار الاقتصادية - تجهيز وعرض
 # =========================
@@ -1934,7 +1947,15 @@ def economic_alert_cycle():
 # إعلانات الشركات
 # =========================
 
-def classify_earnings_session(time_str: str):
+def classify_earnings_session(time_str: str, item: dict = None):
+    item = item or {}
+    raw_session = str(item.get("session", "") or item.get("timing", "") or item.get("when", "")).strip().lower()
+
+    if raw_session in {"bmo", "before market", "before open", "pre-market", "premarket"}:
+        return "قبل الافتتاح"
+    if raw_session in {"amc", "after market", "after close", "post-market", "postmarket"}:
+        return "بعد الإغلاق"
+
     if not time_str:
         return "غير محدد"
 
@@ -1956,7 +1977,7 @@ def get_earnings_for_date(date_str: str):
         return cached
 
     try:
-        data = massive_get("/benzinga/v1/earnings", params={"date": date_str, "limit": 500})
+        data = massive_get("/benzinga/v1/earnings", params={"date": date_str, "limit": 1000})
         results = data.get("results", []) or []
         filtered = []
 
@@ -1966,7 +1987,7 @@ def get_earnings_for_date(date_str: str):
                 continue
 
             item["ticker"] = ticker
-            item["session_label"] = classify_earnings_session(item.get("time", ""))
+            item["session_label"] = classify_earnings_session(item.get("time", ""), item)
             filtered.append(item)
 
         filtered.sort(key=lambda x: (x.get("date", ""), x.get("time", "") or "99:99:99", x.get("ticker", "")))
@@ -2030,7 +2051,7 @@ def scanner_cycle():
             if stock_in_cooldown(ticker):
                 continue
 
-                df = get_df(ticker, "1h")
+            df = get_df(ticker, "1h")
             if df.empty or len(df) < 20:
                 continue
 
@@ -2136,7 +2157,8 @@ async def startup_event():
     asyncio.create_task(scanner_loop())
     asyncio.create_task(contract_update_loop())
     asyncio.create_task(economic_alert_loop())
-    send("✅ البوت شغال ومتصل!\n🔍 الصياد يبدأ بعد 10 ثواني…", chat_id=CHAT_ID) 
+    send("✅ البوت شغال ومتصل!\n🔍 الصياد يبدأ بعد 10 ثواني…", chat_id=CHAT_ID)
+
 # =========================
 # لوحة الأزرار الرئيسية
 # =========================
