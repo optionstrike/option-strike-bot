@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request
+FROM fastapi import FastAPI, Request
 import requests
 import yfinance as yf
 import pandas as pd
@@ -50,13 +50,16 @@ EARNINGS_CACHE_TTL_SECONDS = 600
 ECON_CACHE = {}
 ECON_CACHE_TTL_SECONDS = 300
 
+NEWS_CACHE = {}
+NEWS_CACHE_TTL_SECONDS = 900
+
 # =========================
 # إعدادات الصياد
 # =========================
 
 MAX_SIGNALS_PER_DAY = 5
 STOCK_COOLDOWN_DAYS = 3
-TREND_CONFIRM_HOURS = 3
+TREND_CONFIRM_HOURS = 1
 SCAN_INTERVAL_SECONDS = 3600
 
 # =========================
@@ -340,10 +343,16 @@ def get_economic_calendar():
         today = datetime.now().strftime("%Y-%m-%d")
         future = (datetime.now() + timedelta(days=3)).strftime("%Y-%m-%d")
 
-        data = fmp_get("/economic_calendar", {
+        data = fmp_get("/economic-calendar", {
             "from": today,
             "to": future
         })
+
+        if not isinstance(data, list) or not data:
+            data = fmp_get("/economic_calendar", {
+                "from": today,
+                "to": future
+            })
 
         if isinstance(data, list):
             set_cached_item(ECON_CACHE, cache_key, data)
@@ -472,6 +481,83 @@ def massive_get(path: str, params=None):
     except Exception as e:
         print(f"[API ERROR] {path}: {e}")
         return {}
+
+def strip_html_tags(text_value):
+    try:
+        import re
+        return re.sub(r"<[^>]+>", "", str(text_value or "")).replace("&nbsp;", " ").strip()
+    except Exception:
+        return str(text_value or "").strip()
+
+def get_stock_news(ticker: str, limit: int = 3):
+    key = f"news:{ticker}:{limit}"
+    cached = get_cached_item(NEWS_CACHE, NEWS_CACHE_TTL_SECONDS, key)
+    if cached is not None:
+        return cached
+
+    rows = []
+    try:
+        data = massive_get("/v2/reference/news", params={"ticker": ticker, "limit": max(limit, 1), "order": "desc", "sort": "published_utc"})
+        rows = data.get("results", []) or []
+    except Exception as e:
+        print(f"[NEWS ERROR] {ticker}: {e}")
+        rows = []
+
+    cleaned = []
+    for item in rows[:limit]:
+        title = strip_html_tags(item.get("title") or item.get("headline") or item.get("description") or "")
+        published = item.get("published_utc") or item.get("publishedAt") or item.get("published") or ""
+        publisher = safe_get(item, "publisher", "name", default="") or item.get("publisher") or ""
+        if title:
+            cleaned.append({
+                "title": title,
+                "published": published,
+                "publisher": strip_html_tags(publisher),
+            })
+
+    set_cached_item(NEWS_CACHE, key, cleaned)
+    return cleaned
+
+def format_news_brief(news_rows):
+    if not news_rows:
+        return "لا توجد أخبار حديثة"
+
+    parts = []
+    for item in news_rows[:2]:
+        title = strip_html_tags(item.get("title", ""))
+        published = str(item.get("published", ""))
+        try:
+            dt = datetime.fromisoformat(published.replace("Z", "+00:00")).astimezone(RIYADH_TZ)
+            published_label = dt.strftime("%d/%m %H:%M")
+        except Exception:
+            published_label = published[:16] if published else ""
+
+        publisher = item.get("publisher", "")
+        line = title
+        extra = " | ".join([x for x in [publisher, published_label] if x])
+        if extra:
+            line += f" ({extra})"
+        parts.append(f"• {line}")
+
+    return "\n".join(parts) if parts else "لا توجد أخبار حديثة"
+
+def format_earnings_brief(event):
+    if not event:
+        return "لا يوجد إعلان قريب هذا الأسبوع"
+
+    date_str = event.get("date") or "غير محدد"
+    session_label = event.get("session_label") or classify_earnings_session(event.get("time", ""), event)
+    eps_est = event.get("eps_estimate") or event.get("eps") or event.get("epsEstimated") or ""
+    rev_est = event.get("revenue_estimate") or event.get("revenue") or event.get("revenueEstimated") or ""
+
+    extra = []
+    if eps_est not in [None, ""]:
+        extra.append(f"EPS: {eps_est}")
+    if rev_est not in [None, ""]:
+        extra.append(f"Rev: {rev_est}")
+
+    suffix = f" | {' | '.join(extra)}" if extra else ""
+    return f"{format_arabic_date(date_str)} | {session_label}{suffix}"
 
 def safe_get(d, *keys, default=None):
     cur = d
@@ -734,14 +820,14 @@ def build_contract_from_pick(best, c, target_type, mode="NORMAL"):
 
 def get_confirmed_side_hourly(ticker: str, pivot: float):
     df_1h = get_df(ticker, "1h")
-    if df_1h.empty or len(df_1h) < 3:
+    if df_1h.empty or len(df_1h) < 1:
         return "neutral"
 
-    closes = df_1h["Close"].tail(3)
+    last_close = float(df_1h["Close"].iloc[-1])
 
-    if all(closes > pivot):
+    if last_close > pivot:
         side = "above"
-    elif all(closes < pivot):
+    elif last_close < pivot:
         side = "below"
     else:
         side = "neutral"
@@ -1291,7 +1377,13 @@ Magnet: {o['zlow']:.2f} - {o['zhigh']:.2f}
 🛑 الوقف: {contract['stop_text']}
 📊 نسبة النجاح: <b>{contract['success_rate']}%</b>
 Δ Delta: {contract['delta']:.2f} | Γ Gamma: {contract['gamma']:.4f}
-IV: {contract['iv']:.4f} | OI: {contract['oi']}"""
+IV: {contract['iv']:.4f} | OI: {contract['oi']}
+
+📰 آخر الأخبار:
+{format_news_brief(contract.get('news_items', []))}
+
+📆 الإعلان القادم:
+{format_earnings_brief(contract.get('earnings_event'))}"""
 
 def msg_channel_post(tk, contract):
     type_ar = "CALL" if contract["contract_type"] == "call" else "PUT"
@@ -1316,6 +1408,12 @@ def msg_channel_post(tk, contract):
 
 🛑 الوقف: {contract['stop_text']}
 📊 نسبة النجاح: <b>{contract['success_rate']}%</b>
+
+📰 آخر الأخبار:
+{format_news_brief(contract.get('news_items', []))}
+
+📆 الإعلان القادم:
+{format_earnings_brief(contract.get('earnings_event'))}
 
 ⚠️ تنبيه: هذا الطرح تعليمي
 والقرار النهائي يعود للمتداول
@@ -1825,7 +1923,9 @@ def get_economic_calendar_cached(day_from: str, day_to: str):
     if cached is not None:
         return cached
 
-    rows = fmp_get("/economic-calendar", params={"from": day_from, "to": day_to})  # fixed endpoint
+    rows = fmp_get("/economic-calendar", params={"from": day_from, "to": day_to})
+    if not isinstance(rows, list) or not rows:
+        rows = fmp_get("/economic_calendar", params={"from": day_from, "to": day_to})
     if not isinstance(rows, list):
         rows = []
 
@@ -1977,23 +2077,17 @@ def get_earnings_for_date(date_str: str):
         return cached
 
     try:
-        data = fmp_get("/earning_calendar", params={"from": date_str, "to": date_str})
-        results = data if isinstance(data, list) else []
+        data = massive_get("/benzinga/v1/earnings", params={"date": date_str, "limit": 1000})
+        results = data.get("results", []) or []
         filtered = []
 
         for item in results:
-            ticker = (item.get("symbol") or "").upper().strip()
+            ticker = (item.get("ticker") or "").upper().strip()
             if not ticker or ticker not in WATCHLIST:
                 continue
 
             item["ticker"] = ticker
-            item["date"] = item.get("date", date_str)
-            item["time"] = item.get("time", "")
             item["session_label"] = classify_earnings_session(item.get("time", ""), item)
-            item["estimated_eps"] = item.get("epsEstimated")
-            item["previous_eps"] = item.get("eps")
-            item["estimated_revenue"] = item.get("revenueEstimated")
-            item["previous_revenue"] = item.get("revenue")
             filtered.append(item)
 
         filtered.sort(key=lambda x: (x.get("date", ""), x.get("time", "") or "99:99:99", x.get("ticker", "")))
@@ -2076,6 +2170,11 @@ def scanner_cycle():
             score = calc_score(c, o)
             if score < 60:
                 continue
+
+            news_items = get_stock_news(ticker, limit=3)
+            earnings_event = get_ticker_earnings_event_in_week(ticker)
+            contract["news_items"] = news_items
+            contract["earnings_event"] = earnings_event
 
             results.append((ticker, score, c, o, contract))
 
@@ -2649,3 +2748,4 @@ def home():
             "/start سريع وثابت"
         ]
     }
+
