@@ -22,6 +22,22 @@ API_ANSWER = f"https://api.telegram.org/bot{TOKEN}/answerCallbackQuery"
 MASSIVE_BASE = "https://api.polygon.io"
 
 # =========================
+# حماية الويب هوك
+# =========================
+
+TELEGRAM_SECRET_TOKEN = "OPTION_STRIKE_SECRET_2026_555"
+
+# =========================
+# كاش + منع تكرار التحديثات
+# =========================
+
+ANALYSIS_CACHE = {}
+ANALYSIS_CACHE_TTL_SECONDS = 45
+
+PROCESSED_UPDATES = {}
+PROCESSED_UPDATES_TTL_SECONDS = 600
+
+# =========================
 # إعدادات الصياد
 # =========================
 
@@ -102,6 +118,61 @@ DAILY_SIGNAL_STATE = {
 
 OPEN_CONTRACT_SIGNALS = {}
 
+# =========================
+# أدوات حماية ومساعدة
+# =========================
+
+def cleanup_processed_updates():
+    now = datetime.now()
+    for key in list(PROCESSED_UPDATES.keys()):
+        if now - PROCESSED_UPDATES[key] > timedelta(seconds=PROCESSED_UPDATES_TTL_SECONDS):
+            del PROCESSED_UPDATES[key]
+
+def is_duplicate_update(update_id):
+    if update_id is None:
+        return False
+    cleanup_processed_updates()
+    if update_id in PROCESSED_UPDATES:
+        return True
+    PROCESSED_UPDATES[update_id] = datetime.now()
+    return False
+
+def cleanup_analysis_cache():
+    now = datetime.now()
+    for key in list(ANALYSIS_CACHE.keys()):
+        cached = ANALYSIS_CACHE[key]
+        if now - cached["ts"] > timedelta(seconds=ANALYSIS_CACHE_TTL_SECONDS):
+            del ANALYSIS_CACHE[key]
+
+def get_cached_analysis(ticker: str, tf: str):
+    cleanup_analysis_cache()
+    key = f"{ticker}|{tf}"
+    cached = ANALYSIS_CACHE.get(key)
+    if not cached:
+        return None
+    return cached["value"]
+
+def set_cached_analysis(ticker: str, tf: str, value):
+    ANALYSIS_CACHE[f"{ticker}|{tf}"] = {
+        "ts": datetime.now(),
+        "value": value
+    }
+
+def request_has_valid_secret(req: Request):
+    secret_header = req.headers.get("x-telegram-bot-api-secret-token", "")
+    return secret_header == TELEGRAM_SECRET_TOKEN
+
+def looks_like_telegram_update(data):
+    if not isinstance(data, dict):
+        return False
+    if "update_id" in data:
+        return True
+    if "message" in data:
+        return True
+    if "callback_query" in data:
+        return True
+    return False
+
 def reset_daily_counter_if_needed():
     today = datetime.now().date()
     if DAILY_SIGNAL_STATE["date"] != today:
@@ -157,6 +228,7 @@ def answer_callback(cb_id, text=""):
         }, timeout=10)
     except Exception as e:
         print(f"[CALLBACK ERROR] {e}")
+
 # =========================
 # لوحة الأزرار الرئيسية
 # =========================
@@ -1245,8 +1317,14 @@ async def startup_event():
 # مساعد لتحليل السهم
 # =========================
 
-async def analyze_ticker(ticker: str, tf: str, user: str):
-    send(f"⏳ جاري تحليل <b>{ticker}</b> على فريم {tf}…", chat_id=user)
+async def analyze_ticker(ticker: str, tf: str, user: str, announce: bool = True, use_cache: bool = True):
+    if use_cache:
+        cached = get_cached_analysis(ticker, tf)
+        if cached:
+            return cached
+
+    if announce:
+        send(f"⏳ جاري تحليل <b>{ticker}</b> على فريم {tf}…", chat_id=user)
 
     df = await asyncio.to_thread(get_df, ticker, tf)
     if df.empty:
@@ -1277,7 +1355,9 @@ async def analyze_ticker(ticker: str, tf: str, user: str):
     except Exception:
         contract = None
 
-    return c, o, contract
+    result = (c, o, contract)
+    set_cached_analysis(ticker, tf, result)
+    return result
 
 # =========================
 # Webhook
@@ -1290,11 +1370,25 @@ async def webhook(req: Request):
     except Exception:
         return {"ok": True}
 
+    if not request_has_valid_secret(req):
+        print("[WEBHOOK BLOCKED] Invalid Telegram secret token")
+        return {"ok": True}
+
+    if not looks_like_telegram_update(data):
+        print("[WEBHOOK BLOCKED] Invalid update shape")
+        return {"ok": True}
+
+    if is_duplicate_update(data.get("update_id")):
+        return {"ok": True}
+
     try:
         if "message" in data:
             msg = data["message"]
             text = msg.get("text", "").strip()
             user = str(msg["chat"]["id"])
+
+            if msg.get("from", {}).get("is_bot"):
+                return {"ok": True}
 
             if text == "/start":
                 set_state(user, ticker=None, tf="1d")
@@ -1334,7 +1428,7 @@ async def webhook(req: Request):
 
             set_state(user, ticker=ticker, tf=tf)
 
-            c, o, contract = await analyze_ticker(ticker, tf, user)
+            c, o, contract = await analyze_ticker(ticker, tf, user, announce=True, use_cache=True)
             if c is None:
                 return {"ok": True}
 
@@ -1347,7 +1441,7 @@ async def webhook(req: Request):
             data_cb = cb.get("data", "")
             cb_id = cb.get("id")
 
-            answer_callback(cb_id)
+            answer_callback(cb_id, "جارٍ التنفيذ...")
 
             st = get_state(user)
             ticker = st.get("ticker")
@@ -1359,11 +1453,16 @@ async def webhook(req: Request):
 
             if data_cb.startswith("settf:"):
                 new_tf = data_cb.split(":")[1]
+                if new_tf not in TF:
+                    send("❌ هذا الفريم غير مدعوم", main_menu(), chat_id=user)
+                    return {"ok": True}
+
                 set_state(user, tf=new_tf)
                 tf = new_tf
+
                 if ticker:
                     send(f"✅ تم تغيير الفريم إلى <b>{new_tf}</b>\n⏳ جاري إعادة التحليل...", chat_id=user)
-                    c, o, contract = await analyze_ticker(ticker, tf, user)
+                    c, o, contract = await analyze_ticker(ticker, tf, user, announce=False, use_cache=False)
                     if c:
                         send(msg_pro(ticker, tf, c, o, contract), main_menu(), chat_id=user)
                 else:
@@ -1388,7 +1487,7 @@ async def webhook(req: Request):
                 send(f"❌ السهم <b>{ticker}</b> غير موجود في القائمة", chat_id=user)
                 return {"ok": True}
 
-            c, o, contract = await analyze_ticker(ticker, tf, user)
+            c, o, contract = await analyze_ticker(ticker, tf, user, announce=False, use_cache=True)
             if c is None:
                 return {"ok": True}
 
@@ -1404,6 +1503,8 @@ async def webhook(req: Request):
                 send(msg_plan(ticker, tf, c), main_menu(), chat_id=user)
             elif data_cb == "contract":
                 send(msg_contract(ticker, tf, c, contract), main_menu(), chat_id=user)
+            else:
+                send("❌ الزر غير معروف أو غير مربوط بشكل صحيح", main_menu(), chat_id=user)
 
             return {"ok": True}
 
