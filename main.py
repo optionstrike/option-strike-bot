@@ -1142,3 +1142,407 @@ def msg_contract(tk, tf, c, contract):
 3️⃣ {contract['tp3']:.2f}
 
 📊 نسبة النجاح: <b>{contract['success_rate']}%</b>"""
+# =========================
+# حالة المستخدم
+# =========================
+
+STATE = {}
+
+def set_state(user, ticker=None, tf=None):
+    s = STATE.get(user, {"ticker": None, "tf": "1d"})
+    if ticker is not None:
+        s["ticker"] = ticker
+    if tf is not None:
+        s["tf"] = tf
+    STATE[user] = s
+
+def get_state(user):
+    return STATE.get(user, {"ticker": None, "tf": "1d"})
+
+# =========================
+# تسجيل العقد
+# =========================
+
+def register_contract_signal(ticker: str, contract: dict):
+    key = contract["option_ticker"]
+    OPEN_CONTRACT_SIGNALS[key] = {
+        "ticker": ticker,
+        "option_ticker": contract["option_ticker"],
+        "contract_type": contract["contract_type"],
+        "strike": contract["strike"],
+        "expiration": contract["expiration"],
+        "entry_price": contract["contract_price"],
+        "highest_price": contract["contract_price"],
+        "tp1": contract["tp1"],
+        "tp2": contract["tp2"],
+        "tp3": contract["tp3"],
+        "first_update_sent": False,
+        "last_update_trigger_price": contract["tp1"],
+        "created_at": datetime.now(),
+        "channel_title": f"{ticker} ${contract['strike']:.2f} {'كول' if contract['contract_type'] == 'call' else 'بوت'}"
+    }
+
+def get_live_contract_price(underlying: str, option_ticker: str):
+    try:
+        snap = get_option_contract_snapshot(underlying, option_ticker)
+        price = parse_contract_price_from_snapshot(snap)
+        if price is not None:
+            return float(price)
+    except Exception:
+        pass
+    try:
+        lt = get_option_last_trade(option_ticker)
+        p = lt.get("p") or lt.get("price")
+        if p is not None:
+            return float(p)
+    except Exception:
+        pass
+    return None
+
+# =========================
+# دورة الصياد
+# =========================
+
+def scanner_cycle():
+    reset_daily_counter_if_needed()
+    if not can_send_more_today():
+        return
+
+    results = []
+
+    for ticker in WATCHLIST:
+        try:
+            if stock_in_cooldown(ticker):
+                continue
+
+            df = get_df(ticker, "1h")
+            if df.empty or len(df) < 20:
+                continue
+
+            c = core_metrics(df, ticker=ticker)
+            if c is None:
+                continue
+
+            if not is_entry_ready_now(c):
+                continue
+
+            o = options_info_from_massive(ticker, c["price"])
+            contract = choose_best_contract_from_massive(ticker, c, o)
+            if not contract:
+                continue
+
+            score = calc_score(c, o)
+            if score < 60:
+                continue
+
+            results.append((ticker, score, c, o, contract))
+
+        except Exception as e:
+            print(f"[SCANNER ITEM ERROR] {ticker}: {e}")
+            continue
+
+    results.sort(key=lambda x: x[1], reverse=True)
+
+    sent_now = 0
+    for ticker, score, c, o, contract in results:
+        if not can_send_more_today():
+            break
+        if stock_in_cooldown(ticker):
+            continue
+
+        send(msg_pro(ticker, "1h", c, o, contract), chat_id=CHAT_ID)
+        time.sleep(1)
+        send(msg_channel_post(ticker, contract), chat_id=CHAT_ID)
+
+        register_contract_signal(ticker, contract)
+        mark_stock_sent(ticker)
+        add_daily_signal()
+        sent_now += 1
+
+        if sent_now >= MAX_SIGNALS_PER_DAY:
+            break
+
+def contract_update_cycle():
+    for option_ticker, sig in list(OPEN_CONTRACT_SIGNALS.items()):
+        try:
+            price = get_live_contract_price(sig["ticker"], option_ticker)
+            if price is None:
+                continue
+
+            if price > sig["highest_price"]:
+                sig["highest_price"] = price
+
+            if (not sig["first_update_sent"]) and price >= sig["tp1"]:
+                send(msg_contract_update(sig["channel_title"], sig["entry_price"], price), chat_id=CHAT_ID)
+                sig["first_update_sent"] = True
+                sig["last_update_trigger_price"] = price
+                continue
+
+            if sig["first_update_sent"] and price >= sig["last_update_trigger_price"] + UPDATE_STEP_AFTER_TP1:
+                send(msg_contract_update(sig["channel_title"], sig["entry_price"], price), chat_id=CHAT_ID)
+                sig["last_update_trigger_price"] = price
+
+        except Exception as e:
+            print(f"[CONTRACT UPDATE ERROR] {option_ticker}: {e}")
+
+async def contract_update_loop():
+    await asyncio.sleep(20)
+    while True:
+        try:
+            await asyncio.to_thread(contract_update_cycle)
+        except Exception as e:
+            send(f"❌ خطأ في متابعة العقود: {str(e)}", chat_id=CHAT_ID)
+        await asyncio.sleep(300)
+
+async def scanner_loop():
+    await asyncio.sleep(10)
+    while True:
+        try:
+            await asyncio.to_thread(scanner_cycle)
+        except Exception as e:
+            send(f"❌ خطأ في الصياد: {str(e)}", chat_id=CHAT_ID)
+        await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(scanner_loop())
+    asyncio.create_task(contract_update_loop())
+    send("✅ البوت شغال ومتصل!\n🔍 الصياد يبدأ بعد 10 ثواني…", chat_id=CHAT_ID)
+
+# =========================
+# مساعد لتحليل السهم
+# =========================
+
+async def analyze_ticker(ticker: str, tf: str, user: str, announce: bool = True, use_cache: bool = True):
+    if use_cache:
+        cached = get_cached_analysis(ticker, tf)
+        if cached:
+            return cached
+
+    if announce:
+        send(f"⏳ جاري تحليل <b>{ticker}</b> على فريم {tf}…", chat_id=user)
+
+    df = await asyncio.to_thread(get_df, ticker, tf)
+    if df.empty:
+        send("❌ لا توجد بيانات لهذا السهم", chat_id=user)
+        return None, None, None
+
+    c = await asyncio.to_thread(core_metrics, df, ticker)
+    if c is None:
+        send("❌ تعذر حساب الارتكاز لهذا الأصل", chat_id=user)
+        return None, None, None
+
+    try:
+        o = await asyncio.wait_for(
+            asyncio.to_thread(options_info_from_massive, ticker, c["price"]),
+            timeout=12
+        )
+    except Exception:
+        o = {
+            "call": c["price"], "put": c["price"], "gamma": c["price"],
+            "zlow": c["price"], "zhigh": c["price"], "prob": 50, "liq": "—"
+        }
+
+    try:
+        contract = await asyncio.wait_for(
+            asyncio.to_thread(choose_best_contract_from_massive, ticker, c, o),
+            timeout=15
+        )
+    except Exception:
+        contract = None
+
+    result = (c, o, contract)
+    set_cached_analysis(ticker, tf, result)
+    return result
+
+# =========================
+# Webhook
+# =========================
+
+@app.post("/")
+async def webhook(req: Request):
+    try:
+        data = await req.json()
+    except Exception:
+        return {"ok": True}
+
+    if not request_has_valid_secret(req):
+        print("[WEBHOOK BLOCKED] Invalid Telegram secret token")
+        return {"ok": True}
+
+    if not looks_like_telegram_update(data):
+        print("[WEBHOOK BLOCKED] Invalid update shape")
+        return {"ok": True}
+
+    if is_duplicate_update(data.get("update_id")):
+        return {"ok": True}
+
+    try:
+        if "message" in data:
+            msg = data["message"]
+            text = msg.get("text", "").strip()
+            user = str(msg["chat"]["id"])
+
+            if msg.get("from", {}).get("is_bot"):
+                return {"ok": True}
+
+            if text == "/start":
+                set_state(user, ticker=None, tf="1d")
+                send(
+                    "👋 أهلاً بك في بوت التداول!\n\n"
+                    "📌 أرسل رمز السهم مثل: <code>NVDA</code> أو <code>AAPL</code>\n"
+                    "ثم اضغط على أي زر من القائمة 👇",
+                    main_menu(),
+                    chat_id=user
+                )
+                return {"ok": True}
+
+            if text == "/test":
+                send("✅ البوت شغال 100%\n🔗 متصل بـ Polygon API", chat_id=user)
+                return {"ok": True}
+
+            if text == "/scan":
+                send("🔍 جاري تشغيل الصياد يدوياً...", chat_id=user)
+                await asyncio.to_thread(scanner_cycle)
+                return {"ok": True}
+
+            if not text:
+                send("❌ أرسل رمز سهم صحيح مثل: <code>NVDA</code>", chat_id=user)
+                return {"ok": True}
+
+            parts = text.upper().split()
+            ticker = parts[0]
+            tf = parts[1].lower() if len(parts) > 1 else get_state(user)["tf"]
+
+            if ticker not in WATCHLIST:
+                send(f"❌ السهم <b>{ticker}</b> غير موجود في القائمة\n\nأمثلة: NVDA, AAPL, TSLA, SPY", chat_id=user)
+                return {"ok": True}
+
+            if tf not in TF:
+                send("❌ الفريم غير مدعوم. الفريمات: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w", chat_id=user)
+                return {"ok": True}
+
+            set_state(user, ticker=ticker, tf=tf)
+
+            c, o, contract = await analyze_ticker(ticker, tf, user, announce=True, use_cache=True)
+            if c is None:
+                return {"ok": True}
+
+            send(msg_pro(ticker, tf, c, o, contract), main_menu(), chat_id=user)
+            return {"ok": True}
+
+        if "callback_query" in data:
+            cb = data["callback_query"]
+            user = str(cb["message"]["chat"]["id"])
+            data_cb = cb.get("data", "")
+            cb_id = cb.get("id")
+
+            answer_callback(cb_id, "جارٍ التنفيذ...")
+
+            st = get_state(user)
+            ticker = st.get("ticker")
+            tf = st.get("tf", "1d")
+
+            if data_cb == "tf":
+                send("⚙️ اختر الفريم الزمني 👇", tf_menu(), chat_id=user)
+                return {"ok": True}
+
+            if data_cb.startswith("settf:"):
+                new_tf = data_cb.split(":")[1]
+                if new_tf not in TF:
+                    send("❌ هذا الفريم غير مدعوم", main_menu(), chat_id=user)
+                    return {"ok": True}
+
+                set_state(user, tf=new_tf)
+                tf = new_tf
+
+                if ticker:
+                    send(f"✅ تم تغيير الفريم إلى <b>{new_tf}</b>\n⏳ جاري إعادة التحليل...", chat_id=user)
+                    c, o, contract = await analyze_ticker(ticker, tf, user, announce=False, use_cache=False)
+                    if c:
+                        send(msg_pro(ticker, tf, c, o, contract), main_menu(), chat_id=user)
+                else:
+                    send(f"✅ تم تغيير الفريم إلى <b>{new_tf}</b>\n\nأرسل رمز السهم الآن 👇", main_menu(), chat_id=user)
+                return {"ok": True}
+
+            if data_cb == "back":
+                send("🏠 القائمة الرئيسية", main_menu(), chat_id=user)
+                return {"ok": True}
+
+            if data_cb == "news":
+                send("⏳ جاري تحميل الأخبار...", chat_id=user)
+                news_msg = await asyncio.to_thread(format_news_message, ticker)
+                send(news_msg, main_menu(), chat_id=user)
+                return {"ok": True}
+
+            if not ticker:
+                send("❗ أرسل رمز السهم أولاً مثل: <code>NVDA</code>\nثم اضغط الزر مرة ثانية", main_menu(), chat_id=user)
+                return {"ok": True}
+
+            if ticker not in WATCHLIST:
+                send(f"❌ السهم <b>{ticker}</b> غير موجود في القائمة", chat_id=user)
+                return {"ok": True}
+
+            c, o, contract = await analyze_ticker(ticker, tf, user, announce=False, use_cache=True)
+            if c is None:
+                return {"ok": True}
+
+            if data_cb == "quick":
+                send(msg_quick(ticker, tf, c), main_menu(), chat_id=user)
+            elif data_cb == "pro":
+                send(msg_pro(ticker, tf, c, o, contract), main_menu(), chat_id=user)
+            elif data_cb == "gamma":
+                send(msg_gamma(ticker, tf, c, o), main_menu(), chat_id=user)
+            elif data_cb == "sr":
+                send(msg_sr(ticker, tf, c), main_menu(), chat_id=user)
+            elif data_cb == "plan":
+                send(msg_plan(ticker, tf, c), main_menu(), chat_id=user)
+            elif data_cb == "contract":
+                send(msg_contract(ticker, tf, c, contract), main_menu(), chat_id=user)
+            else:
+                send("❌ الزر غير معروف أو غير مربوط بشكل صحيح", main_menu(), chat_id=user)
+
+            return {"ok": True}
+
+    except Exception as e:
+        try:
+            err_user = None
+            if "message" in data:
+                err_user = str(data["message"]["chat"]["id"])
+            elif "callback_query" in data:
+                err_user = str(data["callback_query"]["message"]["chat"]["id"])
+            if err_user:
+                send(f"❌ خطأ: {str(e)}", chat_id=err_user)
+        except Exception:
+            pass
+        print(f"[WEBHOOK ERROR] {e}")
+
+    return {"ok": True}
+
+# =========================
+# حالة السيرفر
+# =========================
+
+@app.get("/")
+def home():
+    return {
+        "status": "LIVE ✅",
+        "api": "Polygon.io",
+        "watchlist_count": len(WATCHLIST),
+        "daily_limit": MAX_SIGNALS_PER_DAY,
+        "stock_cooldown_days": STOCK_COOLDOWN_DAYS,
+        "trend_confirm_hours": TREND_CONFIRM_HOURS,
+        "max_company_contract_price": MAX_COMPANY_CONTRACT_PRICE,
+        "max_spac_contract_price": MAX_SPAC_CONTRACT_PRICE,
+        "friday_zero_hero_enabled": FRIDAY_ZERO_HERO_ENABLED,
+        "zero_hero_price_range": f"{ZERO_HERO_MIN_PRICE} - {ZERO_HERO_MAX_PRICE}",
+        "features": [
+            "أهداف CALL و PUT منفصلة",
+            "أخبار السوق",
+            "جميع الفريمات",
+            "زيرو هيرو الجمعة",
+            "صياد 5 شركات يومياً",
+            "عقود لجميع الأسهم",
+            "جميع الأزرار تعمل"
+        ]
+    }
