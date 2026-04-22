@@ -9,7 +9,6 @@ from zoneinfo import ZoneInfo
 from typing import Optional, List, Dict, Any
 
 import requests
-from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
@@ -22,7 +21,6 @@ from telegram.ext import (
 # ─────────────────────────────────────────
 # إعدادات عامة
 # ─────────────────────────────────────────
-load_dotenv()
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
