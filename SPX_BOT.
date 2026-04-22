@@ -30,7 +30,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("spx_bot")
 
-TOKEN = "8619465902:AAHPP9AFiL0fV1lejKtaThLlQ4qZ6qCYgX0"
+TOKEN = "8733160640:AAHbA38rl-VBX0lC8sw6juUSbFwSs9sLuoU"
 CHAT_ID = "8371374055"
 MASSIVE_API_KEY = "AcbX3y7rKzou3MzUi8EVlETdYLFsVGa2"
 
