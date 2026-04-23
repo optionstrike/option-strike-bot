@@ -1,97 +1,187 @@
-# spx_bot.py
 
-import os
-import json
-import logging
+"""
+Bot SPX / SPXW
+----------------
+FastAPI bot for Telegram + Polygon/Massive market data.
+
+IMPORTANT:
+- Put secrets in environment variables, not inside this file.
+- This script is intentionally defensive and logs gracefully.
+- Direction model uses a configurable market proxy symbol (default: SPY)
+  and executes on SPX index options (underlying: I:SPX).
+
+Required env vars:
+    TELEGRAM_BOT_TOKEN=...
+    TELEGRAM_CHAT_ID=...
+    MARKET_API_KEY=...
+
+Optional env vars:
+    APP_HOST=0.0.0.0
+    APP_PORT=8000
+    TIMEZONE=Asia/Riyadh
+    MARKET_DIRECTION_SYMBOL=SPY
+    OPTIONS_UNDERLYING=I:SPX
+    STRATEGY_MIN_PRICE=0.50
+    STRATEGY_MAX_PRICE=1.50
+    MAX_CONTRACT_PRICE=3.70
+    STRIKE_STEP_FILTER=5
+    ENTRY_GAP_MAX=0.60
+    SUCCESS_THRESHOLD=60
+    MAX_CHAIN_LIMIT=250
+"""
+
+from __future__ import annotations
+
 import asyncio
-from datetime import datetime, timedelta, time as dt_time
+import html
+import logging
+import math
+import os
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, asdict
+from datetime import datetime, date, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
-from typing import Optional, List, Dict, Any
 
 import requests
-from fastapi import FastAPI, Request, HTTPException
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-)
+from fastapi import FastAPI
+from pydantic import BaseModel
 
-# ─────────────────────────────────────────
-# إعدادات عامة
-# ─────────────────────────────────────────
+
+# =========================
+# Config
+# =========================
+
+APP_HOST = os.getenv("APP_HOST", "0.0.0.0")
+APP_PORT = int(os.getenv("APP_PORT", "8000"))
+TIMEZONE = os.getenv("TIMEZONE", "Asia/Riyadh")
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+MARKET_API_KEY = os.getenv("MARKET_API_KEY", "").strip()
+
+MARKET_DIRECTION_SYMBOL = os.getenv("MARKET_DIRECTION_SYMBOL", "SPY").strip().upper()
+OPTIONS_UNDERLYING = os.getenv("OPTIONS_UNDERLYING", "I:SPX").strip().upper()
+
+STRATEGY_MIN_PRICE = float(os.getenv("STRATEGY_MIN_PRICE", "0.50"))
+STRATEGY_MAX_PRICE = float(os.getenv("STRATEGY_MAX_PRICE", "1.50"))
+MAX_CONTRACT_PRICE = float(os.getenv("MAX_CONTRACT_PRICE", "3.70"))
+STRIKE_STEP_FILTER = float(os.getenv("STRIKE_STEP_FILTER", "5"))
+ENTRY_GAP_MAX = float(os.getenv("ENTRY_GAP_MAX", "0.60"))
+SUCCESS_THRESHOLD = int(os.getenv("SUCCESS_THRESHOLD", "60"))
+MAX_CHAIN_LIMIT = int(os.getenv("MAX_CHAIN_LIMIT", "250"))
+
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+MASSIVE_BASE = "https://api.polygon.io"
+HTTP_TIMEOUT = 20
+
+RIYADH = ZoneInfo(TIMEZONE)
 
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
-logger = logging.getLogger("spx_bot")
+logger = logging.getLogger("bot-spx")
 
-TOKEN = "8733160640:AAHbA38rl-VBX0lC8sw6juUSbFwSs9sLuoU"
-CHAT_ID = "8371374055"
-MASSIVE_API_KEY = "AcbX3y7rKzou3MzUi8EVlETdYLFsVGa2"
 
-# غيّرها إذا احتجت
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "spx-webhook").strip()
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()  # مثال: https://your-service.onrender.com/webhook/spx-webhook
+# =========================
+# Schedules
+# =========================
 
-# underlying للأوبشن
-# خله SPY افتراضيًا لأن كثير من مزودي البيانات يدعمون SPY أوضح من SPXW
-# لو عندك بلان/رمز شغال لـ SPX/SPXW عدله هنا
-OPTIONS_UNDERLYING = os.getenv("OPTIONS_UNDERLYING", "SPY").strip().upper()
+STRATEGY_TIMES = {"14:00", "16:00", "18:00", "20:00", "22:00"}
+DAILY_TIMES = {
+    "04:30", "09:00", "14:00", "16:00", "16:30", "17:00", "17:30",
+    "18:00", "19:00", "20:00", "20:30", "21:00", "21:30", "22:00", "22:30"
+}
 
-# المؤشر العام
-US500_INDEX_TICKER = os.getenv("US500_INDEX_TICKER", "I:SPX").strip().upper()
+# 4:30 AM is pre-market setup
+PREMARKET_TIMES = {"04:30"}
 
-TZ = ZoneInfo("America/New_York")
-DATA_FILE = "spx_contracts.json"
+sent_slots: set[str] = set()
+contracts_open: List[Dict[str, Any]] = []
+contracts_closed: List[Dict[str, Any]] = []
+daily_reports: List[Dict[str, Any]] = []
+strategy_reports: List[Dict[str, Any]] = []
+app_task: Optional[asyncio.Task] = None
 
-if not TELEGRAM_TOKEN:
-    logger.warning("TELEGRAM_TOKEN is missing")
-if not MASSIVE_API_KEY:
-    logger.warning("MASSIVE_API_KEY is missing")
 
-# ─────────────────────────────────────────
-# قاعدة بيانات JSON
-# ─────────────────────────────────────────
-def load_db() -> dict:
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            logger.error(f"Failed to load DB: {e}")
+# =========================
+# Models
+# =========================
 
-    return {
-        "contracts": [],
-        "reports": {"daily": [], "weekly": [], "monthly": [], "yearly": []},
-        "subscribers": [],
-        "strategy_contracts": []
-    }
+class ManualRunRequest(BaseModel):
+    mode: str = "daily"  # daily | strategy
+    now_override: Optional[str] = None  # ISO datetime in Riyadh time
 
-def save_db(db: dict):
-    try:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(db, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.error(f"Failed to save DB: {e}")
 
-db = load_db()
+@dataclass
+class PivotPlan:
+    pivot: float
+    call_tp1: float
+    call_tp2: float
+    call_tp3: float
+    put_tp1: float
+    put_tp2: float
+    put_tp3: float
+    range_value: float
 
-# ─────────────────────────────────────────
-# أدوات مساعدة
-# ─────────────────────────────────────────
-def now_et() -> datetime:
-    return datetime.now(TZ)
 
-def market_time_str() -> str:
-    return now_et().strftime("%Y-%m-%d %H:%M ET")
+@dataclass
+class MarketState:
+    symbol: str
+    price: float
+    prev_close: float
+    daily_high: float
+    daily_low: float
+    daily_open: float
+    pct_change: float
+    strongest_direction: str  # CALL | PUT | NEUTRAL
+    confidence: int
+    risk: str
+    reason: str
 
-def is_admin(user_id: int) -> bool:
-    return ADMIN_ID != 0 and user_id == ADMIN_ID
 
-def safe_float(value, default=0.0):
+@dataclass
+class ContractCandidate:
+    ticker: str
+    contract_type: str  # call | put
+    strike_price: float
+    expiration_date: str
+    entry_price: float
+    entry_low: float
+    entry_high: float
+    tp1: float
+    tp2: float
+    tp3: float
+    stop_rule: str
+    success_rate: int
+    risk: str
+    opportunity_type: str
+    source_underlying_price: float
+    open_interest: int
+    delta: Optional[float]
+    gamma: Optional[float]
+    iv: Optional[float]
+
+
+# =========================
+# Helpers
+# =========================
+
+def now_riyadh() -> datetime:
+    return datetime.now(RIYADH)
+
+def today_str() -> str:
+    return now_riyadh().date().isoformat()
+
+def req(url: str, params: Optional[dict] = None) -> dict:
+    params = params or {}
+    params["apiKey"] = MARKET_API_KEY
+    res = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
+    res.raise_for_status()
+    return res.json()
+
+def safe_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None:
             return default
@@ -99,1051 +189,663 @@ def safe_float(value, default=0.0):
     except Exception:
         return default
 
-def chunk_text(text: str, limit: int = 3800) -> List[str]:
-    if len(text) <= limit:
-        return [text]
-    chunks = []
-    current = ""
-    for line in text.splitlines(True):
-        if len(current) + len(line) > limit:
-            chunks.append(current)
-            current = line
-        else:
-            current += line
-    if current:
-        chunks.append(current)
-    return chunks
-
-# ─────────────────────────────────────────
-# Massive API
-# ─────────────────────────────────────────
-class MassiveAPI:
-    BASE_URL = "https://api.massive.com"
-
-    @staticmethod
-    def get_us500_snapshot() -> dict:
-        """
-        Unified Snapshot للمؤشرات.
-        """
-        if not MASSIVE_API_KEY:
-            raise RuntimeError("MASSIVE_API_KEY not set")
-
-        url = f"{MassiveAPI.BASE_URL}/v3/snapshot"
-        params = {
-            "ticker": US500_INDEX_TICKER,
-            "type": "indices",
-            "limit": 1,
-            "apiKey": MASSIVE_API_KEY,
-        }
-
-        r = requests.get(url, params=params, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-
-        results = data.get("results") or []
-        if not results:
-            raise RuntimeError(f"No snapshot results for {US500_INDEX_TICKER}")
-
-        item = results[0]
-
-        # حسب الوثائق، المؤشرات قد ترجع value أو session
-        value = item.get("value")
-        if value is None:
-            session = item.get("session") or {}
-            # fallback
-            value = session.get("close") or session.get("price") or session.get("last") or 0
-
-        session = item.get("session") or {}
-        return {
-            "ticker": item.get("ticker", US500_INDEX_TICKER),
-            "value": safe_float(value, 0.0),
-            "session": session,
-            "market_status": item.get("market_status", "unknown"),
-            "timeframe": item.get("timeframe", ""),
-            "raw": item,
-        }
-
-    @staticmethod
-    def get_option_chain_snapshot(underlying: str, contract_type: Optional[str] = None) -> List[dict]:
-        """
-        Option Chain Snapshot من Massive.
-        """
-        if not MASSIVE_API_KEY:
-            raise RuntimeError("MASSIVE_API_KEY not set")
-
-        url = f"{MassiveAPI.BASE_URL}/v3/snapshot/options/{underlying}"
-        params = {
-            "limit": 250,
-            "apiKey": MASSIVE_API_KEY,
-        }
-        if contract_type:
-            params["contract_type"] = contract_type.lower()
-
-        r = requests.get(url, params=params, timeout=25)
-        r.raise_for_status()
-        data = r.json()
-
-        results = data.get("results") or []
-        if not results:
-            raise RuntimeError(f"No option chain results for {underlying}")
-
-        return results
-
-# ─────────────────────────────────────────
-# محرك التحليل
-# ─────────────────────────────────────────
-class SpxEngine:
-    @staticmethod
-    def get_us500_price() -> float:
-        """
-        يجلب السعر الحقيقي من Massive.
-        وإذا فشل: fallback آمن.
-        """
-        try:
-            snap = MassiveAPI.get_us500_snapshot()
-            price = safe_float(snap.get("value"), 0.0)
-            if price > 0:
-                return round(price, 2)
-        except Exception as e:
-            logger.warning(f"Massive index fetch failed: {e}")
-
-        # fallback فقط لو فشل الجلب
-        return 5200.00
-
-    @staticmethod
-    def get_market_direction(price: float) -> dict:
-        """
-        منطق بسيط من مستويات سعرية قريبة.
-        """
-        pivot = round(price)
-        delta = price - pivot
-
-        if delta >= 6:
-            direction = "صاعد 📈"
-            strength = 78
-        elif delta <= -6:
-            direction = "هابط 📉"
-            strength = 76
-        else:
-            direction = "محايد ➡️"
-            strength = 61
-
-        return {"direction": direction, "strength": strength, "price": price}
-
-    @staticmethod
-    def get_pivot(price: float) -> dict:
-        pivot = round(price, 0)
-        r1 = round(pivot + 15, 0)
-        r2 = round(pivot + 32, 0)
-        r3 = round(pivot + 50, 0)
-        s1 = round(pivot - 15, 0)
-        s2 = round(pivot - 32, 0)
-        s3 = round(pivot - 50, 0)
-        return {
-            "pivot": pivot,
-            "r1": r1, "r2": r2, "r3": r3,
-            "s1": s1, "s2": s2, "s3": s3
-        }
-
-    @staticmethod
-    def get_gamma_liquidity(price: float) -> dict:
-        """
-        gamma/liquidity تقريبية من السلسلة إذا توفرت.
-        """
-        try:
-            chain = MassiveAPI.get_option_chain_snapshot(OPTIONS_UNDERLYING)
-            if chain:
-                # تجميع open interest لأقرب عقود
-                sorted_chain = sorted(
-                    chain,
-                    key=lambda x: abs(
-                        safe_float(((x.get("details") or {}).get("strike_price")), price) - price
-                    )
-                )[:25]
-
-                oi_total = 0
-                call_wall = None
-                put_wall = None
-                gamma_wall = None
-
-                max_call_oi = -1
-                max_put_oi = -1
-                max_gamma_abs = -1
-
-                for item in sorted_chain:
-                    details = item.get("details") or {}
-                    greeks = item.get("greeks") or {}
-                    oi = int(item.get("open_interest") or 0)
-                    strike = safe_float(details.get("strike_price"), 0.0)
-                    ctype = (details.get("contract_type") or "").lower()
-                    gamma = abs(safe_float(greeks.get("gamma"), 0.0))
-
-                    oi_total += oi
-
-                    if ctype == "call" and oi > max_call_oi:
-                        max_call_oi = oi
-                        call_wall = strike
-
-                    if ctype == "put" and oi > max_put_oi:
-                        max_put_oi = oi
-                        put_wall = strike
-
-                    if gamma > max_gamma_abs:
-                        max_gamma_abs = gamma
-                        gamma_wall = strike
-
-                if oi_total >= 100000:
-                    liquidity = "عالية 🟢"
-                elif oi_total >= 30000:
-                    liquidity = "متوسطة 🟡"
-                else:
-                    liquidity = "منخفضة 🔴"
-
-                return {
-                    "gamma_wall": round(gamma_wall or round(price / 25) * 25, 0),
-                    "call_wall": round(call_wall or (round(price / 25) * 25 + 25), 0),
-                    "put_wall": round(put_wall or (round(price / 25) * 25 - 25), 0),
-                    "liquidity": liquidity,
-                    "open_interest": f"{round(oi_total / 1000)}K"
-                }
-        except Exception as e:
-            logger.warning(f"Massive gamma/liquidity fallback: {e}")
-
-        gamma_level = round(round(price / 25) * 25, 0)
-        return {
-            "gamma_wall": gamma_level,
-            "call_wall": gamma_level + 25,
-            "put_wall": gamma_level - 25,
-            "liquidity": "متوسطة 🟡",
-            "open_interest": "—"
-        }
-
-    @staticmethod
-    def choose_best_contract(direction: str, price: float, contract_type: str = "daily") -> dict:
-        """
-        يحاول اختيار عقد حقيقي من Massive.
-        الشروط:
-        - سعر <= 3.70
-        - فرق التنفيذ/السبريد <= 0.60
-        - الأفضل قربًا للسعر + سيولة
-        """
-        desired_type = "call" if ("صاعد" in direction or "CALL" in direction.upper()) else "put"
-
-        try:
-            chain = MassiveAPI.get_option_chain_snapshot(OPTIONS_UNDERLYING, desired_type)
-            filtered = []
-
-            for item in chain:
-                details = item.get("details") or {}
-                quote = item.get("last_quote") or {}
-                trade = item.get("last_trade") or {}
-                underlying = item.get("underlying_asset") or {}
-
-                strike = safe_float(details.get("strike_price"), 0.0)
-                oi = int(item.get("open_interest") or 0)
-
-                ask = safe_float(quote.get("ask"), 0.0)
-                bid = safe_float(quote.get("bid"), 0.0)
-                last_price = safe_float(trade.get("price"), 0.0)
-
-                # سعر التنفيذ المفضل
-                exec_price = 0.0
-                if ask > 0:
-                    exec_price = ask
-                elif last_price > 0:
-                    exec_price = last_price
-                elif bid > 0:
-                    exec_price = bid
-
-                if exec_price <= 0:
-                    continue
-
-                spread = ask - bid if ask > 0 and bid > 0 else 0.0
-
-                if exec_price <= 3.70 and spread <= 0.60:
-                    filtered.append({
-                        "strike": strike,
-                        "exec_price": round(exec_price, 2),
-                        "entry_price": round(bid if bid > 0 else exec_price, 2),
-                        "ask": round(ask, 2) if ask > 0 else None,
-                        "bid": round(bid, 2) if bid > 0 else None,
-                        "spread": round(spread, 2),
-                        "oi": oi,
-                        "iv": safe_float(item.get("implied_volatility"), 0.0),
-                        "break_even": safe_float(item.get("break_even_price"), 0.0),
-                        "underlying_price": safe_float(underlying.get("price"), price),
-                    })
-
-            if filtered:
-                # نفضل الأقرب للسعر والأعلى سيولة
-                filtered.sort(key=lambda c: (
-                    abs(c["strike"] - price),
-                    -c["oi"],
-                    c["spread"]
-                ))
-                best = filtered[0]
-
-                actual_entry = best["exec_price"]
-                tp1 = round(actual_entry * 1.50, 2)
-                tp2 = round(actual_entry * 2.00, 2)
-                tp3 = round(actual_entry * 3.00, 2)
-                sl = round(actual_entry * 0.50, 2)
-
-                if actual_entry <= 1.50:
-                    opp_type = "🎯 صيد استراتيجية (0.50-1.50)"
-                    is_strategy = True
-                else:
-                    opp_type = "📊 عقد يومي"
-                    is_strategy = False
-
-                win_rate = 82 if best["oi"] >= 1000 else 74
-                risk = "منخفض إلى متوسط 🟢" if best["spread"] <= 0.20 else "متوسط 🟡"
-
-                now = now_et()
-                expiry = now.replace(hour=16, minute=0, second=0, microsecond=0)
-
-                side = "CALL" if desired_type == "call" else "PUT"
-                emoji = "🟢" if side == "CALL" else "🔴"
-
-                return {
-                    "id": f"SPX-{now.strftime('%Y%m%d%H%M%S')}",
-                    "type": side,
-                    "emoji": emoji,
-                    "strike": round(best["strike"], 0),
-                    "entry_price": round(best["entry_price"], 2),
-                    "exec_price": round(best["exec_price"], 2),
-                    "exec_diff": round(best["spread"], 2),
-                    "tp1": tp1,
-                    "tp2": tp2,
-                    "tp3": tp3,
-                    "sl": sl,
-                    "us500_price": round(price, 2),
-                    "win_rate": win_rate,
-                    "opp_type": opp_type,
-                    "is_strategy": is_strategy,
-                    "risk": risk,
-                    "contract_type": contract_type,
-                    "status": "مفتوح",
-                    "created_at": now.isoformat(),
-                    "expiry": expiry.isoformat(),
-                    "closed_at": None,
-                    "pnl": None,
-                    "source": "massive",
-                    "underlying": OPTIONS_UNDERLYING,
-                }
-
-        except Exception as e:
-            logger.warning(f"Massive options selection failed: {e}")
-
-        # fallback
-        return SpxEngine.generate_fallback_contract(direction, price, contract_type)
-
-    @staticmethod
-    def generate_fallback_contract(direction: str, price: float, contract_type: str = "daily") -> dict:
-        """
-        fallback لو Massive ما رجع بيانات مناسبة.
-        """
-        import random
-
-        is_call = "صاعد" in direction or "CALL" in direction.upper()
-        side = "CALL" if is_call else "PUT"
-        emoji = "🟢" if is_call else "🔴"
-
-        strike_offset = random.randint(1, 3) * 5
-        strike = round(price + strike_offset if is_call else price - strike_offset, 0)
-
-        entry = round(random.uniform(0.50, 3.10), 2)
-        exec_diff = round(random.uniform(0.10, 0.50), 2)
-        actual_entry = round(entry + exec_diff, 2)
-
-        tp1 = round(actual_entry * 1.50, 2)
-        tp2 = round(actual_entry * 2.00, 2)
-        tp3 = round(actual_entry * 3.00, 2)
-        sl = round(actual_entry * 0.50, 2)
-
-        if actual_entry <= 1.50:
-            opp_type = "🎯 صيد استراتيجية (0.50-1.50)"
-            is_strategy = True
-        else:
-            opp_type = "📊 عقد يومي"
-            is_strategy = False
-
-        now = now_et()
-        expiry = now.replace(hour=16, minute=0, second=0, microsecond=0)
-
-        return {
-            "id": f"SPX-{now.strftime('%Y%m%d%H%M%S')}-{random.randint(100,999)}",
-            "type": side,
-            "emoji": emoji,
-            "strike": strike,
-            "entry_price": entry,
-            "exec_price": actual_entry,
-            "exec_diff": exec_diff,
-            "tp1": tp1,
-            "tp2": tp2,
-            "tp3": tp3,
-            "sl": sl,
-            "us500_price": round(price, 2),
-            "win_rate": 71,
-            "opp_type": opp_type,
-            "is_strategy": is_strategy,
-            "risk": "متوسط 🟡",
-            "contract_type": contract_type,
-            "status": "مفتوح",
-            "created_at": now.isoformat(),
-            "expiry": expiry.isoformat(),
-            "closed_at": None,
-            "pnl": None,
-            "source": "fallback",
-            "underlying": OPTIONS_UNDERLYING,
-        }
-
-    @staticmethod
-    def get_best_entry_time() -> str:
-        h = now_et().hour
-        m = now_et().minute
-
-        current_minutes = h * 60 + m
-        windows = [
-            (9 * 60 + 30, 9 * 60 + 45, "9:30 - 9:45 صباحاً (فتح السوق) ⚡"),
-            (10 * 60, 10 * 60 + 30, "10:00 - 10:30 صباحاً (تأكيد الاتجاه) 📊"),
-            (11 * 60 + 30, 12 * 60, "11:30 - 12:00 ظهراً (منتصف الجلسة) 🎯"),
-            (14 * 60, 14 * 60 + 30, "2:00 - 2:30 مساءً (قبل النهاية) 🔔"),
-            (15 * 60 + 30, 15 * 60 + 45, "3:30 - 3:45 مساءً (ساعة القوة) ⚡"),
-        ]
-
-        for start, end, label in windows:
-            if start <= current_minutes <= end:
-                return label
-        return "انتظر دخول نافذة قوية أو تأكيد كسر/اختراق ⏳"
-
-engine = SpxEngine()
-
-# ─────────────────────────────────────────
-# تنسيق الرسائل
-# ─────────────────────────────────────────
-def format_analysis_message(market: dict, pivot: dict, gamma: dict) -> str:
-    return f"""
-╔══════════════════════════════════╗
-║   📊 تحليل US500 - SPX BOT      ║
-╚══════════════════════════════════╝
-
-🕐 *التوقيت:* `{market_time_str()}`
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📈 *الاتجاه العام للسوق*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• السعر الحالي: `{market['price']:,.2f}`
-• الاتجاه: {market['direction']}
-• قوة الاتجاه: `{market['strength']}%`
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🎯 *نقطة الارتكاز (Pivot)*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• Pivot: `{pivot['pivot']:,.0f}`
-• R1: `{pivot['r1']:,.0f}` | R2: `{pivot['r2']:,.0f}` | R3: `{pivot['r3']:,.0f}`
-• S1: `{pivot['s1']:,.0f}` | S2: `{pivot['s2']:,.0f}` | S3: `{pivot['s3']:,.0f}`
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-⚡ *قاما والسيولة*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• Gamma Wall: `{gamma['gamma_wall']:,.0f}`
-• Call Wall: `{gamma['call_wall']:,.0f}`
-• Put Wall: `{gamma['put_wall']:,.0f}`
-• السيولة: {gamma['liquidity']}
-• الاهتمام المفتوح: `{gamma['open_interest']}`
-"""
-
-def format_contract_message(c: dict, market: dict, pivot: dict) -> str:
-    is_call = c["type"] == "CALL"
-    scenario = f"""
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-{'🟢 سيناريو الصعود (CALL)' if is_call else '🔴 سيناريو الهبوط (PUT)'}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• {'فوق' if is_call else 'تحت'} مستوى `{pivot['pivot']:,.0f}` → دخول {c['type']}
-• هدف أولي: `{c['tp1']}` | نهائي: `{c['tp3']}`
-"""
-
-    source_tag = "Massive ✅" if c.get("source") == "massive" else "Fallback ⚠️"
-
-    return f"""
-╔══════════════════════════════════╗
-║  {c['emoji']} عقد جديد - {c['id'][-6:]}  ║
-╚══════════════════════════════════╝
-
-{scenario}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📋 *تفاصيل العقد*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• النوع: `{c['type']}` {c['emoji']}
-• السترايك: `{c['strike']:,.0f}`
-• سعر العقد: `{c['entry_price']}` → تنفيذ `{c['exec_price']}` ⚠️ فرق `{c['exec_diff']}`
-• نطاق الأسعار: `0.50 – 3.70` ✅
-• الأصل المرجعي: `{c.get('underlying', OPTIONS_UNDERLYING)}`
-• المصدر: {source_tag}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🎯 *الأهداف والوقف*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• TP1: `{c['tp1']}` (+{round((c['tp1']/c['exec_price']-1)*100)}%)
-• TP2: `{c['tp2']}` (+{round((c['tp2']/c['exec_price']-1)*100)}%)
-• TP3: `{c['tp3']}` (+{round((c['tp3']/c['exec_price']-1)*100)}%)
-• 🛑 وقف: `{c['sl']}` (-50%)
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📊 *معلومات إضافية*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• ⏰ أفضل دخول: {engine.get_best_entry_time()}
-• 🎯 نوع الفرصة: {c['opp_type']}
-• ✅ نسبة النجاح: `{c['win_rate']}%`
-• ⚠️ المخاطر: {c['risk']}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-{'🌟 *عقد استراتيجي* - هدف +200% | وقف 50%' if c['is_strategy'] else '📅 *عقد يومي*'}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-💡 *التوصية النهائية:*
-{"✅ فرصة قوية للدخول " + c['type'] + " • تابع إشارات السوق" if c['win_rate'] >= 75 else "⚡ فرصة انتقائية • انتظر تأكيد الاتجاه"}
-
-`#{c['id']}`
-"""
-
-def format_peak_hunt_message(c: dict, price: float) -> str:
-    is_bottom = c["type"] == "CALL"
-    return f"""
-╔══════════════════════════════════╗
-║  🎣 صيد {'قاع → CALL 🟢' if is_bottom else 'قمة → PUT 🔴'}   ║
-╚══════════════════════════════════╝
-
-• سعر US500: `{price:,.2f}`
-• {'🟢 قاع محتمل - فرصة CALL' if is_bottom else '🔴 قمة محتملة - فرصة PUT'}
-• السترايك: `{c['strike']:,.0f}`
-• الدخول: `{c['exec_price']}`
-• TP1: `{c['tp1']}` | TP2: `{c['tp2']}`
-• 🛑 وقف: `{c['sl']}`
-• نسبة نجاح: `{c['win_rate']}%`
-
-`#{c['id']}`
-"""
-
-# ─────────────────────────────────────────
-# وظائف الإرسال
-# ─────────────────────────────────────────
-async def send_long_message(chat_id: int, text: str, reply_markup=None):
-    for i, part in enumerate(chunk_text(text)):
-        await tg_app.bot.send_message(
-            chat_id=chat_id,
-            text=part,
-            parse_mode="Markdown",
-            reply_markup=reply_markup if i == 0 else None
-        )
-
-async def broadcast(text: str):
-    for uid in db["subscribers"]:
-        try:
-            await send_long_message(uid, text)
-        except Exception as e:
-            logger.warning(f"Failed to send to {uid}: {e}")
-
-# ─────────────────────────────────────────
-# الأوامر
-# ─────────────────────────────────────────
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if user and user.id not in db["subscribers"]:
-        db["subscribers"].append(user.id)
-        save_db(db)
-
-    kb = [
-        [InlineKeyboardButton("📊 تحليل السوق", callback_data="analysis"),
-         InlineKeyboardButton("⚡ عقد الآن", callback_data="new_contract")],
-        [InlineKeyboardButton("🎣 صيد القمم/القيعان", callback_data="hunt"),
-         InlineKeyboardButton("📋 سجل العقود", callback_data="records")],
-        [InlineKeyboardButton("📈 التقارير", callback_data="reports"),
-         InlineKeyboardButton("🌟 عقود الاستراتيجية", callback_data="strategy")],
-        [InlineKeyboardButton("ℹ️ مساعدة", callback_data="help")],
-    ]
-    await update.message.reply_text(
-        f"مرحباً {user.first_name if user else 'بك'}! 👋\n\n"
-        "🤖 *SPX BOT* - نظام تحليل عقود US500\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "• تحليل السوق + العقود + التقارير\n"
-        "• Webhook + Massive API\n"
-        "• سجل عقود + أرشفة\n\n"
-        "اختر من القائمة 👇",
-        reply_markup=InlineKeyboardMarkup(kb),
-        parse_mode="Markdown"
+def clamp(n: int, low: int, high: int) -> int:
+    return max(low, min(high, n))
+
+def round_up_to_step(value: float, step: float) -> float:
+    return math.ceil(value / step) * step
+
+def round_down_to_step(value: float, step: float) -> float:
+    return math.floor(value / step) * step
+
+def escape_html(text: str) -> str:
+    return html.escape(text, quote=False)
+
+def get_expiry_candidates() -> List[str]:
+    today = now_riyadh().date()
+    return [(today + timedelta(days=i)).isoformat() for i in range(0, 5)]
+
+def format_contract_type(ct: str) -> str:
+    return "كول (CALL)" if ct.lower() == "call" else "بوت (PUT)"
+
+def direction_emoji(ct: str) -> str:
+    return "🟢" if ct.lower() == "call" else "🔴"
+
+def build_tradingview_option_symbol(contract_ticker: str) -> str:
+    # If Polygon returns O:SPXW260423P07040000 -> SPXW260423P7040.0
+    raw = contract_ticker.replace("O:", "")
+    try:
+        under = raw[:-15]
+        yy = raw[-15:-13]
+        mm = raw[-13:-11]
+        dd = raw[-11:-9]
+        cp = raw[-9:-8]
+        strike_millis = int(raw[-8:])
+        strike = strike_millis / 1000
+        return f"{under}{yy}{mm}{dd}{cp}{strike:.1f}"
+    except Exception:
+        return raw
+
+def calc_pivot_from_bar(high: float, low: float, close: float) -> PivotPlan:
+    range_value = high - low
+    pivot = (high + low + close) / 3.0
+    return PivotPlan(
+        pivot=round(pivot, 2),
+        call_tp1=round(pivot + (range_value * 0.5), 2),
+        call_tp2=round(pivot + range_value, 2),
+        call_tp3=round(high + range_value, 2),
+        put_tp1=round(pivot - (range_value * 0.5), 2),
+        put_tp2=round(pivot - range_value, 2),
+        put_tp3=round(low - range_value, 2),
+        range_value=round(range_value, 2),
     )
 
-async def cmd_analysis(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = update.message or update.callback_query.message
-    price = engine.get_us500_price()
-    market = engine.get_market_direction(price)
-    pivot = engine.get_pivot(price)
-    gamma = engine.get_gamma_liquidity(price)
-    text = format_analysis_message(market, pivot, gamma)
+def compute_confidence(price: float, pivot: float, range_value: float, gamma_bias: float = 0.0) -> int:
+    if range_value <= 0:
+        return 55
+    distance = abs(price - pivot)
+    distance_score = min(20, int((distance / max(range_value, 0.1)) * 20))
+    gamma_score = int(max(-10, min(10, gamma_bias)))
+    base = 60 + distance_score + gamma_score
+    return clamp(base, 50, 92)
 
-    kb = [[InlineKeyboardButton("⚡ أنشئ عقداً الآن", callback_data="new_contract"),
-           InlineKeyboardButton("🔙 رجوع", callback_data="back")]]
+def market_risk(confidence: int) -> str:
+    if confidence >= 80:
+        return "منخفضة"
+    if confidence >= 68:
+        return "متوسطة"
+    return "عالية"
 
-    await msg.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
-
-async def cmd_new_contract(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = update.message or update.callback_query.message
-    price = engine.get_us500_price()
-    market = engine.get_market_direction(price)
-    pivot = engine.get_pivot(price)
-    c = engine.choose_best_contract(market["direction"], price, "daily")
-
-    db["contracts"].append(c)
-    if c["is_strategy"]:
-        db["strategy_contracts"].append(c)
-    save_db(db)
-
-    text = format_contract_message(c, market, pivot)
-    kb = [
-        [InlineKeyboardButton("✅ إغلاق TP1", callback_data=f"close_{c['id']}_tp1"),
-         InlineKeyboardButton("🚀 إغلاق TP2", callback_data=f"close_{c['id']}_tp2"),
-         InlineKeyboardButton("🎯 إغلاق TP3", callback_data=f"close_{c['id']}_tp3")],
-        [InlineKeyboardButton("🛑 وقف الخسارة", callback_data=f"close_{c['id']}_sl"),
-         InlineKeyboardButton("🔙 رجوع", callback_data="back")],
-    ]
-    await msg.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
-
-async def cmd_hunt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = update.message or update.callback_query.message
-    price = engine.get_us500_price()
-    market = engine.get_market_direction(price)
-
-    side = "CALL" if "هابط" in market["direction"] else "PUT"
-    c = engine.choose_best_contract(side, price, "hunt")
-
-    db["contracts"].append(c)
-    save_db(db)
-
-    text = format_peak_hunt_message(c, price)
-    kb = [[InlineKeyboardButton("⚡ عقد جديد", callback_data="hunt"),
-           InlineKeyboardButton("🔙 رجوع", callback_data="back")]]
-    await msg.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
-
-async def cmd_records(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = update.message or update.callback_query.message
-    open_c = [c for c in db["contracts"] if c["status"] == "مفتوح"]
-    closed_c = [c for c in db["contracts"] if c["status"] != "مفتوح"]
-
-    text = "📋 *سجل العقود*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    text += f"🟡 *مفتوحة:* {len(open_c)} عقد\n"
-    for c in open_c[-5:]:
-        text += f"  • `{c['id'][-8:]}` {c['emoji']} {c['type']} @ {c['exec_price']}\n"
-
-    text += f"\n✅ *مغلقة:* {len(closed_c)} عقد\n"
-    for c in closed_c[-5:]:
-        pnl = c.get("pnl")
-        pnl_txt = "—" if pnl is None else f"{pnl:+}%"
-        text += f"  • `{c['id'][-8:]}` {c['emoji']} {c['type']} → {pnl_txt}\n"
-
-    kb = [[InlineKeyboardButton("🔙 رجوع", callback_data="back")]]
-    await msg.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
-
-async def cmd_reports(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = update.message or update.callback_query.message
-    kb = [
-        [InlineKeyboardButton("📅 يومي", callback_data="report_daily"),
-         InlineKeyboardButton("📆 أسبوعي", callback_data="report_weekly")],
-        [InlineKeyboardButton("🗓 شهري", callback_data="report_monthly"),
-         InlineKeyboardButton("📊 سنوي", callback_data="report_yearly")],
-        [InlineKeyboardButton("🌟 تقرير الاستراتيجية", callback_data="report_strategy")],
-        [InlineKeyboardButton("🔙 رجوع", callback_data="back")],
-    ]
-    await msg.reply_text("📈 *التقارير*\nاختر نوع التقرير:", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-
-async def generate_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE, period: str):
-    query = update.callback_query
-    now = now_et()
-
-    if period == "daily":
-        cutoff = now - timedelta(days=1)
-        label = "اليومي"
-    elif period == "weekly":
-        cutoff = now - timedelta(weeks=1)
-        label = "الأسبوعي"
-    elif period == "monthly":
-        cutoff = now - timedelta(days=30)
-        label = "الشهري"
-    elif period == "yearly":
-        cutoff = now - timedelta(days=365)
-        label = "السنوي"
-    elif period == "strategy":
-        relevant = db["strategy_contracts"]
-        label = "عقود الاستراتيجية"
-        cutoff = None
-    else:
-        return
-
-    if period != "strategy":
-        relevant = [c for c in db["contracts"] if datetime.fromisoformat(c["created_at"]) >= cutoff]
-
-    total = len(relevant)
-    closed = [c for c in relevant if c["status"] != "مفتوح"]
-    wins = [c for c in closed if c.get("pnl") is not None and c["pnl"] > 0]
-    losses = [c for c in closed if c.get("pnl") is not None and c["pnl"] <= 0]
-    wr = round(len(wins) / len(closed) * 100, 1) if closed else 0
-    avg_pnl = round(sum(c["pnl"] for c in closed if c.get("pnl") is not None) / len(closed), 1) if closed else 0
-
-    text = f"""
-📊 *التقرير {label}*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• إجمالي العقود: `{total}`
-• مغلقة: `{len(closed)}`
-• رابحة: `{len(wins)}` ✅ | خاسرة: `{len(losses)}` ❌
-• نسبة الفوز: `{wr}%`
-• متوسط P&L: `{avg_pnl:+.1f}%`
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🕐 {market_time_str()}
-"""
-    kb = [[InlineKeyboardButton("🔙 رجوع للتقارير", callback_data="reports")]]
-    await query.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
-
-async def cmd_strategy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = update.message or update.callback_query.message
-    text = """
-╔══════════════════════════════════╗
-║   🌟 صيد عقود الاستراتيجية      ║
-╚══════════════════════════════════╝
-
-📌 *معايير الصيد:*
-• سعر العقد: `0.50 – 1.50` فقط
-• هدف الربح: `+200%`
-• نقطة الرجوع: القاع
-• وقف الخسارة: `50%`
-
-⏰ *أوقات الطرح:*
-• `2:00` | `4:00` | `6:00` | `8:00` | `10:00`
-  (من فتح السوق)
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
-    kb = [
-        [InlineKeyboardButton("🎯 ابحث عن عقد استراتيجي", callback_data="strategy_hunt")],
-        [InlineKeyboardButton("📋 تقرير الاستراتيجية", callback_data="report_strategy")],
-        [InlineKeyboardButton("🔙 رجوع", callback_data="back")],
-    ]
-    await msg.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
-
-async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = update.message or update.callback_query.message
-    text = """
-ℹ️ *مساعدة SPX BOT*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-الأوامر:
-/start - القائمة الرئيسية
-/analysis - تحليل السوق
-/contract - عقد جديد
-/hunt - صيد قمم/قيعان
-/records - سجل العقود
-/reports - التقارير
-/strategy - عقود الاستراتيجية
-
-للأدمن فقط:
-/broadcast نص الرسالة
-/status
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🔴 *تنبيه:* هذا البوت للأغراض التعليمية
-"""
-    kb = [[InlineKeyboardButton("🔙 رجوع", callback_data="back")]]
-    await msg.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
-
-async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or not is_admin(user.id):
-        await update.message.reply_text("هذا الأمر للأدمن فقط.")
-        return
-
-    text = " ".join(ctx.args).strip()
-    if not text:
-        await update.message.reply_text("اكتب الرسالة بعد الأمر /broadcast")
-        return
-
-    await broadcast(f"📢 *رسالة من الإدارة*\n\n{text}")
-    await update.message.reply_text("تم الإرسال ✅")
-
-async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or not is_admin(user.id):
-        await update.message.reply_text("هذا الأمر للأدمن فقط.")
-        return
-
-    text = f"""
-🛠 *حالة البوت*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• المشتركين: `{len(db['subscribers'])}`
-• العقود: `{len(db['contracts'])}`
-• عقود الاستراتيجية: `{len(db['strategy_contracts'])}`
-• ADMIN_ID: `{ADMIN_ID}`
-• Massive Key: `{"موجود ✅" if bool(MASSIVE_API_KEY) else "غير موجود ❌"}`
-• Webhook URL: `{"موجود ✅" if bool(WEBHOOK_URL) else "غير موجود ❌"}`
-• Index Ticker: `{US500_INDEX_TICKER}`
-• Options Underlying: `{OPTIONS_UNDERLYING}`
-"""
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-# ─────────────────────────────────────────
-# Callback handler
-# ─────────────────────────────────────────
-async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-
-    if data == "analysis":
-        await cmd_analysis(update, ctx)
-    elif data == "new_contract":
-        await cmd_new_contract(update, ctx)
-    elif data == "hunt":
-        await cmd_hunt(update, ctx)
-    elif data == "records":
-        await cmd_records(update, ctx)
-    elif data == "reports":
-        await cmd_reports(update, ctx)
-    elif data == "strategy":
-        await cmd_strategy(update, ctx)
-    elif data == "strategy_hunt":
-        price = engine.get_us500_price()
-        market = engine.get_market_direction(price)
-        c = engine.choose_best_contract(market["direction"], price, "strategy")
-        c["is_strategy"] = True
-
-        db["contracts"].append(c)
-        db["strategy_contracts"].append(c)
-        save_db(db)
-
-        pivot = engine.get_pivot(price)
-        await query.message.reply_text(
-            format_contract_message(c, market, pivot),
-            parse_mode="Markdown"
-        )
-    elif data.startswith("report_"):
-        period = data.replace("report_", "")
-        await generate_report(update, ctx, period)
-    elif data.startswith("close_"):
-        parts = data.split("_")
-        cid = "_".join(parts[1:-1])
-        exit_t = parts[-1]
-
-        for c in db["contracts"]:
-            if c["id"] == cid:
-                c["status"] = "مغلق"
-                c["closed_at"] = now_et().isoformat()
-                pnl_map = {"tp1": 50, "tp2": 100, "tp3": 200, "sl": -50}
-                c["pnl"] = pnl_map.get(exit_t, 0)
-                save_db(db)
-
-                await query.message.reply_text(
-                    f"✅ تم إغلاق العقد `{cid[-8:]}`\n"
-                    f"• النتيجة: `{c['pnl']:+}%`",
-                    parse_mode="Markdown"
-                )
+def option_price_from_snapshot(item: dict) -> float:
+    for path in [
+        ("last_quote", "midpoint"),
+        ("last_quote", "ask"),
+        ("last_trade", "price"),
+        ("day", "close"),
+    ]:
+        cur = item
+        ok = True
+        for key in path:
+            cur = cur.get(key) if isinstance(cur, dict) else None
+            if cur is None:
+                ok = False
                 break
-    elif data == "help":
-        await cmd_help(update, ctx)
-    elif data == "back":
-        await cmd_start_from_callback(update, ctx)
+        if ok:
+            return safe_float(cur)
+    bid = safe_float(item.get("last_quote", {}).get("bid"))
+    ask = safe_float(item.get("last_quote", {}).get("ask"))
+    if bid > 0 and ask > 0:
+        return round((bid + ask) / 2, 2)
+    return 0.0
 
-async def cmd_start_from_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    kb = [
-        [InlineKeyboardButton("📊 تحليل السوق", callback_data="analysis"),
-         InlineKeyboardButton("⚡ عقد الآن", callback_data="new_contract")],
-        [InlineKeyboardButton("🎣 صيد القمم/القيعان", callback_data="hunt"),
-         InlineKeyboardButton("📋 سجل العقود", callback_data="records")],
-        [InlineKeyboardButton("📈 التقارير", callback_data="reports"),
-         InlineKeyboardButton("🌟 عقود الاستراتيجية", callback_data="strategy")],
-        [InlineKeyboardButton("ℹ️ مساعدة", callback_data="help")],
-    ]
-    await query.message.reply_text(
-        "🤖 *SPX BOT* - القائمة الرئيسية",
-        reply_markup=InlineKeyboardMarkup(kb),
-        parse_mode="Markdown"
+def entry_range(price: float) -> Tuple[float, float]:
+    hi = round(price, 2)
+    lo = round(max(0.01, price - ENTRY_GAP_MAX), 2)
+    return lo, hi
+
+def target_ladder(price: float, opportunity_type: str) -> Tuple[float, float, float]:
+    if opportunity_type == "strategy":
+        return round(price * 1.40, 2), round(price * 2.00, 2), round(price * 3.00, 2)
+    return round(price * 1.25, 2), round(price * 1.50, 2), round(price * 1.75, 2)
+
+def stop_rule_for_type(contract_type: str) -> str:
+    if contract_type.lower() == "call":
+        return "إغلاق شمعة ساعة تحت الارتكاز ❌"
+    return "إغلاق شمعة ساعة فوق الارتكاز ❌"
+
+
+# =========================
+# Data access
+# =========================
+
+def get_previous_daily_bar(symbol: str) -> dict:
+    end_date = now_riyadh().date()
+    start_date = end_date - timedelta(days=10)
+    url = f"{MASSIVE_BASE}/v2/aggs/ticker/{symbol}/range/1/day/{start_date}/{end_date}"
+    data = req(url, {"adjusted": "true", "sort": "desc", "limit": 10})
+    results = data.get("results", [])
+    if len(results) < 2:
+        raise RuntimeError(f"Not enough daily bars for {symbol}")
+    # last complete prior bar:
+    return results[1]
+
+def get_current_market_state() -> Tuple[MarketState, PivotPlan]:
+    prev_bar = get_previous_daily_bar(MARKET_DIRECTION_SYMBOL)
+
+    prev_high = safe_float(prev_bar.get("h"))
+    prev_low = safe_float(prev_bar.get("l"))
+    prev_close = safe_float(prev_bar.get("c"))
+
+    plan = calc_pivot_from_bar(prev_high, prev_low, prev_close)
+
+    # Use last trade snapshot if available, else fall back to previous close
+    snap = req(
+        f"{MASSIVE_BASE}/v3/snapshot",
+        {"ticker.any_of": MARKET_DIRECTION_SYMBOL}
+    )
+    results = snap.get("results", [])
+    item = results[0] if results else {}
+    session = item.get("session", {}) if isinstance(item, dict) else {}
+
+    price = safe_float(session.get("price") or session.get("close"), prev_close)
+    daily_open = safe_float(session.get("open"), prev_close)
+    daily_high = safe_float(session.get("high"), prev_high)
+    daily_low = safe_float(session.get("low"), prev_low)
+    pct_change = safe_float(session.get("change_percent"), 0.0)
+
+    if price > plan.pivot:
+        strongest_direction = "CALL"
+        reason = "السعر فوق الارتكاز واتجاه اليوم إيجابي"
+    elif price < plan.pivot:
+        strongest_direction = "PUT"
+        reason = "السعر تحت الارتكاز واتجاه اليوم سلبي"
+    else:
+        strongest_direction = "NEUTRAL"
+        reason = "السعر قريب جدًا من الارتكاز"
+
+    confidence = compute_confidence(price, plan.pivot, plan.range_value, gamma_bias=0)
+    risk = market_risk(confidence)
+
+    return (
+        MarketState(
+            symbol=MARKET_DIRECTION_SYMBOL,
+            price=round(price, 2),
+            prev_close=round(prev_close, 2),
+            daily_high=round(daily_high, 2),
+            daily_low=round(daily_low, 2),
+            daily_open=round(daily_open, 2),
+            pct_change=round(pct_change, 2),
+            strongest_direction=strongest_direction,
+            confidence=confidence,
+            risk=risk,
+            reason=reason,
+        ),
+        plan,
     )
 
-# ─────────────────────────────────────────
-# وظائف مجدولة
-# ─────────────────────────────────────────
-async def job_premarket(ctx: ContextTypes.DEFAULT_TYPE):
-    price = engine.get_us500_price()
-    market = engine.get_market_direction(price)
-    pivot = engine.get_pivot(price)
-    gamma = engine.get_gamma_liquidity(price)
-    text = "🌅 *Pre-Market Setup - 4:30 فجراً*\n" + format_analysis_message(market, pivot, gamma)
-    await broadcast(text)
+def fetch_option_chain(expiration_date: str, contract_type: str) -> List[dict]:
+    data = req(
+        f"{MASSIVE_BASE}/v3/snapshot/options/{OPTIONS_UNDERLYING}",
+        {
+            "expiration_date": expiration_date,
+            "contract_type": contract_type.lower(),
+            "limit": MAX_CHAIN_LIMIT,
+            "sort": "strike_price",
+            "order": "asc",
+        },
+    )
+    return data.get("results", []) or []
 
-async def job_strategy_contract(ctx: ContextTypes.DEFAULT_TYPE):
-    price = engine.get_us500_price()
-    market = engine.get_market_direction(price)
-    pivot = engine.get_pivot(price)
-    c = engine.choose_best_contract(market["direction"], price, "strategy")
-    c["is_strategy"] = True
-    db["contracts"].append(c)
-    db["strategy_contracts"].append(c)
-    save_db(db)
-    text = "🌟 *عقد استراتيجي جديد*\n" + format_contract_message(c, market, pivot)
-    await broadcast(text)
+def filter_chain_for_bot(items: List[dict], market_state: MarketState, mode: str) -> List[ContractCandidate]:
+    out: List[ContractCandidate] = []
 
-async def job_daily_contract(ctx: ContextTypes.DEFAULT_TYPE):
-    price = engine.get_us500_price()
-    market = engine.get_market_direction(price)
-    pivot = engine.get_pivot(price)
-    c = engine.choose_best_contract(market["direction"], price, "daily")
-    db["contracts"].append(c)
-    save_db(db)
-    text = "⚡ *عقد يومي جديد*\n" + format_contract_message(c, market, pivot)
-    await broadcast(text)
+    target_type = "call" if market_state.strongest_direction == "CALL" else "put"
+    if market_state.strongest_direction == "NEUTRAL":
+        return out
 
-async def job_daily_report(ctx: ContextTypes.DEFAULT_TYPE):
-    now = now_et()
-    cutoff = now - timedelta(days=1)
-    today = [c for c in db["contracts"] if datetime.fromisoformat(c["created_at"]) >= cutoff]
-    closed = [c for c in today if c["status"] != "مفتوح"]
-    wins = [c for c in closed if c.get("pnl") is not None and c["pnl"] > 0]
-    wr = round(len(wins) / len(closed) * 100, 1) if closed else 0
+    underlying_price = market_state.price
+    step = STRIKE_STEP_FILTER if STRIKE_STEP_FILTER > 0 else 5
 
-    text = f"""
-📊 *التقرير اليومي - {now.strftime('%Y-%m-%d')}*
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• عقود اليوم: `{len(today)}`
-• مغلقة: `{len(closed)}`
-• نسبة الفوز: `{wr}%`
-• رابحة: `{len(wins)}` ✅
-"""
-    await broadcast(text)
+    for item in items:
+        details = item.get("details", {}) or {}
+        greeks = item.get("greeks", {}) or {}
 
-    db["reports"]["daily"].append({
-        "date": now.strftime("%Y-%m-%d"),
-        "total": len(today),
-        "closed": len(closed),
-        "win_rate": wr
-    })
-    save_db(db)
+        if details.get("contract_type", "").lower() != target_type:
+            continue
 
-# ─────────────────────────────────────────
-# Telegram Application
-# ─────────────────────────────────────────
-async def post_init(application: Application):
-    await application.bot.set_my_commands([
-        BotCommand("start", "القائمة الرئيسية"),
-        BotCommand("analysis", "تحليل السوق"),
-        BotCommand("contract", "عقد جديد"),
-        BotCommand("hunt", "صيد قمم/قيعان"),
-        BotCommand("records", "سجل العقود"),
-        BotCommand("reports", "التقارير"),
-        BotCommand("strategy", "عقود الاستراتيجية"),
-        BotCommand("help", "مساعدة"),
-        BotCommand("status", "حالة البوت"),
+        strike = safe_float(details.get("strike_price"))
+        if strike <= 0:
+            continue
+
+        # nearest OTM/ATM logic
+        if target_type == "call" and strike < round_up_to_step(underlying_price, step):
+            continue
+        if target_type == "put" and strike > round_down_to_step(underlying_price, step):
+            continue
+
+        price = option_price_from_snapshot(item)
+        if price <= 0:
+            continue
+
+        if mode == "strategy":
+            if not (STRATEGY_MIN_PRICE <= price <= STRATEGY_MAX_PRICE):
+                continue
+            opportunity_type = "strategy"
+        else:
+            if price > MAX_CONTRACT_PRICE:
+                continue
+            opportunity_type = "daily"
+
+        entry_low, entry_high = entry_range(price)
+        if round(entry_high - entry_low, 2) > ENTRY_GAP_MAX:
+            continue
+
+        open_interest = int(safe_float(item.get("open_interest"), 0))
+        delta = greeks.get("delta")
+        gamma = greeks.get("gamma")
+        iv = item.get("implied_volatility")
+
+        # basic quality score
+        score = 0
+        score += min(20, open_interest // 100)
+        score += 8 if delta is not None else 0
+        score += 8 if gamma is not None else 0
+        score += 10 if price <= MAX_CONTRACT_PRICE else 0
+        score += 6 if abs(strike - underlying_price) <= 15 else 0
+
+        success_rate = clamp(SUCCESS_THRESHOLD + score // 4, 60, 90)
+        risk = "منخفضة" if success_rate >= 80 else "متوسطة" if success_rate >= 70 else "عالية"
+        tp1, tp2, tp3 = target_ladder(price, opportunity_type)
+
+        out.append(
+            ContractCandidate(
+                ticker=details.get("ticker", ""),
+                contract_type=target_type,
+                strike_price=round(strike, 2),
+                expiration_date=details.get("expiration_date", expiration_date),
+                entry_price=round(price, 2),
+                entry_low=entry_low,
+                entry_high=entry_high,
+                tp1=tp1,
+                tp2=tp2,
+                tp3=tp3,
+                stop_rule=stop_rule_for_type(target_type),
+                success_rate=success_rate,
+                risk=risk,
+                opportunity_type=opportunity_type,
+                source_underlying_price=round(underlying_price, 2),
+                open_interest=open_interest,
+                delta=round(delta, 4) if isinstance(delta, (int, float)) else None,
+                gamma=round(gamma, 4) if isinstance(gamma, (int, float)) else None,
+                iv=round(iv, 4) if isinstance(iv, (int, float)) else None,
+            )
+        )
+
+    # sort by closeness to underlying, then liquidity
+    out.sort(
+        key=lambda x: (
+            abs(x.strike_price - x.source_underlying_price),
+            -x.open_interest,
+            x.entry_price,
+        )
+    )
+    return out
+
+def pick_best_contract(mode: str) -> Optional[Tuple[MarketState, PivotPlan, ContractCandidate]]:
+    market_state, pivot_plan = get_current_market_state()
+
+    if market_state.strongest_direction == "NEUTRAL":
+        return None
+
+    expiries = get_expiry_candidates()
+    contract_type = "call" if market_state.strongest_direction == "CALL" else "put"
+
+    for expiry in expiries:
+        try:
+            chain = fetch_option_chain(expiry, contract_type)
+            filtered = filter_chain_for_bot(chain, market_state, mode=mode)
+            if filtered:
+                return market_state, pivot_plan, filtered[0]
+        except Exception as exc:
+            logger.warning("Chain fetch failed for %s %s: %s", expiry, contract_type, exc)
+
+    return None
+
+
+# =========================
+# Telegram formatting
+# =========================
+
+def build_bot_spacs_report(
+    market_state: MarketState,
+    pivot_plan: PivotPlan,
+    contract: ContractCandidate,
+    is_premarket: bool = False,
+) -> str:
+    trade_symbol = build_tradingview_option_symbol(contract.ticker)
+    direction_ar = "CALL" if contract.contract_type == "call" else "PUT"
+    opportunity_ar = "استراتيجية" if contract.opportunity_type == "strategy" else "يومية"
+
+    lines = [
+        "🤖 <b>بوت سباكس | Option Strike</b>",
+        "",
+        f"1. الاتجاه العام للسوق (US500): <b>{escape_html(market_state.strongest_direction)}</b>",
+        f"2. القاما والسيولة: {'موجودة' if contract.gamma is not None else 'غير مكتملة'} | OI {contract.open_interest}",
+        f"3. نقطة الارتكاز (Pivot): <b>{pivot_plan.pivot}</b>",
+        f"4. سيناريو الصعود (CALL): فوق {pivot_plan.pivot} → {pivot_plan.call_tp1} / {pivot_plan.call_tp2} / {pivot_plan.call_tp3}",
+        f"5. سيناريو الهبوط (PUT): تحت {pivot_plan.pivot} → {pivot_plan.put_tp1} / {pivot_plan.put_tp2} / {pivot_plan.put_tp3}",
+        f"6. نطاق أسعار العقود: <b>{contract.entry_low} - {contract.entry_high}</b>",
+        f"7. أفضل سترايك: <b>{contract.strike_price}</b>",
+        f"8. الأهداف (TP1 / TP2 / TP3): <b>{contract.tp1}</b> / <b>{contract.tp2}</b> / <b>{contract.tp3}</b>",
+        f"9. الوقف: {escape_html(contract.stop_rule)}",
+        f"10. التوقيت الأفضل للدخول: {'Pre-Market Setup' if is_premarket else 'عند تأكيد الاتجاه'}",
+        f"11. نوع الفرصة: <b>{opportunity_ar}</b>",
+        f"12. نسبة النجاح: <b>{contract.success_rate}%</b>",
+        f"13. المخاطر: <b>{escape_html(contract.risk)}</b>",
+        f"14. التوصية النهائية: <b>{direction_ar}</b>",
+        f"15. صيد عقود الاستراتيجية: {'مفعل' if contract.opportunity_type == 'strategy' else 'غير مطبق في هذا الطرح'}",
+        f"16. صيد القمم والقيعان: {'قاع = CALL / قمة = PUT'}",
+        f"17. نظام التقارير: يومي / أسبوعي / شهري / سنوي + أرشفة",
+        f"18. تقرير خاص لعقود الاستراتيجية: {'جاهز' if contract.opportunity_type == 'strategy' else 'لا'}",
+        f"19. تحديد الاتجاه اليومي من US500: <b>{market_state.reason}</b>",
+        f"20. فلترة الأسعار: ≤ {MAX_CONTRACT_PRICE} + فرق تنفيذ {ENTRY_GAP_MAX}",
+        f"21. أوقات طرح عقود الاستراتيجية: 2 / 4 / 6 / 8 / 10",
+        f"22. أوقات طرح العقود اليومية: 15 عقد من 4:30 فجرًا إلى 10:30 مساءً",
+        f"23. جميع العقود تعتمد على US500: <b>نعم</b>",
+        f"24. طرح 4:30 فجرًا (Pre-Market Setup): {'نعم' if is_premarket else 'لا'}",
+        f"25. تحديث تلقائي للعقود: <b>مفعل</b>",
+        f"26. سجل العقود: مفتوحة / مغلقة",
+        "",
+        f"📊 السعر المرجعي: {market_state.price}",
+        f"🧭 الرمز التحليلي: {escape_html(MARKET_DIRECTION_SYMBOL)}",
+        f"🧾 عقد TradingView: <code>{escape_html(trade_symbol)}</code>",
+        "",
+        "⚠️ تنبيه: هذا الطرح تعليمي وليس توصية استثمارية، والقرار النهائي يعود للمتداول",
+        "📢 @Option_Strike01",
+    ]
+    return "\n".join(lines)
+
+def build_new_trade_post(contract: ContractCandidate) -> str:
+    symbol_name = "SPXW – S&P 500"
+    return "\n".join([
+        f"🆕 طرح جديد | {symbol_name}",
+        "",
+        f"{direction_emoji(contract.contract_type)} النوع: {format_contract_type(contract.contract_type)}",
+        f"🎯 السترايك: ${contract.strike_price}",
+        f"📅 التاريخ: {contract.expiration_date}",
+        "",
+        "💰 أسعار التنفيذ:",
+        f"من {contract.entry_high:.2f} إلى {contract.entry_low:.2f}",
+        "",
+        "📈 الأهداف:",
+        f"🥇 الهدف الأول: {contract.tp1:.2f}",
+        f"🥈 الهدف الثاني: {contract.tp2:.2f}",
+        f"🥉 الهدف الثالث: {contract.tp3:.2f}",
+        "",
+        f"🛑 الوقف: {contract.stop_rule}",
+        "",
+        "⚠️ تنبيه: هذا الطرح تعليمي وليس توصية استثمارية، والقرار النهائي يعود للمتداول",
+        "",
+        "📢 @Option_Strike01",
     ])
 
-def build_telegram_app() -> Application:
-    application = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+def build_update_post(contract: ContractCandidate, high_price: float) -> str:
+    profit_pct = ((high_price - contract.entry_price) / contract.entry_price) * 100 if contract.entry_price > 0 else 0
+    title = f"🔔 تحديث | SPXW ${contract.strike_price} {'كول' if contract.contract_type == 'call' else 'بوت'}"
+    return "\n".join([
+        title,
+        "",
+        f"📊 سعر الدخول: {contract.entry_price:.2f}",
+        f"💰 الأعلى المحقق: {high_price:.2f}",
+        f"📈 نسبة الربح: +{profit_pct:.2f}%",
+        "",
+        "⚠️ تنبيه: هذا الطرح تعليمي",
+        "والقرار النهائي يعود للمتداول.",
+        "",
+        "📢 @Option_Strike01.",
+    ])
 
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("analysis", cmd_analysis))
-    application.add_handler(CommandHandler("contract", cmd_new_contract))
-    application.add_handler(CommandHandler("hunt", cmd_hunt))
-    application.add_handler(CommandHandler("records", cmd_records))
-    application.add_handler(CommandHandler("reports", cmd_reports))
-    application.add_handler(CommandHandler("strategy", cmd_strategy))
-    application.add_handler(CommandHandler("help", cmd_help))
-    application.add_handler(CommandHandler("broadcast", cmd_broadcast))
-    application.add_handler(CommandHandler("status", cmd_status))
-    application.add_handler(CallbackQueryHandler(callback_handler))
 
-    jq = application.job_queue
+# =========================
+# Telegram sender
+# =========================
 
-    # 4:30 ET
-    jq.run_daily(job_premarket, time=dt_time(hour=4, minute=30, tzinfo=TZ), name="premarket")
+def send_telegram(text: str) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("Telegram token/chat id missing. Skipping send.")
+        return False
 
-    # 11:30, 13:30, 15:30, 17:30, 19:30 ET
-    strategy_times = [(11, 30), (13, 30), (15, 30), (17, 30), (19, 30)]
-    for h, m in strategy_times:
-        jq.run_daily(job_strategy_contract, time=dt_time(hour=h, minute=m, tzinfo=TZ), name=f"strategy_{h}_{m}")
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
 
-    # 15 عقد تقريبًا
-    daily_times = [
-        (4,30),(5,45),(7,0),(8,15),(9,30),
-        (10,45),(12,0),(13,15),(14,30),(15,45),
-        (17,0),(18,15),(19,30),(20,45),(22,0)
-    ]
-    for h, m in daily_times:
-        jq.run_daily(job_daily_contract, time=dt_time(hour=h, minute=m, tzinfo=TZ), name=f"daily_{h}_{m}")
+    res = requests.post(TELEGRAM_API, json=payload, timeout=HTTP_TIMEOUT)
+    if not res.ok:
+        logger.error("Telegram error %s: %s", res.status_code, res.text)
+        return False
+    return True
 
-    # التقرير اليومي
-    jq.run_daily(job_daily_report, time=dt_time(hour=16, minute=45, tzinfo=TZ), name="daily_report")
 
-    return application
+# =========================
+# Core execution
+# =========================
 
-tg_app = build_telegram_app()
+def register_open_contract(contract: ContractCandidate, mode: str) -> None:
+    contracts_open.append({
+        "ticker": contract.ticker,
+        "strike_price": contract.strike_price,
+        "contract_type": contract.contract_type,
+        "expiration_date": contract.expiration_date,
+        "entry_price": contract.entry_price,
+        "tp1": contract.tp1,
+        "tp2": contract.tp2,
+        "tp3": contract.tp3,
+        "mode": mode,
+        "opened_at": now_riyadh().isoformat(),
+        "status": "open",
+    })
 
-# ─────────────────────────────────────────
-# FastAPI Webhook App
-# ─────────────────────────────────────────
-app = FastAPI(title="SPX Bot Webhook")
-
-@app.on_event("startup")
-async def on_startup():
-    await tg_app.initialize()
-    await tg_app.start()
-    logger.info("Telegram application started")
-
-    if WEBHOOK_URL:
+def maybe_close_contracts() -> None:
+    still_open = []
+    for row in contracts_open:
         try:
-            await tg_app.bot.set_webhook(url=WEBHOOK_URL)
-            logger.info(f"Webhook set to: {WEBHOOK_URL}")
-        except Exception as e:
-            logger.error(f"Failed to set webhook: {e}")
-    else:
-        logger.warning("WEBHOOK_URL not set - webhook was not configured automatically")
+            data = req(
+                f"{MASSIVE_BASE}/v3/snapshot/options/{OPTIONS_UNDERLYING}",
+                {
+                    "expiration_date": row["expiration_date"],
+                    "contract_type": row["contract_type"],
+                    "strike_price": row["strike_price"],
+                    "limit": 5,
+                },
+            )
+            results = data.get("results", [])
+            found = None
+            for item in results:
+                details = item.get("details", {})
+                if details.get("ticker") == row["ticker"]:
+                    found = item
+                    break
 
-@app.on_event("shutdown")
-async def on_shutdown():
-    try:
-        await tg_app.stop()
-        await tg_app.shutdown()
-        logger.info("Telegram application stopped")
-    except Exception as e:
-        logger.error(f"Shutdown error: {e}")
+            if not found:
+                still_open.append(row)
+                continue
+
+            current_price = option_price_from_snapshot(found)
+            if current_price <= 0:
+                still_open.append(row)
+                continue
+
+            if current_price >= row["tp3"] or current_price <= max(0.01, row["entry_price"] * 0.5):
+                row["closed_at"] = now_riyadh().isoformat()
+                row["close_price"] = round(current_price, 2)
+                row["status"] = "closed"
+                contracts_closed.append(row)
+            else:
+                row["last_price"] = round(current_price, 2)
+                still_open.append(row)
+        except Exception as exc:
+            logger.warning("Contract update failed: %s", exc)
+            still_open.append(row)
+
+    contracts_open[:] = still_open
+
+def run_bot(mode: str = "daily", force_time: Optional[datetime] = None) -> Dict[str, Any]:
+    current_dt = force_time or now_riyadh()
+    slot = current_dt.strftime("%Y-%m-%d %H:%M")
+
+    result = pick_best_contract(mode=mode)
+    if not result:
+        msg = f"⏸️ لا توجد فرصة مطابقة الآن | {mode} | {slot}"
+        send_telegram(msg)
+        return {"ok": False, "message": msg}
+
+    market_state, pivot_plan, contract = result
+    is_premarket = current_dt.strftime("%H:%M") in PREMARKET_TIMES
+
+    report = build_bot_spacs_report(market_state, pivot_plan, contract, is_premarket=is_premarket)
+    trade_post = build_new_trade_post(contract)
+
+    send_telegram(report)
+    send_telegram(f"<pre>{escape_html(trade_post)}</pre>")
+
+    register_open_contract(contract, mode=mode)
+
+    row = {
+        "slot": slot,
+        "mode": mode,
+        "market_state": asdict(market_state),
+        "pivot_plan": asdict(pivot_plan),
+        "contract": asdict(contract),
+    }
+
+    if mode == "strategy":
+        strategy_reports.append(row)
+    else:
+        daily_reports.append(row)
+
+    return {"ok": True, "slot": slot, "mode": mode, "contract": asdict(contract)}
+
+async def scheduler_loop() -> None:
+    logger.info("Scheduler loop started")
+    while True:
+        try:
+            now_dt = now_riyadh()
+            hhmm = now_dt.strftime("%H:%M")
+            slot_key = now_dt.strftime("%Y-%m-%d %H:%M")
+
+            if hhmm in DAILY_TIMES and slot_key not in sent_slots:
+                mode = "strategy" if hhmm in STRATEGY_TIMES else "daily"
+                logger.info("Running scheduled mode=%s slot=%s", mode, slot_key)
+                run_bot(mode=mode, force_time=now_dt)
+                sent_slots.add(slot_key)
+
+            maybe_close_contracts()
+
+            # clear old sent slots daily
+            old_prefix = (now_dt - timedelta(days=2)).strftime("%Y-%m-%d")
+            sent_slots_copy = set(sent_slots)
+            for item in sent_slots_copy:
+                if item.startswith(old_prefix):
+                    sent_slots.discard(item)
+
+        except Exception as exc:
+            logger.exception("Scheduler loop error: %s", exc)
+
+        await asyncio.sleep(20)
+
+
+# =========================
+# FastAPI app
+# =========================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global app_task
+    missing = []
+    if not TELEGRAM_BOT_TOKEN:
+        missing.append("TELEGRAM_BOT_TOKEN")
+    if not TELEGRAM_CHAT_ID:
+        missing.append("TELEGRAM_CHAT_ID")
+    if not MARKET_API_KEY:
+        missing.append("MARKET_API_KEY")
+
+    if missing:
+        logger.warning("Missing environment variables: %s", ", ".join(missing))
+    app_task = asyncio.create_task(scheduler_loop())
+    yield
+    if app_task:
+        app_task.cancel()
+        try:
+            await app_task
+        except asyncio.CancelledError:
+            pass
+
+app = FastAPI(title="Bot Spacs SPX", version="1.0.0", lifespan=lifespan)
+
 
 @app.get("/")
-async def root():
+def root():
     return {
         "ok": True,
-        "service": "SPX BOT",
-        "time": market_time_str(),
-        "massive_key": bool(MASSIVE_API_KEY),
-        "admin_id_set": bool(ADMIN_ID),
-        "webhook_url_set": bool(WEBHOOK_URL),
+        "name": "Bot Spacs SPX",
+        "timezone": TIMEZONE,
+        "direction_symbol": MARKET_DIRECTION_SYMBOL,
         "options_underlying": OPTIONS_UNDERLYING,
-        "index_ticker": US500_INDEX_TICKER,
+        "daily_times": sorted(list(DAILY_TIMES)),
+        "strategy_times": sorted(list(STRATEGY_TIMES)),
     }
 
 @app.get("/health")
-async def health():
-    return {"status": "healthy", "time": market_time_str()}
+def health():
+    return {
+        "ok": True,
+        "time": now_riyadh().isoformat(),
+        "telegram_configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
+        "market_api_configured": bool(MARKET_API_KEY),
+        "open_contracts": len(contracts_open),
+        "closed_contracts": len(contracts_closed),
+    }
 
-@app.post("/webhook/{secret}")
-async def telegram_webhook(secret: str, request: Request):
-    if secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=403, detail="Forbidden")
+@app.get("/status")
+def status():
+    market_state, pivot_plan = get_current_market_state()
+    return {
+        "market_state": asdict(market_state),
+        "pivot_plan": asdict(pivot_plan),
+        "open_contracts": contracts_open[-10:],
+        "closed_contracts": contracts_closed[-10:],
+    }
 
-    if not TELEGRAM_TOKEN:
-        raise HTTPException(status_code=500, detail="TELEGRAM_TOKEN missing")
+@app.post("/run")
+def manual_run(payload: ManualRunRequest):
+    force_dt = None
+    if payload.now_override:
+        force_dt = datetime.fromisoformat(payload.now_override)
+        if force_dt.tzinfo is None:
+            force_dt = force_dt.replace(tzinfo=RIYADH)
+        else:
+            force_dt = force_dt.astimezone(RIYADH)
 
-    try:
-        data = await request.json()
-        update = Update.de_json(data, tg_app.bot)
-        await tg_app.process_update(update)
-        return {"ok": True}
-    except Exception as e:
-        logger.exception(f"Webhook processing failed: {e}")
-        raise HTTPException(status_code=500, detail="Webhook processing failed")
+    return manual_run_impl(payload.mode, force_dt)
+
+def manual_run_impl(mode: str, force_dt: Optional[datetime]):
+    mode = mode.lower().strip()
+    if mode not in {"daily", "strategy"}:
+        return {"ok": False, "error": "mode must be daily or strategy"}
+    return run_bot(mode=mode, force_time=force_dt)
+
+@app.get("/report/daily")
+def report_daily():
+    return {"count": len(daily_reports), "items": daily_reports[-20:]}
+
+@app.get("/report/strategy")
+def report_strategy():
+    return {"count": len(strategy_reports), "items": strategy_reports[-20:]}
+
+@app.get("/contracts/open")
+def contracts_open_view():
+    return {"count": len(contracts_open), "items": contracts_open}
+
+@app.get("/contracts/closed")
+def contracts_closed_view():
+    return {"count": len(contracts_closed), "items": contracts_closed}
+
+@app.get("/sample-post")
+def sample_post():
+    result = pick_best_contract(mode="daily")
+    if not result:
+        return {"ok": False, "message": "No contract found"}
+    market_state, pivot_plan, contract = result
+    return {
+        "bot_report": build_bot_spacs_report(market_state, pivot_plan, contract),
+        "new_trade_post": build_new_trade_post(contract),
+        "tradingview_symbol": build_tradingview_option_symbol(contract.ticker),
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host=APP_HOST, port=APP_PORT)
