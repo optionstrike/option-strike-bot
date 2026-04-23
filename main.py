@@ -57,7 +57,7 @@ NEWS_CACHE_TTL_SECONDS = 900
 # إعدادات الصياد
 # =========================
 
-MAX_SIGNALS_PER_DAY = 5
+MAX_SIGNALS_PER_DAY = 6
 MAX_SIGNALS_PER_SCAN = 1
 STOCK_COOLDOWN_DAYS = 3
 TREND_CONFIRM_HOURS = 1
@@ -136,16 +136,6 @@ SPAC_TICKERS = {
 
 INDEX_TICKERS = {"US500", "SPY", "QQQ", "SPX", "NDX", "US100"}
 
-FRIDAY_ZERO_HERO_TICKERS = ["TSLA", "MU", "META", "APP", "CAT", "CVNA"]
-FRIDAY_ZERO_HERO_SLOT_ORDER = [
-    ((16, 45), "TSLA"),
-    ((17, 0), "MU"),
-    ((17, 15), "META"),
-    ((17, 45), "APP"),
-    ((18, 15), "CAT"),
-    ((19, 0), "CVNA")
-]
-
 MIN_DTE_DAYS = 1
 MAX_DTE_DAYS = 30
 INDEX_MAX_DTE_DAYS = 7
@@ -161,19 +151,17 @@ NO_ENTRY_FIRST_MINUTES = 30
 # قائمة الأسهم
 # =========================
 
-WATCHLIST = list(dict.fromkeys([
-    "GLD", "IBM", "V", "JPM", "SBUX", "MMM", "QCOM", "GOOG", "INTC", "NFLX", "GS", "SMH",
-    "ABNB", "TWLO", "DASH", "PYPL", "DHI", "BE", "ENPH", "JNJ", "DELL", "BIDU", "RDDT",
-    "DDOG", "UPS", "DE", "NOW", "UBER", "INTU", "LRCX", "LOW", "HD", "PANW", "BA", "ZS",
-    "MRVL", "ULTA", "SMCI", "MARA", "MCD", "PDD", "FDX", "FSLR", "COST", "SHOP", "ALB",
-    "NBIS", "ARM", "CRCL", "ABBV", "HOOD", "BABA", "ADBE", "LULU", "ORCL", "LLY", "TSM",
-    "CVNA", "COIN", "CRWV", "CAT", "AMD", "SNOW", "MDB", "AMZN", "MU", "CRM", "GE",
-    "NVDA", "AAPL", "GOOGL", "MSFT", "TSLA", "META", "AVGO", "CRWD", "APP", "UNH",
-    "MSTR", "PLTR", "US500", "SPY", "QQQ", "SPX", "NDX", "US100"
-]))
+PRIORITY_45_TICKERS = [
+    "NVDA", "AAPL", "GOOGL", "MSFT", "META", "TSLA", "UNH", "MSTR", "COIN", "LLY",
+    "AVGO", "APP", "CRWD", "TSM", "PLTR", "CVNA", "AMD", "CRWV", "CAT", "SNOW",
+    "CRM", "COST", "MU", "MDB", "AMZN", "FSLR", "GE", "NBIS", "CRCL", "DELL",
+    "LRCX", "HD", "LOW", "ADBE", "ORCL", "ARM", "BA", "FDX", "RDDT", "GLD",
+    "IBM", "GS", "SMH", "V"
+]
 
-PRIORITY_WATCHLIST = WATCHLIST[:30]
-PRIORITY_WATCHLIST_SET = set(PRIORITY_WATCHLIST)
+FRIDAY_ZERO_HERO_TICKERS = ["TSLA", "MU", "META", "APP", "CAT", "CVNA"]
+
+WATCHLIST = list(dict.fromkeys(PRIORITY_45_TICKERS))
 
 HTTP = requests.Session()
 
@@ -322,41 +310,26 @@ def get_market_open_close_riyadh(target_date=None):
     return market_open_et.astimezone(RIYADH_TZ), market_close_et.astimezone(RIYADH_TZ)
 
 def get_regular_scan_slots_riyadh(target_date=None):
-    market_open_riyadh, market_close_riyadh = get_market_open_close_riyadh(target_date)
-    slot = (market_open_riyadh + timedelta(minutes=NO_ENTRY_FIRST_MINUTES)).replace(second=0, microsecond=0)
+    now_riyadh = datetime.now(RIYADH_TZ)
+    if target_date is None:
+        target_date = now_riyadh.date()
 
-    slots = []
-    while slot <= market_close_riyadh:
-        slots.append(slot)
-        slot += timedelta(hours=1)
-
-    extra_slot = datetime(target_date.year, target_date.month, target_date.day, 17, 30, tzinfo=RIYADH_TZ)
-    if extra_slot not in slots and market_open_riyadh <= extra_slot <= market_close_riyadh:
-        slots.append(extra_slot)
-
-    return sorted(slots)
+    raw_times = [(17, 0), (17, 30), (18, 0), (19, 0), (20, 0), (21, 0)]
+    return [datetime(target_date.year, target_date.month, target_date.day, hh, mm, tzinfo=RIYADH_TZ) for hh, mm in raw_times]
 
 def get_friday_zero_hero_slots_riyadh(target_date=None):
     now_riyadh = datetime.now(RIYADH_TZ)
     if target_date is None:
         target_date = now_riyadh.date()
 
-    return [
-        datetime(target_date.year, target_date.month, target_date.day, hh, mm, tzinfo=RIYADH_TZ)
-        for (hh, mm), _ticker in FRIDAY_ZERO_HERO_SLOT_ORDER
-    ]
+    raw_times = [(16, 45), (17, 0), (17, 15), (17, 45), (18, 15), (19, 0)]
+    return [datetime(target_date.year, target_date.month, target_date.day, hh, mm, tzinfo=RIYADH_TZ) for hh, mm in raw_times]
 
-def get_friday_slot_ticker(now_riyadh=None):
+def get_active_watchlist(now_riyadh=None):
     now_riyadh = now_riyadh or datetime.now(RIYADH_TZ)
-    if now_riyadh.weekday() != 4 or not FRIDAY_ZERO_HERO_ENABLED:
-        return None
-
-    for (hh, mm), ticker in FRIDAY_ZERO_HERO_SLOT_ORDER:
-        slot = datetime(now_riyadh.year, now_riyadh.month, now_riyadh.day, hh, mm, tzinfo=RIYADH_TZ)
-        diff = (now_riyadh - slot).total_seconds()
-        if 0 <= diff <= 70:
-            return ticker
-    return None
+    if now_riyadh.weekday() == 4 and FRIDAY_ZERO_HERO_ENABLED:
+        return FRIDAY_ZERO_HERO_TICKERS
+    return WATCHLIST
 
 def get_due_scanner_slot_key(now_riyadh=None):
     now_riyadh = now_riyadh or datetime.now(RIYADH_TZ)
@@ -1094,7 +1067,7 @@ def calc_success_rate(c: dict, o: dict, contract: dict):
 # اختيار العقد
 # =========================
 
-def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None, force_zero_hero_only: bool = False):
+def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
     try:
         chain = get_option_chain_snapshot(ticker)
         if not chain:
@@ -1156,9 +1129,6 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None, forc
                 if success_rate >= ZERO_HERO_MIN_SUCCESS_RATE:
                     contract["success_rate"] = success_rate
                     return contract
-
-        if force_zero_hero_only:
-            return None
 
         stage1 = []
         for x in parsed:
@@ -1624,7 +1594,7 @@ def msg_daily_report():
         f"📋 <b>التقرير اليومي</b>\n\n"
         f"📊 عدد الإشارات اليوم: {DAILY_SIGNAL_STATE['count']}/{MAX_SIGNALS_PER_DAY}\n"
         f"📂 العقود المفتوحة حالياً: {len(OPEN_CONTRACT_SIGNALS)}\n"
-        f"📈 الأسهم في القائمة: {len(WATCHLIST)}\n\n"
+        f"📈 الأسهم في القائمة: {len(get_active_watchlist())}\n\n"
     )
 
     if OPEN_CONTRACT_SIGNALS:
@@ -2175,7 +2145,7 @@ def get_earnings_for_date(date_str: str):
         filtered = []
         for item in results:
             ticker = (item.get("ticker") or item.get("symbol") or "").upper().strip()
-            if not ticker or ticker not in WATCHLIST:
+            if not ticker or ticker not in set(WATCHLIST) | set(FRIDAY_ZERO_HERO_TICKERS):
                 continue
 
             event_date = item.get("date") or item.get("reportDate") or item.get("earnings_date") or date_str
@@ -2241,19 +2211,9 @@ def scanner_cycle():
         print("[SCANNER] داخل أول نصف ساعة من الافتتاح - لا يوجد دخول حالياً")
         return
 
-    now_riyadh = datetime.now(RIYADH_TZ)
-    friday_forced_ticker = get_friday_slot_ticker(now_riyadh)
-    friday_zero_hero_mode = friday_forced_ticker is not None
-
-    if friday_zero_hero_mode:
-        scan_watchlist = [friday_forced_ticker]
-    else:
-        remaining_watchlist = [x for x in WATCHLIST if x not in PRIORITY_WATCHLIST_SET]
-        scan_watchlist = PRIORITY_WATCHLIST + remaining_watchlist
-
     results = []
 
-    for ticker in scan_watchlist:
+    for ticker in get_active_watchlist():
         try:
             if stock_in_cooldown(ticker):
                 continue
@@ -2270,7 +2230,7 @@ def scanner_cycle():
                 continue
 
             o = options_info_from_massive(ticker, c["price"])
-            contract = choose_best_contract_from_massive(ticker, c, o, force_zero_hero_only=friday_zero_hero_mode)
+            contract = choose_best_contract_from_massive(ticker, c, o)
             if not contract:
                 continue
 
@@ -2283,17 +2243,16 @@ def scanner_cycle():
             contract["news_items"] = news_items
             contract["earnings_event"] = earnings_event
 
-            priority_rank = 1 if ticker in PRIORITY_WATCHLIST_SET else 0
-            results.append((priority_rank, ticker, score, c, o, contract))
+            results.append((ticker, score, c, o, contract))
 
         except Exception as e:
             print(f"[SCANNER ITEM ERROR] {ticker}: {e}")
             continue
 
-    results.sort(key=lambda x: (x[0], x[2]), reverse=True)
+    results.sort(key=lambda x: x[1], reverse=True)
 
     sent_now = 0
-    for _priority_rank, ticker, score, c, o, contract in results:
+    for ticker, score, c, o, contract in results:
         if not can_send_more_today():
             break
         if stock_in_cooldown(ticker):
@@ -2547,7 +2506,7 @@ def process_tradingview_signal(payload: dict):
             send("❌ TradingView: لا يوجد ticker في الرسالة", chat_id=CHAT_ID)
             return {"ok": True}
 
-        if ticker not in WATCHLIST:
+        if ticker not in set(WATCHLIST) | set(FRIDAY_ZERO_HERO_TICKERS):
             send(f"❌ TradingView: السهم {ticker} غير موجود في القائمة", chat_id=CHAT_ID)
             return {"ok": True}
 
@@ -2662,7 +2621,7 @@ async def webhook(req: Request):
             ticker = parts[0]
             tf = parts[1].lower() if len(parts) > 1 else get_state(user)["tf"]
 
-            if ticker not in WATCHLIST:
+            if ticker not in set(WATCHLIST) | set(FRIDAY_ZERO_HERO_TICKERS):
                 send(
                     f"❌ السهم <b>{ticker}</b> غير موجود في القائمة\n\n"
                     f"أمثلة: NVDA, AAPL, TSLA, SPY",
@@ -2787,7 +2746,7 @@ async def webhook(req: Request):
                 send("❗ أرسل رمز السهم أولاً مثل: <code>NVDA</code>\nثم اضغط الزر مرة ثانية", main_menu(), chat_id=user)
                 return {"ok": True}
 
-            if ticker not in WATCHLIST:
+            if ticker not in set(WATCHLIST) | set(FRIDAY_ZERO_HERO_TICKERS):
                 send(f"❌ السهم <b>{ticker}</b> غير موجود في القائمة", chat_id=user)
                 return {"ok": True}
 
@@ -2837,7 +2796,7 @@ def home():
     return {
         "status": "LIVE ✅",
         "api": "Polygon.io + FMP",
-        "watchlist_count": len(WATCHLIST),
+        "watchlist_count": len(get_active_watchlist()),
         "daily_limit": MAX_SIGNALS_PER_DAY,
         "stock_cooldown_days": STOCK_COOLDOWN_DAYS,
         "trend_confirm_hours": TREND_CONFIRM_HOURS,
