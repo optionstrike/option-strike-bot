@@ -115,8 +115,8 @@ EARNINGS_MAX_BUTTONS = 100
 
 FRIDAY_ZERO_HERO_ENABLED = True
 ZERO_HERO_ONLY_ON_FRIDAY = True
-ZERO_HERO_MIN_PRICE = 0.20
-ZERO_HERO_MAX_PRICE = 2.00
+ZERO_HERO_MIN_PRICE = 0.70
+ZERO_HERO_MAX_PRICE = 2.50
 ZERO_HERO_MIN_SUCCESS_RATE = 75
 ZERO_HERO_MIN_OI = 100
 ZERO_HERO_MIN_PROB = 65
@@ -135,6 +135,16 @@ SPAC_TICKERS = {
 }
 
 INDEX_TICKERS = {"US500", "SPY", "QQQ", "SPX", "NDX", "US100"}
+
+FRIDAY_ZERO_HERO_TICKERS = ["TSLA", "MU", "META", "APP", "CAT", "CVNA"]
+FRIDAY_ZERO_HERO_SLOT_ORDER = [
+    ((16, 45), "TSLA"),
+    ((17, 0), "MU"),
+    ((17, 15), "META"),
+    ((17, 45), "APP"),
+    ((18, 15), "CAT"),
+    ((19, 0), "CVNA")
+]
 
 MIN_DTE_DAYS = 1
 MAX_DTE_DAYS = 30
@@ -161,6 +171,9 @@ WATCHLIST = list(dict.fromkeys([
     "NVDA", "AAPL", "GOOGL", "MSFT", "TSLA", "META", "AVGO", "CRWD", "APP", "UNH",
     "MSTR", "PLTR", "US500", "SPY", "QQQ", "SPX", "NDX", "US100"
 ]))
+
+PRIORITY_WATCHLIST = WATCHLIST[:30]
+PRIORITY_WATCHLIST_SET = set(PRIORITY_WATCHLIST)
 
 HTTP = requests.Session()
 
@@ -316,15 +329,34 @@ def get_regular_scan_slots_riyadh(target_date=None):
     while slot <= market_close_riyadh:
         slots.append(slot)
         slot += timedelta(hours=1)
-    return slots
+
+    extra_slot = datetime(target_date.year, target_date.month, target_date.day, 17, 30, tzinfo=RIYADH_TZ)
+    if extra_slot not in slots and market_open_riyadh <= extra_slot <= market_close_riyadh:
+        slots.append(extra_slot)
+
+    return sorted(slots)
 
 def get_friday_zero_hero_slots_riyadh(target_date=None):
     now_riyadh = datetime.now(RIYADH_TZ)
     if target_date is None:
         target_date = now_riyadh.date()
 
-    raw_times = [(16, 45), (17, 30), (18, 0), (18, 30), (19, 0)]
-    return [datetime(target_date.year, target_date.month, target_date.day, hh, mm, tzinfo=RIYADH_TZ) for hh, mm in raw_times]
+    return [
+        datetime(target_date.year, target_date.month, target_date.day, hh, mm, tzinfo=RIYADH_TZ)
+        for (hh, mm), _ticker in FRIDAY_ZERO_HERO_SLOT_ORDER
+    ]
+
+def get_friday_slot_ticker(now_riyadh=None):
+    now_riyadh = now_riyadh or datetime.now(RIYADH_TZ)
+    if now_riyadh.weekday() != 4 or not FRIDAY_ZERO_HERO_ENABLED:
+        return None
+
+    for (hh, mm), ticker in FRIDAY_ZERO_HERO_SLOT_ORDER:
+        slot = datetime(now_riyadh.year, now_riyadh.month, now_riyadh.day, hh, mm, tzinfo=RIYADH_TZ)
+        diff = (now_riyadh - slot).total_seconds()
+        if 0 <= diff <= 70:
+            return ticker
+    return None
 
 def get_due_scanner_slot_key(now_riyadh=None):
     now_riyadh = now_riyadh or datetime.now(RIYADH_TZ)
@@ -1062,7 +1094,7 @@ def calc_success_rate(c: dict, o: dict, contract: dict):
 # اختيار العقد
 # =========================
 
-def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
+def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None, force_zero_hero_only: bool = False):
     try:
         chain = get_option_chain_snapshot(ticker)
         if not chain:
@@ -1124,6 +1156,9 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
                 if success_rate >= ZERO_HERO_MIN_SUCCESS_RATE:
                     contract["success_rate"] = success_rate
                     return contract
+
+        if force_zero_hero_only:
+            return None
 
         stage1 = []
         for x in parsed:
@@ -2206,9 +2241,19 @@ def scanner_cycle():
         print("[SCANNER] داخل أول نصف ساعة من الافتتاح - لا يوجد دخول حالياً")
         return
 
+    now_riyadh = datetime.now(RIYADH_TZ)
+    friday_forced_ticker = get_friday_slot_ticker(now_riyadh)
+    friday_zero_hero_mode = friday_forced_ticker is not None
+
+    if friday_zero_hero_mode:
+        scan_watchlist = [friday_forced_ticker]
+    else:
+        remaining_watchlist = [x for x in WATCHLIST if x not in PRIORITY_WATCHLIST_SET]
+        scan_watchlist = PRIORITY_WATCHLIST + remaining_watchlist
+
     results = []
 
-    for ticker in WATCHLIST:
+    for ticker in scan_watchlist:
         try:
             if stock_in_cooldown(ticker):
                 continue
@@ -2225,7 +2270,7 @@ def scanner_cycle():
                 continue
 
             o = options_info_from_massive(ticker, c["price"])
-            contract = choose_best_contract_from_massive(ticker, c, o)
+            contract = choose_best_contract_from_massive(ticker, c, o, force_zero_hero_only=friday_zero_hero_mode)
             if not contract:
                 continue
 
@@ -2238,16 +2283,17 @@ def scanner_cycle():
             contract["news_items"] = news_items
             contract["earnings_event"] = earnings_event
 
-            results.append((ticker, score, c, o, contract))
+            priority_rank = 1 if ticker in PRIORITY_WATCHLIST_SET else 0
+            results.append((priority_rank, ticker, score, c, o, contract))
 
         except Exception as e:
             print(f"[SCANNER ITEM ERROR] {ticker}: {e}")
             continue
 
-    results.sort(key=lambda x: x[1], reverse=True)
+    results.sort(key=lambda x: (x[0], x[2]), reverse=True)
 
     sent_now = 0
-    for ticker, score, c, o, contract in results:
+    for _priority_rank, ticker, score, c, o, contract in results:
         if not can_send_more_today():
             break
         if stock_in_cooldown(ticker):
