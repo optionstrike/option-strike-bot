@@ -11,9 +11,9 @@ IMPORTANT:
   and executes on SPX index options (underlying: I:SPX).
 
 Required env vars:
-    TELEGRAM_BOT_TOKEN=...
-    TELEGRAM_CHAT_ID=...
-    MARKET_API_KEY=...
+    TELEGRAM_BOT_TOKEN="8733160640:AAHbA38rl-VBX0lC8sw6juUSbFwSs9sLuoU"
+    TELEGRAM_CHAT_ID=""id":8371374055"
+    MARKET_API_KEY="AcbX3y7rKzou3MzUi8EVlETdYLFsVGa2"
 
 Optional env vars:
     APP_HOST=0.0.0.0
