@@ -1,5 +1,8 @@
 from fastapi import FastAPI, Request
 import requests
+import io
+import json
+import os
 import yfinance as yf
 import pandas as pd
 import time
@@ -22,6 +25,8 @@ MASSIVE_API_KEY = "AcbX3y7rKzou3MzUi8EVlETdYLFsVGa2"
 FMP_API_KEY = "xQ7wdkVapeynP4FsDL4dBLMisFkbN2qL"
 
 API_SEND = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+API_SEND_PHOTO = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
+API_EDIT_MEDIA = f"https://api.telegram.org/bot{TOKEN}/editMessageMedia"
 API_ANSWER = f"https://api.telegram.org/bot{TOKEN}/answerCallbackQuery"
 
 MASSIVE_BASE = "https://api.polygon.io"
@@ -1329,6 +1334,161 @@ def send(msg, keyboard=None, chat_id=None):
     except Exception as e:
         print(f"[SEND ERROR] {e}")
 
+
+
+# =========================
+# صور الطرح والتحديث
+# =========================
+
+def _img_font(size: int, bold: bool = False):
+    try:
+        from PIL import ImageFont
+        candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        ]
+        for path in candidates:
+            if os.path.exists(path):
+                return ImageFont.truetype(path, size=size)
+        return ImageFont.load_default()
+    except Exception:
+        return None
+
+def _contract_type_en(row: dict):
+    return "Call" if row.get("contract_type") == "call" else "Put"
+
+def _format_option_header(row: dict):
+    ticker = row.get("ticker", "—")
+    strike = float(row.get("strike", 0) or 0)
+    exp = row.get("expiration", "")
+    try:
+        exp_dt = datetime.strptime(exp, "%Y-%m-%d")
+        exp_txt = exp_dt.strftime("%d %b %y")
+    except Exception:
+        exp_txt = str(exp)
+    return f"{ticker} ${strike:g}", f"{exp_txt}  {_contract_type_en(row)}"
+
+def build_contract_image(row: dict, is_update: bool = False):
+    """صورة بسيطة جداً مثل شاشة عقد الأوبشن. تفاصيل الطرح تبقى في الكابشن فقط."""
+    try:
+        from PIL import Image, ImageDraw
+    except Exception as e:
+        print(f"[IMAGE ERROR] Pillow غير متوفر: {e}")
+        return None
+
+    width, height = 1080, 1080
+    bg = (8, 13, 24)
+    panel = (13, 21, 36)
+    line = (34, 48, 72)
+    white = (245, 247, 250)
+    muted = (148, 163, 184)
+    green = (28, 199, 130)
+    red = (255, 77, 109)
+    orange = (255, 145, 43)
+
+    is_call = row.get("contract_type") == "call"
+    accent = green if is_call else red
+
+    entry = float(row.get("entry_price", row.get("contract_price", 0)) or 0)
+    current = float(row.get("current_price", entry) or entry)
+    high = float(row.get("highest_price", current) or current)
+    display_price = high if is_update else current
+    pnl = ((display_price - entry) / entry) * 100 if entry > 0 else 0
+    change_abs = display_price - entry if is_update else 0
+    change_color = green if pnl >= 0 else red
+
+    title1, title2 = _format_option_header(row)
+    option_ticker = str(row.get("option_ticker", ""))
+    oi = row.get("oi", "—")
+    vol = row.get("volume", row.get("vol", "—"))
+    mid = row.get("mid", row.get("contract_price", entry))
+
+    f_logo = _img_font(34, True)
+    f_title = _img_font(54, True)
+    f_sub = _img_font(34, False)
+    f_price = _img_font(150, True)
+    f_change = _img_font(42, True)
+    f_label = _img_font(34, False)
+    f_value = _img_font(36, True)
+    f_small = _img_font(27, False)
+
+    img = Image.new("RGB", (width, height), bg)
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle((46, 46, width-46, height-46), radius=46, fill=panel, outline=line, width=2)
+
+    draw.text((78, 78), "OPTION STRIKE", fill=orange, font=f_logo)
+    pill = "UPDATE" if is_update else "LIVE OPTION"
+    pill_fill = (18, 40, 34) if is_call else (48, 22, 32)
+    draw.rounded_rectangle((780, 74, 1000, 126), radius=22, fill=pill_fill, outline=accent, width=2)
+    draw.text((812, 84), pill, fill=accent, font=f_small)
+
+    draw.text((78, 180), title1, fill=white, font=f_title)
+    draw.text((78, 248), title2, fill=muted, font=f_sub)
+    draw.text((78, 385), f"{display_price:.2f}", fill=accent if is_update else white, font=f_price)
+
+    if is_update:
+        draw.text((84, 555), f"{change_abs:+.2f}   {pnl:+.2f}%", fill=change_color, font=f_change)
+        status = "WINNING" if pnl >= 0 else "LOSING"
+        draw.rounded_rectangle((78, 625, 350, 685), radius=22, fill=(9, 14, 25), outline=change_color, width=2)
+        draw.text((110, 637), status, fill=change_color, font=f_label)
+    else:
+        draw.text((84, 555), "Clean setup • details in caption", fill=muted, font=f_change)
+
+    y = 735
+    stats = [("Mid", mid), ("Open Int.", oi), ("Vol.", vol)]
+    if is_update:
+        stats = [("Entry", entry), ("High", high), ("PnL", f"{pnl:+.2f}%")]
+    for label, value in stats:
+        draw.text((90, y), str(label), fill=muted, font=f_label)
+        value_txt = f"{value:.2f}" if isinstance(value, float) else str(value)
+        draw.text((690, y), value_txt, fill=white, font=f_value)
+        y += 70
+
+    draw.line((78, 950, 1002, 950), fill=line, width=2)
+    footer = option_ticker[:55] if option_ticker else "@Option_Strike01"
+    draw.text((78, 978), footer, fill=muted, font=f_small)
+    draw.text((805, 978), "@Option_Strike01", fill=orange, font=f_small)
+
+    bio = io.BytesIO()
+    bio.name = f"{row.get('ticker','OPTION')}_{'update' if is_update else 'new'}.png"
+    img.save(bio, format="PNG")
+    bio.seek(0)
+    return bio
+
+def send_contract_image(row: dict, caption: str = "", keyboard=None, chat_id=None):
+    target_chat_id = str(chat_id) if chat_id else CHAT_ID
+    photo = build_contract_image(row, is_update=False)
+    if photo is None:
+        return send(caption, keyboard=keyboard, chat_id=target_chat_id)
+    data = {"chat_id": target_chat_id, "caption": caption, "parse_mode": "HTML"}
+    if keyboard:
+        data["reply_markup"] = json.dumps(keyboard)
+    try:
+        r = HTTP.post(API_SEND_PHOTO, data=data, files={"photo": photo}, timeout=30)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"[SEND PHOTO ERROR] {e}")
+        return send(caption, keyboard=keyboard, chat_id=target_chat_id)
+
+def edit_contract_image(row: dict, caption: str = "", chat_id=None):
+    target_chat_id = str(chat_id) if chat_id else CHAT_ID
+    message_id = row.get("message_id")
+    if not message_id:
+        return send_contract_image(row, caption=caption, chat_id=target_chat_id)
+    photo = build_contract_image(row, is_update=True)
+    if photo is None:
+        return send(caption, chat_id=target_chat_id)
+    media = {"type": "photo", "media": "attach://photo", "caption": caption, "parse_mode": "HTML"}
+    data = {"chat_id": target_chat_id, "message_id": message_id, "media": json.dumps(media)}
+    try:
+        r = HTTP.post(API_EDIT_MEDIA, data=data, files={"photo": photo}, timeout=30)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"[EDIT PHOTO ERROR] {e}")
+        return send_contract_image(row, caption=caption, chat_id=target_chat_id)
+
 def answer_callback(cb_id, text=""):
     try:
         HTTP.post(API_ANSWER, json={
@@ -1567,6 +1727,57 @@ def msg_contract(tk, tf, c, contract):
 
 📊 نسبة النجاح: <b>{contract['success_rate']}%</b>"""
 
+
+def calc_signal_pnl(row: dict):
+    entry = row.get("entry_price", 0) or 0
+    current = row.get("current_price") or row.get("highest_price") or entry
+    high = row.get("highest_price") or current or entry
+    if entry <= 0:
+        return 0.0, current, high
+    pnl = ((current - entry) / entry) * 100
+    return pnl, current, high
+
+def calc_signal_high_pnl(row: dict):
+    entry = row.get("entry_price", 0) or 0
+    high = row.get("highest_price") or entry
+    if entry <= 0:
+        return 0.0
+    return ((high - entry) / entry) * 100
+
+def signal_status(row: dict):
+    pnl, current, high = calc_signal_pnl(row)
+    entry = row.get("entry_price", 0) or 0
+    if high >= row.get("tp3", 10**9):
+        return "🏆 حقق TP3"
+    if high >= row.get("tp2", 10**9):
+        return "🥈 حقق TP2"
+    if high >= row.get("tp1", 10**9):
+        return "🥇 حقق TP1"
+    if current < entry:
+        return "🔴 خاسر"
+    if current > entry:
+        return "🟢 رابح"
+    return "⚪ مفتوح"
+
+def format_report_contract_line(row: dict, idx: int):
+    pnl, current, high = calc_signal_pnl(row)
+    high_pnl = calc_signal_high_pnl(row)
+    type_txt = "CALL" if row.get("contract_type") == "call" else "PUT"
+    type_icon = "🟢" if row.get("contract_type") == "call" else "🔴"
+    exp = format_short_date(row.get("expiration", ""))
+    created = row.get("created_at")
+    created_txt = created.strftime("%d/%m %H:%M") if created else "—"
+    status = signal_status(row)
+    return (
+        f"{idx}) <b>{row.get('ticker', '—')} {type_icon} {type_txt}</b> | "
+        f"{exp} | <code>{row.get('option_ticker', '—')}</code>\n"
+        f"   الحالة: <b>{status}</b>\n"
+        f"   دخول: {row.get('entry_price', 0):.2f} | الحالي: {current:.2f} | الأعلى: {high:.2f}\n"
+        f"   الأداء الحالي: <b>{pnl:+.2f}%</b> | أعلى ربح: <b>{high_pnl:+.2f}%</b>\n"
+        f"   الأهداف: {row.get('tp1', 0):.2f} / {row.get('tp2', 0):.2f} / {row.get('tp3', 0):.2f}\n"
+        f"   وقت الطرح: {created_txt}\n"
+    )
+
 def msg_open_contracts():
     if not OPEN_CONTRACT_SIGNALS:
         return "📂 لا توجد عقود مفتوحة حالياً."
@@ -1577,8 +1788,11 @@ def msg_open_contracts():
         msg += (
             f"{i}. <b>{sig['ticker']}</b>\n"
             f"العقد: <code>{sig['option_ticker']}</code>\n"
+            f"التاريخ: {format_short_date(sig.get('expiration', ''))}\n"
             f"النوع: {'CALL' if sig['contract_type'] == 'call' else 'PUT'}\n"
+            f"الحالة: {signal_status(sig)}\n"
             f"سعر الدخول: {sig['entry_price']:.2f}\n"
+            f"السعر الحالي: {sig.get('current_price', sig['highest_price']):.2f}\n"
             f"أعلى سعر: {sig['highest_price']:.2f}\n"
             f"TP1: {sig['tp1']:.2f} | TP2: {sig['tp2']:.2f} | TP3: {sig['tp3']:.2f}\n"
             f"تم التحديث الأول: {'نعم' if sig['first_update_sent'] else 'لا'}\n"
@@ -1589,31 +1803,54 @@ def msg_open_contracts():
 
 def msg_daily_report():
     reset_daily_counter_if_needed()
+    today = datetime.now().date()
+    today_rows = [x for x in SIGNAL_HISTORY if x.get("created_at") and x["created_at"].date() == today]
 
+    total = len(today_rows)
+    wins = losses = open_count = tp1_hits = tp2_hits = tp3_hits = 0
+
+    for row in today_rows:
+        pnl, current, high = calc_signal_pnl(row)
+        if high >= row.get("tp1", 10**9):
+            tp1_hits += 1
+        if high >= row.get("tp2", 10**9):
+            tp2_hits += 1
+        if high >= row.get("tp3", 10**9):
+            tp3_hits += 1
+        if current < row.get("entry_price", 0):
+            losses += 1
+        elif current > row.get("entry_price", 0) or high >= row.get("tp1", 10**9):
+            wins += 1
+        else:
+            open_count += 1
+
+    success_rate = (wins / total) * 100 if total else 0
     msg = (
-        f"📋 <b>التقرير اليومي</b>\n\n"
-        f"📊 عدد الإشارات اليوم: {DAILY_SIGNAL_STATE['count']}/{MAX_SIGNALS_PER_DAY}\n"
-        f"📂 العقود المفتوحة حالياً: {len(OPEN_CONTRACT_SIGNALS)}\n"
-        f"📈 الأسهم في القائمة: {len(get_active_watchlist())}\n\n"
+        f"📋 <b>تقرير عقود اليوم</b>\n"
+        f"━━━━━━━━━━━━━━\n\n"
+        f"📅 التاريخ: {datetime.now(RIYADH_TZ).strftime('%d/%m/%Y')}\n"
+        f"📊 إجمالي العقود: <b>{total}</b>\n"
+        f"🟢 الرابحة: {wins}\n"
+        f"🔴 الخاسرة: {losses}\n"
+        f"⚪ المفتوحة بدون حركة: {open_count}\n"
+        f"📈 نسبة النجاح: <b>{success_rate:.2f}%</b>\n\n"
+        f"🎯 تحقيق الأهداف:\n"
+        f"TP1: {tp1_hits}/{total}\n"
+        f"TP2: {tp2_hits}/{total}\n"
+        f"TP3: {tp3_hits}/{total}\n\n"
+        f"📦 <b>جميع العقود:</b>\n"
+        f"━━━━━━━━━━━━━━\n"
     )
-
-    if OPEN_CONTRACT_SIGNALS:
-        best_sig = max(
-            OPEN_CONTRACT_SIGNALS.values(),
-            key=lambda x: ((x['highest_price'] - x['entry_price']) / x['entry_price']) if x['entry_price'] > 0 else 0
-        )
-        best_pnl = ((best_sig["highest_price"] - best_sig["entry_price"]) / best_sig["entry_price"]) * 100 if best_sig["entry_price"] > 0 else 0
-
-        msg += (
-            f"🏆 <b>أفضل عقد اليوم</b>\n"
-            f"{best_sig['ticker']} | {'CALL' if best_sig['contract_type'] == 'call' else 'PUT'}\n"
-            f"سعر الدخول: {best_sig['entry_price']:.2f}\n"
-            f"أعلى سعر: {best_sig['highest_price']:.2f}\n"
-            f"نسبة الربح: {best_pnl:+.2f}%\n"
-        )
+    if not today_rows:
+        msg += "❌ لا توجد عقود مسجلة اليوم.\n"
     else:
-        msg += "ℹ️ لا توجد عقود مفتوحة لعرض أفضل أداء حالياً."
-
+        for i, row in enumerate(today_rows, 1):
+            msg += format_report_contract_line(row, i) + "\n"
+    msg += (
+        "⚠️ تنبيه: هذا التقرير تعليمي\n"
+        "والقرار النهائي يعود للمتداول.\n\n"
+        "📢 @Option_Strike01"
+    )
     return msg
 
 def msg_earnings_list(events, mode: str):
@@ -1769,7 +2006,6 @@ def get_week_start(dt=None):
 def msg_weekly_report():
     week_start = get_week_start()
     week_end = week_start + timedelta(days=6)
-
     week_rows = [x for x in SIGNAL_HISTORY if x.get("created_at") and week_start <= x["created_at"].date() <= week_end]
 
     if not week_rows:
@@ -1780,23 +2016,12 @@ def msg_weekly_report():
         )
 
     total = len(week_rows)
-    wins = 0
-    losses = 0
-    call_count = 0
-    put_count = 0
-    tp1_hits = 0
-    tp2_hits = 0
-    tp3_hits = 0
-
-    best_row = None
-    worst_row = None
-    total_pnl = 0.0
+    wins = losses = open_count = call_count = put_count = tp1_hits = tp2_hits = tp3_hits = 0
+    total_high_pnl = 0.0
 
     for row in week_rows:
-        entry = row.get("entry_price", 0) or 0
-        high = row.get("highest_price", entry) or entry
-        pnl = ((high - entry) / entry) * 100 if entry > 0 else 0.0
-        total_pnl += pnl
+        pnl, current, high = calc_signal_pnl(row)
+        total_high_pnl += calc_signal_high_pnl(row)
 
         if high >= row.get("tp1", 10**9):
             tp1_hits += 1
@@ -1805,67 +2030,51 @@ def msg_weekly_report():
         if high >= row.get("tp3", 10**9):
             tp3_hits += 1
 
-        if pnl > 0:
+        if current < row.get("entry_price", 0):
+            losses += 1
+        elif current > row.get("entry_price", 0) or high >= row.get("tp1", 10**9):
             wins += 1
         else:
-            losses += 1
+            open_count += 1
 
         if row.get("contract_type") == "call":
             call_count += 1
         else:
             put_count += 1
 
-        if best_row is None or pnl > best_row["pnl"]:
-            best_row = {"row": row, "pnl": pnl}
-        if worst_row is None or pnl < worst_row["pnl"]:
-            worst_row = {"row": row, "pnl": pnl}
-
     success_rate = (wins / total) * 100 if total else 0
-    avg_pnl = total_pnl / total if total else 0
+    avg_high_pnl = total_high_pnl / total if total else 0
 
-    msg = f"""🗓 <b>التقرير الأسبوعي</b>
+    msg = f"""🗓 <b>تقرير عقود الأسبوع</b>
+━━━━━━━━━━━━━━
 
 📅 الفترة: {week_start.strftime('%d/%m')} - {week_end.strftime('%d/%m')}
 
-📊 إجمالي العقود: {total}
-✅ الرابحة: {wins}
-❌ الخاسرة: {losses}
+📊 إجمالي العقود: <b>{total}</b>
+🟢 الرابحة: {wins}
+🔴 الخاسرة: {losses}
+⚪ المفتوحة بدون حركة: {open_count}
 📈 نسبة النجاح: <b>{success_rate:.2f}%</b>
 
 📦 توزيع العقود:
-🟢 Call: {call_count}
-🔴 Put: {put_count}
+🟢 CALL: {call_count}
+🔴 PUT: {put_count}
 
 🎯 تحقيق الأهداف:
 TP1: {tp1_hits}/{total}
 TP2: {tp2_hits}/{total}
 TP3: {tp3_hits}/{total}
 
-📉 متوسط الأداء: {avg_pnl:+.2f}%"""
+📉 متوسط أعلى أداء: <b>{avg_high_pnl:+.2f}%</b>
 
-    if best_row:
-        r = best_row["row"]
-        msg += f"""
+📦 <b>جميع عقود الأسبوع:</b>
+━━━━━━━━━━━━━━
+"""
 
-🏆 <b>أفضل عقد بالأسبوع</b>
-{r['ticker']} | {'CALL' if r['contract_type'] == 'call' else 'PUT'}
-دخول: {r['entry_price']:.2f}
-الأعلى: {r['highest_price']:.2f}
-الربح: {best_row['pnl']:+.2f}%"""
+    for i, row in enumerate(week_rows, 1):
+        msg += format_report_contract_line(row, i) + "\n"
 
-    if worst_row:
-        r = worst_row["row"]
-        msg += f"""
-
-📉 <b>أضعف عقد بالأسبوع</b>
-{r['ticker']} | {'CALL' if r['contract_type'] == 'call' else 'PUT'}
-دخول: {r['entry_price']:.2f}
-الأعلى: {r['highest_price']:.2f}
-النتيجة: {worst_row['pnl']:+.2f}%"""
-
-    msg += """
-
-⚠️ تنبيه: هذا التقرير تعليمي
+    msg += """⚠️ تنبيه: هذا التقرير تعليمي
 والقرار النهائي يعود للمتداول.
 
 📢 @Option_Strike01"""
@@ -1885,13 +2094,18 @@ def register_contract_signal(ticker: str, contract: dict):
         "expiration": contract["expiration"],
         "entry_price": contract["contract_price"],
         "highest_price": contract["contract_price"],
+        "current_price": contract["contract_price"],
         "tp1": contract["tp1"],
         "tp2": contract["tp2"],
         "tp3": contract["tp3"],
         "first_update_sent": False,
         "last_update_trigger_price": contract["tp1"],
         "created_at": datetime.now(),
-        "channel_title": f"{ticker} ${contract['strike']:.2f} {'كول' if contract['contract_type'] == 'call' else 'بوت'}"
+        "channel_title": f"{ticker} ${contract['strike']:.2f} {'كول' if contract['contract_type'] == 'call' else 'بوت'}",
+        "message_id": contract.get("message_id"),
+        "mid": contract.get("mid", contract.get("contract_price")),
+        "oi": contract.get("oi", "—"),
+        "volume": contract.get("volume", contract.get("vol", "—"))
     }
     OPEN_CONTRACT_SIGNALS[key] = row
     SIGNAL_HISTORY.append(row)
@@ -2260,7 +2474,11 @@ def scanner_cycle():
 
         send(msg_pro(ticker, "1h", c, o, contract), chat_id=CHAT_ID)
         time.sleep(1)
-        send(msg_channel_post(ticker, contract), chat_id=CHAT_ID)
+        photo_res = send_contract_image({"ticker": ticker, **contract}, caption=msg_channel_post(ticker, contract), chat_id=CHAT_ID)
+        try:
+            contract["message_id"] = photo_res.get("result", {}).get("message_id")
+        except Exception:
+            contract["message_id"] = None
 
         register_contract_signal(ticker, contract)
         mark_stock_sent(ticker)
@@ -2277,17 +2495,19 @@ def contract_update_cycle():
             if price is None:
                 continue
 
+            sig["current_price"] = price
+
             if price > sig["highest_price"]:
                 sig["highest_price"] = price
 
             if (not sig["first_update_sent"]) and price >= sig["tp1"]:
-                send(msg_contract_update(sig["channel_title"], sig["entry_price"], price), chat_id=CHAT_ID)
+                edit_contract_image(sig, caption=msg_contract_update(sig["channel_title"], sig["entry_price"], price), chat_id=CHAT_ID)
                 sig["first_update_sent"] = True
                 sig["last_update_trigger_price"] = price
                 continue
 
             if sig["first_update_sent"] and price >= sig["last_update_trigger_price"] + UPDATE_STEP_AFTER_TP1:
-                send(msg_contract_update(sig["channel_title"], sig["entry_price"], price), chat_id=CHAT_ID)
+                edit_contract_image(sig, caption=msg_contract_update(sig["channel_title"], sig["entry_price"], price), chat_id=CHAT_ID)
                 sig["last_update_trigger_price"] = price
 
         except Exception as e:
@@ -2542,7 +2762,11 @@ def process_tradingview_signal(payload: dict):
         if contract:
             send(msg_pro(ticker, tf, c, o, contract), chat_id=CHAT_ID)
             time.sleep(1)
-            send(msg_channel_post(ticker, contract), chat_id=CHAT_ID)
+            photo_res = send_contract_image({"ticker": ticker, **contract}, caption=msg_channel_post(ticker, contract), chat_id=CHAT_ID)
+            try:
+                contract["message_id"] = photo_res.get("result", {}).get("message_id")
+            except Exception:
+                contract["message_id"] = None
             register_contract_signal(ticker, contract)
         else:
             send(msg_pro(ticker, tf, c, o, None), chat_id=CHAT_ID)
