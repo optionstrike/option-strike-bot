@@ -3,6 +3,5 @@ uvicorn
 requests
 yfinance
 pandas
-numpy
 deep-translator
-tzdata
+pillow
