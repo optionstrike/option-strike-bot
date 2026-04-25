@@ -1,8 +1,5 @@
 from fastapi import FastAPI, Request
 import requests
-import io
-import json
-import os
 import yfinance as yf
 import pandas as pd
 import time
@@ -25,8 +22,6 @@ MASSIVE_API_KEY = "AcbX3y7rKzou3MzUi8EVlETdYLFsVGa2"
 FMP_API_KEY = "xQ7wdkVapeynP4FsDL4dBLMisFkbN2qL"
 
 API_SEND = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-API_SEND_PHOTO = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
-API_EDIT_MEDIA = f"https://api.telegram.org/bot{TOKEN}/editMessageMedia"
 API_ANSWER = f"https://api.telegram.org/bot{TOKEN}/answerCallbackQuery"
 
 MASSIVE_BASE = "https://api.polygon.io"
@@ -1334,161 +1329,6 @@ def send(msg, keyboard=None, chat_id=None):
     except Exception as e:
         print(f"[SEND ERROR] {e}")
 
-
-
-# =========================
-# صور الطرح والتحديث
-# =========================
-
-def _img_font(size: int, bold: bool = False):
-    try:
-        from PIL import ImageFont
-        candidates = [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
-        ]
-        for path in candidates:
-            if os.path.exists(path):
-                return ImageFont.truetype(path, size=size)
-        return ImageFont.load_default()
-    except Exception:
-        return None
-
-def _contract_type_en(row: dict):
-    return "Call" if row.get("contract_type") == "call" else "Put"
-
-def _format_option_header(row: dict):
-    ticker = row.get("ticker", "—")
-    strike = float(row.get("strike", 0) or 0)
-    exp = row.get("expiration", "")
-    try:
-        exp_dt = datetime.strptime(exp, "%Y-%m-%d")
-        exp_txt = exp_dt.strftime("%d %b %y")
-    except Exception:
-        exp_txt = str(exp)
-    return f"{ticker} ${strike:g}", f"{exp_txt}  {_contract_type_en(row)}"
-
-def build_contract_image(row: dict, is_update: bool = False):
-    """صورة بسيطة جداً مثل شاشة عقد الأوبشن. تفاصيل الطرح تبقى في الكابشن فقط."""
-    try:
-        from PIL import Image, ImageDraw
-    except Exception as e:
-        print(f"[IMAGE ERROR] Pillow غير متوفر: {e}")
-        return None
-
-    width, height = 1080, 1080
-    bg = (8, 13, 24)
-    panel = (13, 21, 36)
-    line = (34, 48, 72)
-    white = (245, 247, 250)
-    muted = (148, 163, 184)
-    green = (28, 199, 130)
-    red = (255, 77, 109)
-    orange = (255, 145, 43)
-
-    is_call = row.get("contract_type") == "call"
-    accent = green if is_call else red
-
-    entry = float(row.get("entry_price", row.get("contract_price", 0)) or 0)
-    current = float(row.get("current_price", entry) or entry)
-    high = float(row.get("highest_price", current) or current)
-    display_price = high if is_update else current
-    pnl = ((display_price - entry) / entry) * 100 if entry > 0 else 0
-    change_abs = display_price - entry if is_update else 0
-    change_color = green if pnl >= 0 else red
-
-    title1, title2 = _format_option_header(row)
-    option_ticker = str(row.get("option_ticker", ""))
-    oi = row.get("oi", "—")
-    vol = row.get("volume", row.get("vol", "—"))
-    mid = row.get("mid", row.get("contract_price", entry))
-
-    f_logo = _img_font(34, True)
-    f_title = _img_font(54, True)
-    f_sub = _img_font(34, False)
-    f_price = _img_font(150, True)
-    f_change = _img_font(42, True)
-    f_label = _img_font(34, False)
-    f_value = _img_font(36, True)
-    f_small = _img_font(27, False)
-
-    img = Image.new("RGB", (width, height), bg)
-    draw = ImageDraw.Draw(img)
-    draw.rounded_rectangle((46, 46, width-46, height-46), radius=46, fill=panel, outline=line, width=2)
-
-    draw.text((78, 78), "OPTION STRIKE", fill=orange, font=f_logo)
-    pill = "UPDATE" if is_update else "LIVE OPTION"
-    pill_fill = (18, 40, 34) if is_call else (48, 22, 32)
-    draw.rounded_rectangle((780, 74, 1000, 126), radius=22, fill=pill_fill, outline=accent, width=2)
-    draw.text((812, 84), pill, fill=accent, font=f_small)
-
-    draw.text((78, 180), title1, fill=white, font=f_title)
-    draw.text((78, 248), title2, fill=muted, font=f_sub)
-    draw.text((78, 385), f"{display_price:.2f}", fill=accent if is_update else white, font=f_price)
-
-    if is_update:
-        draw.text((84, 555), f"{change_abs:+.2f}   {pnl:+.2f}%", fill=change_color, font=f_change)
-        status = "WINNING" if pnl >= 0 else "LOSING"
-        draw.rounded_rectangle((78, 625, 350, 685), radius=22, fill=(9, 14, 25), outline=change_color, width=2)
-        draw.text((110, 637), status, fill=change_color, font=f_label)
-    else:
-        draw.text((84, 555), "Clean setup • details in caption", fill=muted, font=f_change)
-
-    y = 735
-    stats = [("Mid", mid), ("Open Int.", oi), ("Vol.", vol)]
-    if is_update:
-        stats = [("Entry", entry), ("High", high), ("PnL", f"{pnl:+.2f}%")]
-    for label, value in stats:
-        draw.text((90, y), str(label), fill=muted, font=f_label)
-        value_txt = f"{value:.2f}" if isinstance(value, float) else str(value)
-        draw.text((690, y), value_txt, fill=white, font=f_value)
-        y += 70
-
-    draw.line((78, 950, 1002, 950), fill=line, width=2)
-    footer = option_ticker[:55] if option_ticker else "@Option_Strike01"
-    draw.text((78, 978), footer, fill=muted, font=f_small)
-    draw.text((805, 978), "@Option_Strike01", fill=orange, font=f_small)
-
-    bio = io.BytesIO()
-    bio.name = f"{row.get('ticker','OPTION')}_{'update' if is_update else 'new'}.png"
-    img.save(bio, format="PNG")
-    bio.seek(0)
-    return bio
-
-def send_contract_image(row: dict, caption: str = "", keyboard=None, chat_id=None):
-    target_chat_id = str(chat_id) if chat_id else CHAT_ID
-    photo = build_contract_image(row, is_update=False)
-    if photo is None:
-        return send(caption, keyboard=keyboard, chat_id=target_chat_id)
-    data = {"chat_id": target_chat_id, "caption": caption, "parse_mode": "HTML"}
-    if keyboard:
-        data["reply_markup"] = json.dumps(keyboard)
-    try:
-        r = HTTP.post(API_SEND_PHOTO, data=data, files={"photo": photo}, timeout=30)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        print(f"[SEND PHOTO ERROR] {e}")
-        return send(caption, keyboard=keyboard, chat_id=target_chat_id)
-
-def edit_contract_image(row: dict, caption: str = "", chat_id=None):
-    target_chat_id = str(chat_id) if chat_id else CHAT_ID
-    message_id = row.get("message_id")
-    if not message_id:
-        return send_contract_image(row, caption=caption, chat_id=target_chat_id)
-    photo = build_contract_image(row, is_update=True)
-    if photo is None:
-        return send(caption, chat_id=target_chat_id)
-    media = {"type": "photo", "media": "attach://photo", "caption": caption, "parse_mode": "HTML"}
-    data = {"chat_id": target_chat_id, "message_id": message_id, "media": json.dumps(media)}
-    try:
-        r = HTTP.post(API_EDIT_MEDIA, data=data, files={"photo": photo}, timeout=30)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        print(f"[EDIT PHOTO ERROR] {e}")
-        return send_contract_image(row, caption=caption, chat_id=target_chat_id)
-
 def answer_callback(cb_id, text=""):
     try:
         HTTP.post(API_ANSWER, json={
@@ -2101,11 +1941,7 @@ def register_contract_signal(ticker: str, contract: dict):
         "first_update_sent": False,
         "last_update_trigger_price": contract["tp1"],
         "created_at": datetime.now(),
-        "channel_title": f"{ticker} ${contract['strike']:.2f} {'كول' if contract['contract_type'] == 'call' else 'بوت'}",
-        "message_id": contract.get("message_id"),
-        "mid": contract.get("mid", contract.get("contract_price")),
-        "oi": contract.get("oi", "—"),
-        "volume": contract.get("volume", contract.get("vol", "—"))
+        "channel_title": f"{ticker} ${contract['strike']:.2f} {'كول' if contract['contract_type'] == 'call' else 'بوت'}"
     }
     OPEN_CONTRACT_SIGNALS[key] = row
     SIGNAL_HISTORY.append(row)
@@ -2474,11 +2310,7 @@ def scanner_cycle():
 
         send(msg_pro(ticker, "1h", c, o, contract), chat_id=CHAT_ID)
         time.sleep(1)
-        photo_res = send_contract_image({"ticker": ticker, **contract}, caption=msg_channel_post(ticker, contract), chat_id=CHAT_ID)
-        try:
-            contract["message_id"] = photo_res.get("result", {}).get("message_id")
-        except Exception:
-            contract["message_id"] = None
+        send(msg_channel_post(ticker, contract), chat_id=CHAT_ID)
 
         register_contract_signal(ticker, contract)
         mark_stock_sent(ticker)
@@ -2501,13 +2333,13 @@ def contract_update_cycle():
                 sig["highest_price"] = price
 
             if (not sig["first_update_sent"]) and price >= sig["tp1"]:
-                edit_contract_image(sig, caption=msg_contract_update(sig["channel_title"], sig["entry_price"], price), chat_id=CHAT_ID)
+                send(msg_contract_update(sig["channel_title"], sig["entry_price"], price), chat_id=CHAT_ID)
                 sig["first_update_sent"] = True
                 sig["last_update_trigger_price"] = price
                 continue
 
             if sig["first_update_sent"] and price >= sig["last_update_trigger_price"] + UPDATE_STEP_AFTER_TP1:
-                edit_contract_image(sig, caption=msg_contract_update(sig["channel_title"], sig["entry_price"], price), chat_id=CHAT_ID)
+                send(msg_contract_update(sig["channel_title"], sig["entry_price"], price), chat_id=CHAT_ID)
                 sig["last_update_trigger_price"] = price
 
         except Exception as e:
@@ -2762,11 +2594,7 @@ def process_tradingview_signal(payload: dict):
         if contract:
             send(msg_pro(ticker, tf, c, o, contract), chat_id=CHAT_ID)
             time.sleep(1)
-            photo_res = send_contract_image({"ticker": ticker, **contract}, caption=msg_channel_post(ticker, contract), chat_id=CHAT_ID)
-            try:
-                contract["message_id"] = photo_res.get("result", {}).get("message_id")
-            except Exception:
-                contract["message_id"] = None
+            send(msg_channel_post(ticker, contract), chat_id=CHAT_ID)
             register_contract_signal(ticker, contract)
         else:
             send(msg_pro(ticker, tf, c, o, None), chat_id=CHAT_ID)
