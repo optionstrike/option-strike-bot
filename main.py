@@ -7,7 +7,7 @@ import yfinance as yf
 import pandas as pd
 import time
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 from deep_translator import GoogleTranslator
 
@@ -2080,6 +2080,233 @@ TP3: {tp3_hits}/{total}
 📢 @Option_Strike01"""
     return msg
 
+
+
+# =========================
+# التقارير المصورة + السنوي
+# =========================
+
+def report_rows_for_period(period: str):
+    now_riyadh = datetime.now(RIYADH_TZ)
+    today = now_riyadh.date()
+
+    if period == "daily":
+        title = "التقرير اليومي"
+        subtitle = today.strftime("%d/%m/%Y")
+        start_date = today
+        end_date = today
+    elif period == "weekly":
+        start_date = today - timedelta(days=today.weekday())
+        end_date = start_date + timedelta(days=6)
+        title = "التقرير الأسبوعي"
+        subtitle = f"{start_date.strftime('%d/%m')} - {end_date.strftime('%d/%m/%Y')}"
+    elif period == "yearly":
+        start_date = date(today.year, 1, 1)
+        end_date = date(today.year, 12, 31)
+        title = "التقرير السنوي"
+        subtitle = str(today.year)
+    else:
+        start_date = today
+        end_date = today
+        title = "التقرير"
+        subtitle = today.strftime("%d/%m/%Y")
+
+    rows = []
+    for x in SIGNAL_HISTORY:
+        created = x.get("created_at")
+        if not created:
+            continue
+        if getattr(created, "tzinfo", None) is None:
+            created_date = created.date()
+        else:
+            created_date = created.astimezone(RIYADH_TZ).date()
+        if start_date <= created_date <= end_date:
+            rows.append(x)
+    return title, subtitle, rows
+
+def summarize_report_rows(rows: list):
+    total = len(rows)
+    wins = losses = open_count = call_count = put_count = tp1_hits = tp2_hits = tp3_hits = 0
+    total_high_pnl = 0.0
+
+    for row in rows:
+        pnl, current, high = calc_signal_pnl(row)
+        total_high_pnl += calc_signal_high_pnl(row)
+        if row.get("contract_type") == "call":
+            call_count += 1
+        else:
+            put_count += 1
+        if high >= row.get("tp1", 10**9):
+            tp1_hits += 1
+        if high >= row.get("tp2", 10**9):
+            tp2_hits += 1
+        if high >= row.get("tp3", 10**9):
+            tp3_hits += 1
+        if current < row.get("entry_price", 0):
+            losses += 1
+        elif current > row.get("entry_price", 0) or high >= row.get("tp1", 10**9):
+            wins += 1
+        else:
+            open_count += 1
+
+    return {
+        "total": total, "wins": wins, "losses": losses, "open": open_count,
+        "calls": call_count, "puts": put_count,
+        "tp1": tp1_hits, "tp2": tp2_hits, "tp3": tp3_hits,
+        "success_rate": (wins / total) * 100 if total else 0.0,
+        "avg_high_pnl": total_high_pnl / total if total else 0.0,
+    }
+
+def build_report_image(period: str):
+    try:
+        from PIL import Image, ImageDraw
+    except Exception as e:
+        print(f"[REPORT IMAGE ERROR] Pillow غير متوفر: {e}")
+        return None
+
+    title, subtitle, rows = report_rows_for_period(period)
+    summary = summarize_report_rows(rows)
+    visible_rows = rows[:24]
+    width = 1080
+    row_h = 118
+    top_h = 425
+    footer_h = 120
+    height = max(1080, top_h + (len(visible_rows) * row_h) + footer_h)
+
+    bg = (7, 12, 22); panel = (13, 22, 38); panel2 = (17, 28, 48)
+    line = (38, 54, 82); white = (245, 247, 250); muted = (148, 163, 184)
+    gold = (255, 180, 58); green = (28, 199, 130); red = (255, 77, 109); blue = (96, 165, 250)
+
+    f_logo = _img_font(34, True); f_title = _img_font(62, True); f_sub = _img_font(30, False)
+    f_box_num = _img_font(44, True); f_box_label = _img_font(24, False); f_head = _img_font(30, True)
+    f_row = _img_font(28, True); f_small = _img_font(23, False); f_mini = _img_font(20, False)
+
+    img = Image.new("RGB", (width, height), bg)
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle((42, 38, width-42, height-42), radius=44, fill=panel, outline=line, width=2)
+    draw.text((78, 72), "OPTION STRIKE", fill=gold, font=f_logo)
+    draw.text((78, 132), title, fill=white, font=f_title)
+    draw.text((82, 210), f"الفترة: {subtitle}", fill=muted, font=f_sub)
+    draw.text((770, 78), "REPORT", fill=gold, font=f_head)
+    draw.text((760, 116), "@Option_Strike01", fill=muted, font=f_small)
+
+    boxes = [("العقود", summary["total"], blue), ("الرابحة", summary["wins"], green), ("الخاسرة", summary["losses"], red), ("النجاح", f"{summary['success_rate']:.1f}%", gold)]
+    x = 78; y = 275; box_w = 220; box_h = 105
+    for label, value, color in boxes:
+        draw.rounded_rectangle((x, y, x+box_w, y+box_h), radius=28, fill=panel2, outline=line, width=2)
+        draw.text((x+24, y+18), str(value), fill=color, font=f_box_num)
+        draw.text((x+24, y+68), label, fill=muted, font=f_box_label)
+        x += box_w + 24
+
+    y = 420
+    draw.text((78, y), "جميع العقود", fill=white, font=f_head)
+    y += 48
+    if not rows:
+        draw.rounded_rectangle((78, y, width-78, y+120), radius=26, fill=panel2, outline=line, width=2)
+        draw.text((120, y+42), "لا توجد عقود مسجلة في هذه الفترة", fill=muted, font=f_row)
+    else:
+        for idx, row in enumerate(visible_rows, 1):
+            pnl, current, high = calc_signal_pnl(row)
+            high_pnl = calc_signal_high_pnl(row)
+            is_win = current >= row.get("entry_price", 0) or high >= row.get("tp1", 10**9)
+            is_loss = current < row.get("entry_price", 0)
+            status_color = green if is_win else red if is_loss else muted
+            type_txt = "CALL" if row.get("contract_type") == "call" else "PUT"
+            type_color = green if type_txt == "CALL" else red
+            created = row.get("created_at")
+            if created and getattr(created, "tzinfo", None):
+                created_txt = created.astimezone(RIYADH_TZ).strftime("%d/%m %H:%M")
+            elif created:
+                created_txt = created.strftime("%d/%m %H:%M")
+            else:
+                created_txt = "—"
+            exp = format_short_date(row.get("expiration", ""))
+            draw.rounded_rectangle((78, y, width-78, y+98), radius=24, fill=panel2, outline=line, width=1)
+            draw.text((102, y+16), f"{idx}", fill=muted, font=f_small)
+            draw.text((145, y+14), str(row.get("ticker", "—")), fill=white, font=f_row)
+            draw.text((280, y+14), type_txt, fill=type_color, font=f_row)
+            draw.text((392, y+14), f"{exp}", fill=muted, font=f_small)
+            draw.text((505, y+14), f"دخول {row.get('entry_price', 0):.2f}", fill=muted, font=f_small)
+            draw.text((675, y+14), f"الأعلى {high:.2f}", fill=white, font=f_small)
+            draw.text((845, y+14), f"{high_pnl:+.1f}%", fill=status_color, font=f_row)
+            draw.text((145, y+54), str(row.get("option_ticker", "—"))[:42], fill=muted, font=f_mini)
+            draw.text((675, y+54), f"TP1 {row.get('tp1', 0):.2f} | TP2 {row.get('tp2', 0):.2f} | TP3 {row.get('tp3', 0):.2f}", fill=muted, font=f_mini)
+            draw.text((912, y+54), created_txt, fill=muted, font=f_mini)
+            y += row_h
+        if len(rows) > len(visible_rows):
+            draw.text((90, y), f"+ يوجد {len(rows) - len(visible_rows)} عقد إضافي محفوظ في التقرير النصي داخل البوت", fill=muted, font=f_small)
+
+    draw.line((78, height-112, width-78, height-112), fill=line, width=2)
+    draw.text((78, height-82), "⚠️ هذا التقرير تعليمي والقرار النهائي يعود للمتداول", fill=muted, font=f_small)
+    draw.text((790, height-82), "@Option_Strike01", fill=gold, font=f_small)
+    bio = io.BytesIO(); bio.name = f"option_strike_{period}_report.png"; img.save(bio, format="PNG"); bio.seek(0)
+    return bio
+
+def send_report_image(period: str, keyboard=None, chat_id=None):
+    target_chat_id = str(chat_id) if chat_id else CHAT_ID
+    photo = build_report_image(period)
+    title, subtitle, rows = report_rows_for_period(period)
+    caption = (
+        f"📊 <b>{title}</b>\n"
+        f"📅 الفترة: {subtitle}\n"
+        f"📦 عدد العقود: <b>{len(rows)}</b>\n\n"
+        f"⚠️ تنبيه: هذا التقرير تعليمي\n"
+        f"والقرار النهائي يعود للمتداول.\n\n"
+        f"📢 @Option_Strike01"
+    )
+    if photo is None:
+        if period == "daily": return send(msg_daily_report(), keyboard=keyboard, chat_id=target_chat_id)
+        if period == "weekly": return send(msg_weekly_report(), keyboard=keyboard, chat_id=target_chat_id)
+        return send(msg_yearly_report(), keyboard=keyboard, chat_id=target_chat_id)
+    data = {"chat_id": target_chat_id, "caption": caption, "parse_mode": "HTML"}
+    if keyboard: data["reply_markup"] = json.dumps(keyboard)
+    try:
+        r = HTTP.post(API_SEND_PHOTO, data=data, files={"photo": photo}, timeout=30)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"[SEND REPORT PHOTO ERROR] {e}")
+        if period == "daily": return send(msg_daily_report(), keyboard=keyboard, chat_id=target_chat_id)
+        if period == "weekly": return send(msg_weekly_report(), keyboard=keyboard, chat_id=target_chat_id)
+        return send(msg_yearly_report(), keyboard=keyboard, chat_id=target_chat_id)
+
+def msg_yearly_report():
+    title, subtitle, year_rows = report_rows_for_period("yearly")
+    summary = summarize_report_rows(year_rows)
+    if not year_rows:
+        return f"📅 <b>التقرير السنوي</b>\n\nالسنة: {subtitle}\n❌ لا توجد عقود مسجلة هذه السنة."
+    msg = f"""📅 <b>تقرير عقود السنة</b>
+━━━━━━━━━━━━━━
+
+📅 السنة: {subtitle}
+📊 إجمالي العقود: <b>{summary['total']}</b>
+🟢 الرابحة: {summary['wins']}
+🔴 الخاسرة: {summary['losses']}
+⚪ المفتوحة بدون حركة: {summary['open']}
+📈 نسبة النجاح: <b>{summary['success_rate']:.2f}%</b>
+
+📦 توزيع العقود:
+🟢 CALL: {summary['calls']}
+🔴 PUT: {summary['puts']}
+
+🎯 تحقيق الأهداف:
+TP1: {summary['tp1']}/{summary['total']}
+TP2: {summary['tp2']}/{summary['total']}
+TP3: {summary['tp3']}/{summary['total']}
+
+📉 متوسط أعلى أداء: <b>{summary['avg_high_pnl']:+.2f}%</b>
+
+📦 <b>جميع عقود السنة:</b>
+━━━━━━━━━━━━━━
+"""
+    for i, row in enumerate(year_rows, 1):
+        msg += format_report_contract_line(row, i) + "\n"
+    msg += """⚠️ تنبيه: هذا التقرير تعليمي
+والقرار النهائي يعود للمتداول.
+
+📢 @Option_Strike01"""
+    return msg
+
 # =========================
 # تسجيل العقد
 # =========================
@@ -2583,7 +2810,10 @@ def main_menu():
                 {"text": "🗓 التقرير الأسبوعي", "callback_data": "weekly_report"},
             ],
             [
+                {"text": "📅 التقرير السنوي", "callback_data": "yearly_report"},
                 {"text": "📰 الأخبار المهمة", "callback_data": "econ_menu"},
+            ],
+            [
                 {"text": "⚙️ تغيير الفريم", "callback_data": "tf"},
             ]
         ]
@@ -2917,7 +3147,11 @@ async def webhook(req: Request):
                 return {"ok": True}
 
             if data_cb == "weekly_report":
-                send(msg_weekly_report(), main_menu(), chat_id=user)
+                send_report_image("weekly", main_menu(), chat_id=user)
+                return {"ok": True}
+
+            if data_cb == "yearly_report":
+                send_report_image("yearly", main_menu(), chat_id=user)
                 return {"ok": True}
 
             if data_cb == "econ_menu":
@@ -2963,7 +3197,7 @@ async def webhook(req: Request):
                 return {"ok": True}
 
             if data_cb == "daily_report":
-                send(msg_daily_report(), main_menu(), chat_id=user)
+                send_report_image("daily", main_menu(), chat_id=user)
                 return {"ok": True}
 
             if not ticker:
