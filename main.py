@@ -184,72 +184,8 @@ DAILY_SIGNAL_STATE = {
 
 OPEN_CONTRACT_SIGNALS = {}
 SIGNAL_HISTORY = []
-
-# =========================
-# أرشفة التقارير والعقود
-# =========================
-REPORTS_DIR = "reports_archive"
-SIGNAL_HISTORY_FILE = os.path.join(REPORTS_DIR, "signal_history.json")
-REPORT_IMAGE_WIDTH = 1080
-REPORT_IMAGE_HEIGHT = 1620
-
 ECON_ALERT_SENT = set()
 LAST_SCANNER_SLOT_KEY = None
-
-
-# =========================
-# حفظ واسترجاع أرشيف العقود
-# =========================
-
-def _dt_to_str(v):
-    return v.isoformat() if isinstance(v, datetime) else v
-
-def _dt_from_str(v):
-    if not v or isinstance(v, datetime):
-        return v
-    try:
-        return datetime.fromisoformat(str(v))
-    except Exception:
-        return None
-
-def _safe_float(v, default=0.0):
-    try:
-        if v in [None, "", "—"]:
-            return default
-        return float(v)
-    except Exception:
-        return default
-
-def save_signal_archive():
-    try:
-        os.makedirs(REPORTS_DIR, exist_ok=True)
-        data = []
-        for row in SIGNAL_HISTORY:
-            clean = dict(row)
-            clean["created_at"] = _dt_to_str(clean.get("created_at"))
-            data.append(clean)
-        with open(SIGNAL_HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"[ARCHIVE SAVE ERROR] {e}")
-
-def load_signal_archive():
-    try:
-        os.makedirs(REPORTS_DIR, exist_ok=True)
-        if not os.path.exists(SIGNAL_HISTORY_FILE):
-            return
-        with open(SIGNAL_HISTORY_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        SIGNAL_HISTORY.clear()
-        OPEN_CONTRACT_SIGNALS.clear()
-        for row in data:
-            row["created_at"] = _dt_from_str(row.get("created_at")) or datetime.now()
-            SIGNAL_HISTORY.append(row)
-            if row.get("option_ticker"):
-                OPEN_CONTRACT_SIGNALS[row["option_ticker"]] = row
-        print(f"[ARCHIVE LOADED] {len(SIGNAL_HISTORY)} signals")
-    except Exception as e:
-        print(f"[ARCHIVE LOAD ERROR] {e}")
 
 # =========================
 # أدوات حماية ومساعدة
@@ -1553,115 +1489,6 @@ def edit_contract_image(row: dict, caption: str = "", chat_id=None):
         print(f"[EDIT PHOTO ERROR] {e}")
         return send_contract_image(row, caption=caption, chat_id=target_chat_id)
 
-
-def _report_stats(rows: list):
-    st = {"total": len(rows), "wins": 0, "losses": 0, "calls": 0, "puts": 0, "tp1": 0, "tp2": 0, "tp3": 0, "entry": 0.0, "high": 0.0, "net": 0.0, "equity": []}
-    acc = 0.0
-    for row in rows:
-        pnl, current, high = calc_signal_pnl(row)
-        entry = _safe_float(row.get("entry_price"))
-        net = max(0.0, high - entry) if high >= entry else current - entry
-        st["entry"] += entry; st["high"] += high; st["net"] += net
-        acc += net; st["equity"].append(acc)
-        st["wins" if net >= 0 else "losses"] += 1
-        st["calls" if row.get("contract_type") == "call" else "puts"] += 1
-        if high >= _safe_float(row.get("tp1"), 10**9): st["tp1"] += 1
-        if high >= _safe_float(row.get("tp2"), 10**9): st["tp2"] += 1
-        if high >= _safe_float(row.get("tp3"), 10**9): st["tp3"] += 1
-    st["success"] = (st["wins"] / st["total"] * 100) if st["total"] else 0.0
-    return st
-
-def _format_report_fallback(rows, title, period_text):
-    st = _report_stats(rows)
-    msg = f"📊 <b>{title}</b>\n📅 {period_text}\n\nإجمالي العقود: <b>{st['total']}</b>\nالرابحة: {st['wins']}\nالخاسرة: {st['losses']}\nنسبة النجاح: <b>{st['success']:.2f}%</b>\n\n"
-    msg += f"TP1: {st['tp1']}/{st['total']}\nTP2: {st['tp2']}/{st['total']}\nTP3: {st['tp3']}/{st['total']}\n\n"
-    if not rows:
-        msg += "❌ لا توجد عقود في هذه الفترة.\n"
-    for i, row in enumerate(rows, 1):
-        msg += format_report_contract_line(row, i) + "\n"
-    return msg + "\n📢 @Option_Strike01"
-
-def build_report_image(rows: list, title: str, period_text: str):
-    try:
-        from PIL import Image, ImageDraw
-    except Exception:
-        return None
-    st = _report_stats(rows)
-    W, H = REPORT_IMAGE_WIDTH, REPORT_IMAGE_HEIGHT
-    bg=(2,7,10); panel=(7,17,22); line=(170,97,25); gold=(229,151,45); green=(83,188,52); red=(210,61,42); white=(238,238,226)
-    img=Image.new("RGB",(W,H),bg); d=ImageDraw.Draw(img)
-    f_title=_img_font(58,True); f_sub=_img_font(32,False); f_box=_img_font(25,True); f_num=_img_font(44,True); f_med=_img_font(28,True); f_small=_img_font(21,False); f_tiny=_img_font(18,False)
-    d.rectangle((8,8,W-8,H-8), outline=line, width=3)
-    d.text((55,60),"OPTION\nSTRIKE",fill=gold,font=_img_font(36,True),spacing=0)
-    d.text((540,55),title,fill=gold,font=f_title,anchor="ma")
-    d.text((540,125),"تقرير الشركات",fill=gold,font=f_sub,anchor="ma")
-    d.rounded_rectangle((345,170,735,220),radius=12,outline=line,width=2,fill=(10,17,22)); d.text((540,181),period_text,fill=white,font=f_sub,anchor="ma")
-    for x,label,value,color in [(20,"إجمالي العقود",st['total'],white),(210,"الرابحة",st['wins'],green),(400,"الخاسرة",st['losses'],red),(590,"نسبة النجاح",f"{st['success']:.2f}%",green)]:
-        d.rounded_rectangle((x,240,x+175,375),radius=10,outline=line,width=2,fill=panel); d.text((x+88,258),str(label),fill=gold,font=f_box,anchor="ma"); d.text((x+88,304),str(value),fill=color,font=f_num,anchor="ma")
-    total=max(st['total'],1)
-    d.rounded_rectangle((785,240,1060,375),radius=10,outline=line,width=2,fill=panel); d.text((922,258),"توزيع العقود",fill=gold,font=f_box,anchor="ma")
-    d.text((835,303),f"CALL ({st['calls']})  {st['calls']/total*100:.2f}%",fill=green,font=f_small); d.text((835,336),f"PUT ({st['puts']})  {st['puts']/total*100:.2f}%",fill=red,font=f_small)
-    d.rounded_rectangle((20,390,550,610),radius=10,outline=line,width=2,fill=panel); d.text((285,405),"الأداء خلال الفترة",fill=gold,font=f_box,anchor="ma")
-    chart=(65,455,520,575); d.rectangle(chart,outline=(31,55,58),width=1); eq=st['equity'] or [0]; mn=min(eq+[0]); mx=max(eq+[1]); mx = mx if mx != mn else mn+1
-    pts=[]
-    for i,v in enumerate(eq):
-        pts.append((chart[0]+int((chart[2]-chart[0])*(i/max(len(eq)-1,1))), chart[3]-int((chart[3]-chart[1])*((v-mn)/(mx-mn)))))
-    if len(pts)>1: d.line(pts,fill=green,width=4)
-    for p in pts: d.ellipse((p[0]-4,p[1]-4,p[0]+4,p[1]+4),fill=green)
-    d.rounded_rectangle((570,390,1060,610),radius=10,outline=line,width=2,fill=panel); d.text((815,405),"تحقيق الأهداف",fill=gold,font=f_box,anchor="ma")
-    for i,(lab,val) in enumerate([("TP1",st['tp1']),("TP2",st['tp2']),("TP3",st['tp3'])]):
-        y=455+i*48; pct=(val/total*100) if st['total'] else 0
-        d.text((610,y),lab,fill=white,font=f_med); d.text((700,y),f"{val} / {st['total']}",fill=white,font=f_small); d.rectangle((820,y+8,980,y+24),fill=(30,43,43)); d.rectangle((820,y+8,820+int(160*pct/100),y+24),fill=green); d.text((995,y),f"{pct:.2f}%",fill=green,font=f_small)
-    d.rounded_rectangle((20,625,1060,1435),radius=10,outline=line,width=2,fill=panel); d.text((540,638),"جميع العقود",fill=gold,font=f_med,anchor="ma")
-    xs=[1040,980,875,770,650,530,405,290,165]; headers=["#","الشركة","النوع","تاريخ الانتهاء","دخول","أعلى","الصافي","نسبة الربح","الحالة"]; y=680
-    for x,h in zip(xs,headers): d.text((x,y),h,fill=gold,font=f_tiny,anchor="ra")
-    d.line((35,y+30,1045,y+30),fill=line,width=1); y+=40
-    for idx,row in enumerate(rows[:24],1):
-        entry=_safe_float(row.get('entry_price')); high=_safe_float(row.get('highest_price'),entry); current=_safe_float(row.get('current_price'),high); net=max(0,high-entry) if high>=entry else current-entry; pct=(net/entry*100) if entry else 0; ctype='CALL' if row.get('contract_type')=='call' else 'PUT'; color=green if net>=0 else red; status='رابح' if net>=0 else 'خاسر'
-        vals=[idx,row.get('ticker','—'),ctype,format_short_date(row.get('expiration','')),f"{entry:.2f}",f"{high:.2f}",f"{net:.2f}",f"{pct:.0f}%",status]
-        for x,v in zip(xs,vals): d.text((x,y),str(v),fill=color if x in [290,405,165] else white,font=f_tiny,anchor="ra")
-        y+=29
-        if y>1400: break
-    for x1,x2,lab,val,col in [(35,330,"مجموع الدخول",st['entry'],white),(365,660,"مجموع أعلى سعر",st['high'],white),(695,1045,"صافي الربح",st['net'],green if st['net']>=0 else red)]:
-        d.rounded_rectangle((x1,1450,x2,1525),radius=10,outline=line,fill=(5,15,18),width=2); d.text(((x1+x2)//2,1463),lab,fill=white,font=f_small,anchor="ma"); d.text(((x1+x2)//2,1492),f"$ {val:.2f}",fill=col,font=f_med,anchor="ma")
-    d.text((540,1560),"تداول بذكاء .. وانضباط    |    @Option_Strike01",fill=gold,font=f_small,anchor="ma")
-    bio=io.BytesIO(); bio.name="option_strike_report.png"; img.save(bio,format="PNG"); bio.seek(0); return bio
-
-def send_report_image(rows: list, title: str, period_text: str, chat_id=None, keyboard=None):
-    target_chat_id = str(chat_id) if chat_id else CHAT_ID
-    photo = build_report_image(rows, title, period_text)
-    if photo is None:
-        return send(_format_report_fallback(rows, title, period_text), keyboard=keyboard, chat_id=target_chat_id)
-    data = {"chat_id": target_chat_id, "caption": f"📊 <b>{title}</b>\n📅 {period_text}\n\n📢 @Option_Strike01", "parse_mode": "HTML"}
-    if keyboard: data["reply_markup"] = json.dumps(keyboard)
-    try:
-        r = HTTP.post(API_SEND_PHOTO, data=data, files={"photo": photo}, timeout=30); r.raise_for_status(); return r.json()
-    except Exception as e:
-        print(f"[SEND REPORT PHOTO ERROR] {e}"); return send(_format_report_fallback(rows, title, period_text), keyboard=keyboard, chat_id=target_chat_id)
-
-def rows_for_day(day=None):
-    d = day or datetime.now(RIYADH_TZ).date(); return [x for x in SIGNAL_HISTORY if x.get("created_at") and x["created_at"].date() == d]
-
-def rows_for_week():
-    ws=get_week_start(); we=ws+timedelta(days=6); return [x for x in SIGNAL_HISTORY if x.get("created_at") and ws <= x["created_at"].date() <= we], ws, we
-
-def rows_for_month(year:int, month:int):
-    return [x for x in SIGNAL_HISTORY if x.get("created_at") and x["created_at"].year==year and x["created_at"].month==month]
-
-def rows_for_year(year:int):
-    return [x for x in SIGNAL_HISTORY if x.get("created_at") and x["created_at"].year==year]
-
-def report_menu():
-    return {"inline_keyboard":[[{"text":"📋 تقرير اليوم","callback_data":"daily_report_img"},{"text":"🗓 تقرير الأسبوع","callback_data":"weekly_report_img"}],[{"text":"📅 تقرير شهري","callback_data":"report_months"},{"text":"📆 تقرير سنوي","callback_data":"yearly_report_img"}],[{"text":"🏠 رجوع","callback_data":"back"}]]}
-
-def months_archive_menu():
-    keys=sorted({(x["created_at"].year,x["created_at"].month) for x in SIGNAL_HISTORY if x.get("created_at")}, reverse=True); rows=[]; row=[]
-    for y,m in keys[:24]:
-        row.append({"text":f"{m:02d}/{y}","callback_data":f"month_report:{y}:{m}"})
-        if len(row)==3: rows.append(row); row=[]
-    if row: rows.append(row)
-    rows.append([{"text":"🏠 رجوع","callback_data":"reports_menu"}]); return {"inline_keyboard":rows}
-
 def answer_callback(cb_id, text=""):
     try:
         HTTP.post(API_ANSWER, json={
@@ -2282,7 +2109,6 @@ def register_contract_signal(ticker: str, contract: dict):
     }
     OPEN_CONTRACT_SIGNALS[key] = row
     SIGNAL_HISTORY.append(row)
-    save_signal_archive()
 
 def get_live_contract_price(underlying: str, option_ticker: str):
     try:
@@ -2678,15 +2504,11 @@ def contract_update_cycle():
                 edit_contract_image(sig, caption=msg_contract_update(sig["channel_title"], sig["entry_price"], price), chat_id=CHAT_ID)
                 sig["first_update_sent"] = True
                 sig["last_update_trigger_price"] = price
-                save_signal_archive()
                 continue
 
             if sig["first_update_sent"] and price >= sig["last_update_trigger_price"] + UPDATE_STEP_AFTER_TP1:
                 edit_contract_image(sig, caption=msg_contract_update(sig["channel_title"], sig["entry_price"], price), chat_id=CHAT_ID)
                 sig["last_update_trigger_price"] = price
-                save_signal_archive()
-
-            save_signal_archive()
 
         except Exception as e:
             print(f"[CONTRACT UPDATE ERROR] {option_ticker}: {e}")
@@ -2728,7 +2550,6 @@ async def economic_alert_loop():
 
 @app.on_event("startup")
 async def startup_event():
-    load_signal_archive()
     asyncio.create_task(scanner_loop())
     asyncio.create_task(contract_update_loop())
     asyncio.create_task(economic_alert_loop())
@@ -2755,7 +2576,7 @@ def main_menu():
             ],
             [
                 {"text": "📂 العقود المفتوحة", "callback_data": "open_contracts"},
-                {"text": "📊 التقارير", "callback_data": "reports_menu"},
+                {"text": "📋 التقرير اليومي", "callback_data": "daily_report"},
             ],
             [
                 {"text": "📆 إعلانات الشركات", "callback_data": "earnings_menu"},
@@ -3095,43 +2916,8 @@ async def webhook(req: Request):
                 send(msg_earnings_analysis(tk, event, c, o, contract, trade_view), main_menu(), chat_id=user)
                 return {"ok": True}
 
-            if data_cb == "reports_menu":
-                send("📊 اختر نوع التقرير 👇", report_menu(), chat_id=user)
-                return {"ok": True}
-
-            if data_cb == "daily_report_img":
-                rows = rows_for_day()
-                send_report_image(rows, "التقرير اليومي", datetime.now(RIYADH_TZ).strftime("%d/%m/%Y"), chat_id=user, keyboard=report_menu())
-                return {"ok": True}
-
-            if data_cb == "weekly_report_img":
-                rows, ws, we = rows_for_week()
-                send_report_image(rows, "التقرير الأسبوعي", f"{ws.strftime('%d/%m/%Y')} - {we.strftime('%d/%m/%Y')}", chat_id=user, keyboard=report_menu())
-                return {"ok": True}
-
-            if data_cb == "yearly_report_img":
-                y = datetime.now(RIYADH_TZ).year
-                rows = rows_for_year(y)
-                send_report_image(rows, "التقرير السنوي", str(y), chat_id=user, keyboard=report_menu())
-                return {"ok": True}
-
-            if data_cb == "report_months":
-                send("📅 اختر الشهر من الأرشيف 👇", months_archive_menu(), chat_id=user)
-                return {"ok": True}
-
-            if data_cb.startswith("month_report:"):
-                try:
-                    _, y, m = data_cb.split(":")
-                    y, m = int(y), int(m)
-                    rows = rows_for_month(y, m)
-                    send_report_image(rows, "التقرير الشهري", f"{m:02d}/{y}", chat_id=user, keyboard=months_archive_menu())
-                except Exception as e:
-                    send(f"❌ تعذر عرض التقرير الشهري: {e}", report_menu(), chat_id=user)
-                return {"ok": True}
-
             if data_cb == "weekly_report":
-                rows, ws, we = rows_for_week()
-                send_report_image(rows, "التقرير الأسبوعي", f"{ws.strftime('%d/%m/%Y')} - {we.strftime('%d/%m/%Y')}", chat_id=user, keyboard=main_menu())
+                send(msg_weekly_report(), main_menu(), chat_id=user)
                 return {"ok": True}
 
             if data_cb == "econ_menu":
@@ -3177,8 +2963,7 @@ async def webhook(req: Request):
                 return {"ok": True}
 
             if data_cb == "daily_report":
-                rows = rows_for_day()
-                send_report_image(rows, "التقرير اليومي", datetime.now(RIYADH_TZ).strftime("%d/%m/%Y"), chat_id=user, keyboard=main_menu())
+                send(msg_daily_report(), main_menu(), chat_id=user)
                 return {"ok": True}
 
             if not ticker:
