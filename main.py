@@ -127,6 +127,42 @@ ZERO_HERO_MIN_OI = 100
 ZERO_HERO_MIN_PROB = 65
 
 # =========================
+# عقود الحيتان - مستقلة عن الطرح العادي
+# =========================
+
+WHALE_CONTRACTS_ENABLED = True
+WHALE_MAX_SIGNALS_PER_DAY = 6
+WHALE_MAX_SIGNALS_PER_SCAN = 1
+WHALE_MIN_PRICE = 0.70
+WHALE_MAX_PRICE = 1.50
+WHALE_MIN_DTE_DAYS = 7
+WHALE_MAX_DTE_DAYS = 35
+WHALE_MIN_OI = 50
+WHALE_MIN_SCORE = 60
+# =========================
+# نظام الحيتان المطور - قناص الانفجارات
+# مستقل عن الطرح العادي ولا يغير شروط الشركات
+# =========================
+WHALE_ENHANCED_EXPLOSION_ENABLED = True
+WHALE_MIN_EXPLOSION_SCORE = 75
+WHALE_CONSOLIDATION_BARS = 12
+WHALE_STRUCTURE_BARS = 24
+WHALE_MAX_CONSOLIDATION_RANGE_PCT = 0.060
+WHALE_NEAR_LEVEL_PCT = 0.020
+WHALE_VOLUME_SPIKE_MULT = 1.40
+WHALE_VOLUME_RISING_MULT = 1.15
+WHALE_ATR_COMPRESSION_MULT = 0.95
+WHALE_ENTRY_ZONE_WIDTH = 0.60
+WHALE_SLOT_TIMES_RIYADH = [(17, 30), (18, 30), (19, 30), (20, 30), (21, 30), (22, 30)]
+# ملاحظة مهمة:
+# الحيتان مستقلة تماماً عن الطرح العادي:
+# - لا تستخدم عداد الطرح العادي
+# - لا تستخدم تبريد الشركات العادي
+# - حتى لو نفس الشركة انطرحت عادي، عقد الحيتان يطلع إذا شروطه مكتملة
+WHALE_ALLOW_SAME_TICKER_AS_REGULAR = True
+
+
+# =========================
 # الارتكاز
 # =========================
 
@@ -184,8 +220,114 @@ DAILY_SIGNAL_STATE = {
 
 OPEN_CONTRACT_SIGNALS = {}
 SIGNAL_HISTORY = []
+
+# =========================
+# أرشفة التقارير والعقود
+# =========================
+REPORTS_DIR = "reports_archive"
+SIGNAL_HISTORY_FILE = os.path.join(REPORTS_DIR, "signal_history.json")
+REPORT_IMAGE_WIDTH = 1080
+REPORT_IMAGE_HEIGHT = 1620
+
 ECON_ALERT_SENT = set()
 LAST_SCANNER_SLOT_KEY = None
+LAST_WHALE_SLOT_KEY = None
+
+WHALE_DAILY_SIGNAL_STATE = {
+    "date": datetime.now().date(),
+    "count": 0
+}
+WHALE_LAST_SENT_CONTRACT = {}
+WHALE_HISTORY = []
+WHALE_HISTORY_FILE = os.path.join(REPORTS_DIR, "whale_signal_history.json")
+
+
+# =========================
+# حفظ واسترجاع أرشيف العقود
+# =========================
+
+def _dt_to_str(v):
+    return v.isoformat() if isinstance(v, datetime) else v
+
+def _dt_from_str(v):
+    if not v or isinstance(v, datetime):
+        return v
+    try:
+        return datetime.fromisoformat(str(v))
+    except Exception:
+        return None
+
+def _safe_float(v, default=0.0):
+    try:
+        if v in [None, "", "—"]:
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+def save_signal_archive():
+    try:
+        os.makedirs(REPORTS_DIR, exist_ok=True)
+        data = []
+        for row in SIGNAL_HISTORY:
+            clean = dict(row)
+            clean["created_at"] = _dt_to_str(clean.get("created_at"))
+            data.append(clean)
+        with open(SIGNAL_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[ARCHIVE SAVE ERROR] {e}")
+
+def load_signal_archive():
+    try:
+        os.makedirs(REPORTS_DIR, exist_ok=True)
+        if not os.path.exists(SIGNAL_HISTORY_FILE):
+            return
+        with open(SIGNAL_HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        SIGNAL_HISTORY.clear()
+        OPEN_CONTRACT_SIGNALS.clear()
+        for row in data:
+            row["created_at"] = _dt_from_str(row.get("created_at")) or datetime.now()
+            SIGNAL_HISTORY.append(row)
+            if row.get("option_ticker"):
+                OPEN_CONTRACT_SIGNALS[row["option_ticker"]] = row
+        print(f"[ARCHIVE LOADED] {len(SIGNAL_HISTORY)} signals")
+    except Exception as e:
+        print(f"[ARCHIVE LOAD ERROR] {e}")
+
+def save_whale_archive():
+    try:
+        os.makedirs(REPORTS_DIR, exist_ok=True)
+        data = []
+        for row in WHALE_HISTORY:
+            clean = dict(row)
+            clean["created_at"] = _dt_to_str(clean.get("created_at"))
+            data.append(clean)
+        with open(WHALE_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[WHALE ARCHIVE SAVE ERROR] {e}")
+
+def load_whale_archive():
+    try:
+        os.makedirs(REPORTS_DIR, exist_ok=True)
+        if not os.path.exists(WHALE_HISTORY_FILE):
+            return
+        with open(WHALE_HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        WHALE_HISTORY.clear()
+        for row in data:
+            row["created_at"] = _dt_from_str(row.get("created_at")) or datetime.now()
+            row.setdefault("first_update_sent", False)
+            row.setdefault("last_update_trigger_price", row.get("tp1", row.get("entry_price", 0)))
+            row.setdefault("category", "whale")
+            WHALE_HISTORY.append(row)
+            if row.get("option_ticker"):
+                OPEN_CONTRACT_SIGNALS[row["option_ticker"]] = row
+        print(f"[WHALE ARCHIVE LOADED] {len(WHALE_HISTORY)} signals")
+    except Exception as e:
+        print(f"[WHALE ARCHIVE LOAD ERROR] {e}")
 
 # =========================
 # أدوات حماية ومساعدة
@@ -280,6 +422,21 @@ def add_daily_signal():
     reset_daily_counter_if_needed()
     DAILY_SIGNAL_STATE["count"] += 1
 
+def reset_whale_daily_counter_if_needed():
+    today = datetime.now(RIYADH_TZ).date()
+    if WHALE_DAILY_SIGNAL_STATE["date"] != today:
+        WHALE_DAILY_SIGNAL_STATE["date"] = today
+        WHALE_DAILY_SIGNAL_STATE["count"] = 0
+        WHALE_LAST_SENT_CONTRACT.clear()
+
+def can_send_more_whales_today():
+    reset_whale_daily_counter_if_needed()
+    return WHALE_DAILY_SIGNAL_STATE["count"] < WHALE_MAX_SIGNALS_PER_DAY
+
+def add_whale_signal():
+    reset_whale_daily_counter_if_needed()
+    WHALE_DAILY_SIGNAL_STATE["count"] += 1
+
 def stock_in_cooldown(ticker: str) -> bool:
     last_sent = LAST_SENT_STOCK.get(ticker)
     if not last_sent:
@@ -305,6 +462,20 @@ def is_in_no_entry_window():
 
     return market_open <= now_et < no_entry_end
 
+def is_us_market_open_now():
+    """
+    فلتر حماية لعقود الحيتان والطرح الآلي:
+    يمنع الإرسال إذا السوق الأمريكي مقفل.
+    لا يعتمد على توقيت السعودية فقط لأن التوقيت الصيفي يتغير.
+    """
+    now_et = datetime.now(MARKET_TZ)
+    if now_et.weekday() >= 5:
+        return False
+
+    market_open = now_et.replace(hour=MARKET_OPEN_HOUR, minute=MARKET_OPEN_MINUTE, second=0, microsecond=0)
+    market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    return market_open <= now_et <= market_close
+
 def get_market_open_close_riyadh(target_date=None):
     now_et = datetime.now(MARKET_TZ)
     if target_date is None:
@@ -321,6 +492,12 @@ def get_regular_scan_slots_riyadh(target_date=None):
 
     raw_times = [(17, 0), (17, 30), (18, 0), (19, 0), (20, 0), (21, 0)]
     return [datetime(target_date.year, target_date.month, target_date.day, hh, mm, tzinfo=RIYADH_TZ) for hh, mm in raw_times]
+
+def get_whale_scan_slots_riyadh(target_date=None):
+    now_riyadh = datetime.now(RIYADH_TZ)
+    if target_date is None:
+        target_date = now_riyadh.date()
+    return [datetime(target_date.year, target_date.month, target_date.day, hh, mm, tzinfo=RIYADH_TZ) for hh, mm in WHALE_SLOT_TIMES_RIYADH]
 
 def get_friday_zero_hero_slots_riyadh(target_date=None):
     now_riyadh = datetime.now(RIYADH_TZ)
@@ -345,6 +522,16 @@ def get_due_scanner_slot_key(now_riyadh=None):
     slots = get_friday_zero_hero_slots_riyadh(now_riyadh.date()) if (now_riyadh.weekday() == 4 and FRIDAY_ZERO_HERO_ENABLED) else get_regular_scan_slots_riyadh(now_riyadh.date())
 
     for slot in slots:
+        diff = (now_riyadh - slot).total_seconds()
+        if 0 <= diff <= 70:
+            return slot.strftime('%Y-%m-%d %H:%M')
+    return None
+
+def get_due_whale_slot_key(now_riyadh=None):
+    now_riyadh = now_riyadh or datetime.now(RIYADH_TZ)
+    if (not WHALE_CONTRACTS_ENABLED) or now_riyadh.weekday() >= 5:
+        return None
+    for slot in get_whale_scan_slots_riyadh(now_riyadh.date()):
         diff = (now_riyadh - slot).total_seconds()
         if 0 <= diff <= 70:
             return slot.strftime('%Y-%m-%d %H:%M')
@@ -1246,6 +1433,274 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
         print(f"[CONTRACT PICK ERROR] {ticker}: {e}")
         return None
 
+
+def calc_rsi_from_close(close_series, length=14):
+    try:
+        delta = close_series.diff()
+        gain = delta.clip(lower=0).rolling(length).mean()
+        loss = (-delta.clip(upper=0)).rolling(length).mean()
+        rs = gain / loss.replace(0, 1e-9)
+        rsi = 100 - (100 / (1 + rs))
+        return float(rsi.iloc[-1])
+    except Exception:
+        return 50.0
+
+def calc_atr_from_df(df, length=14):
+    try:
+        high = df["High"].astype(float)
+        low = df["Low"].astype(float)
+        close = df["Close"].astype(float)
+        prev_close = close.shift(1)
+        tr = pd.concat([
+            (high - low),
+            (high - prev_close).abs(),
+            (low - prev_close).abs()
+        ], axis=1).max(axis=1)
+        return tr.rolling(length).mean()
+    except Exception:
+        return pd.Series(dtype=float)
+
+def get_us500_whale_bias():
+    try:
+        df_m = get_df("US500", "1h")
+        if df_m.empty or len(df_m) < 60:
+            return "NEUTRAL"
+        close = df_m["Close"].astype(float)
+        ema20 = float(close.ewm(span=20).mean().iloc[-1])
+        ema50 = float(close.ewm(span=50).mean().iloc[-1])
+        last = float(close.iloc[-1])
+        if last > ema20 > ema50:
+            return "CALL"
+        if last < ema20 < ema50:
+            return "PUT"
+        return "NEUTRAL"
+    except Exception:
+        return "NEUTRAL"
+
+def detect_whale_explosion_setup(df, ticker: str, base_c: dict, market_bias: str = "NEUTRAL"):
+    """
+    قناص الحيتان المطور:
+    يبحث عن تجميع + قرب مستوى مهم + ارتفاع فوليوم + ضغط ATR + توافق السوق.
+    يرجع setup مستقل للـ whale فقط ولا يغير منطق الطرح العادي.
+    """
+    try:
+        if df is None or df.empty or len(df) < max(60, WHALE_STRUCTURE_BARS + 5):
+            return None
+
+        close = df["Close"].astype(float)
+        high = df["High"].astype(float)
+        low = df["Low"].astype(float)
+        volume = df["Volume"].astype(float) if "Volume" in df.columns else pd.Series([0] * len(df), index=df.index)
+
+        price = float(close.iloc[-1])
+        recent_close = close.tail(WHALE_CONSOLIDATION_BARS)
+        recent_high = float(high.tail(WHALE_CONSOLIDATION_BARS).max())
+        recent_low = float(low.tail(WHALE_CONSOLIDATION_BARS).min())
+        structure_high = float(high.tail(WHALE_STRUCTURE_BARS).max())
+        structure_low = float(low.tail(WHALE_STRUCTURE_BARS).min())
+        structure_range = max(structure_high - structure_low, 1e-9)
+
+        consolidation_range_pct = (recent_high - recent_low) / max(price, 1e-9)
+        consolidation_ok = consolidation_range_pct <= WHALE_MAX_CONSOLIDATION_RANGE_PCT
+
+        atr_series = calc_atr_from_df(df, 14)
+        if atr_series.empty or atr_series.dropna().empty:
+            atr_now = 0.0
+            atr_avg = 0.0
+            atr_compression_ok = False
+        else:
+            atr_now = float(atr_series.iloc[-1])
+            atr_avg = float(atr_series.tail(30).mean())
+            atr_compression_ok = atr_avg > 0 and atr_now <= atr_avg * WHALE_ATR_COMPRESSION_MULT
+
+        last_vol = float(volume.iloc[-1])
+        vol3 = float(volume.tail(3).mean())
+        prev_vol10 = float(volume.iloc[-13:-3].mean()) if len(volume) >= 13 else float(volume.tail(10).mean())
+        volume_spike_ok = prev_vol10 > 0 and last_vol >= prev_vol10 * WHALE_VOLUME_SPIKE_MULT
+        volume_rising_ok = prev_vol10 > 0 and vol3 >= prev_vol10 * WHALE_VOLUME_RISING_MULT
+
+        rsi = calc_rsi_from_close(close, 14)
+        prev_rsi = calc_rsi_from_close(close.iloc[:-1], 14) if len(close) > 20 else rsi
+
+        dist_to_resistance = abs(structure_high - price) / max(price, 1e-9)
+        dist_to_support = abs(price - structure_low) / max(price, 1e-9)
+        near_resistance = dist_to_resistance <= WHALE_NEAR_LEVEL_PCT
+        near_support = dist_to_support <= WHALE_NEAR_LEVEL_PCT
+
+        range_position = (price - structure_low) / structure_range
+        bottom_zone = range_position <= 0.30
+        top_zone = range_position >= 0.70
+
+        # تحديد الاتجاه الذكي للحيتان: قاع = CALL / قمة = PUT / اختراق مقاومة = CALL / كسر دعم = PUT
+        if bottom_zone or (near_resistance and (volume_rising_ok or volume_spike_ok) and rsi >= 48):
+            direction_type = "call"
+            direction = "CALL 🟢"
+            trigger_level = structure_high if near_resistance else structure_low
+            level_name = "قاع تجميع" if bottom_zone else "مقاومة قبل الانفجار"
+        elif top_zone or (near_support and (volume_rising_ok or volume_spike_ok) and rsi <= 52):
+            direction_type = "put"
+            direction = "PUT 🔴"
+            trigger_level = structure_low if near_support else structure_high
+            level_name = "قمة تصريف" if top_zone else "دعم قبل الكسر"
+        else:
+            return None
+
+        score = 0
+
+        # Volume = 25
+        if volume_spike_ok:
+            score += 25
+        elif volume_rising_ok:
+            score += 18
+
+        # RSI = 20
+        if direction_type == "call":
+            if 48 <= rsi <= 68 and rsi >= prev_rsi:
+                score += 20
+            elif rsi >= 45:
+                score += 12
+        else:
+            if 32 <= rsi <= 52 and rsi <= prev_rsi:
+                score += 20
+            elif rsi <= 55:
+                score += 12
+
+        # قرب من مستوى مهم = 20
+        if near_resistance or near_support or bottom_zone or top_zone:
+            score += 20
+
+        # تجميع + ضغط ATR = 20
+        if consolidation_ok and atr_compression_ok:
+            score += 20
+        elif consolidation_ok or atr_compression_ok:
+            score += 12
+
+        # توافق US500 = 15
+        if market_bias == "NEUTRAL":
+            score += 7
+        elif market_bias == ("CALL" if direction_type == "call" else "PUT"):
+            score += 15
+
+        reasons = []
+        if consolidation_ok:
+            reasons.append("تجميع واضح")
+        if atr_compression_ok:
+            reasons.append("ضغط ATR")
+        if volume_spike_ok:
+            reasons.append("فوليوم انفجاري")
+        elif volume_rising_ok:
+            reasons.append("فوليوم يرتفع")
+        if near_resistance:
+            reasons.append("قرب مقاومة")
+        if near_support:
+            reasons.append("قرب دعم")
+        if bottom_zone:
+            reasons.append("منطقة قاع")
+        if top_zone:
+            reasons.append("منطقة قمة")
+        if market_bias != "NEUTRAL":
+            reasons.append(f"US500 {market_bias}")
+
+        setup = {
+            "direction": direction,
+            "direction_type": direction_type,
+            "explosion_score": int(min(100, score)),
+            "rsi": round(rsi, 2),
+            "consolidation_range_pct": round(consolidation_range_pct * 100, 2),
+            "atr_now": round(atr_now, 4),
+            "atr_avg": round(atr_avg, 4),
+            "volume_spike": bool(volume_spike_ok),
+            "volume_rising": bool(volume_rising_ok),
+            "near_resistance": bool(near_resistance),
+            "near_support": bool(near_support),
+            "bottom_zone": bool(bottom_zone),
+            "top_zone": bool(top_zone),
+            "trigger_level": round(float(trigger_level), 2),
+            "level_name": level_name,
+            "reasons": " + ".join(reasons) if reasons else "إعداد حيتان"
+        }
+
+        if setup["explosion_score"] < WHALE_MIN_EXPLOSION_SCORE:
+            return None
+
+        enhanced_c = dict(base_c)
+        enhanced_c["direction"] = direction
+        enhanced_c["whale_setup"] = setup
+        return enhanced_c
+
+    except Exception as e:
+        print(f"[WHALE SETUP ERROR] {ticker}: {e}")
+        return None
+
+
+def choose_whale_contract_from_massive(ticker: str, c: dict, o: dict = None):
+    try:
+        chain = get_option_chain_snapshot(ticker)
+        if not chain:
+            return None
+
+        parsed = [parse_contract_meta(x) for x in chain]
+        parsed = [x for x in parsed if x["ticker"] and x["contract_price"] is not None]
+        if not parsed:
+            return None
+
+        whale_setup = c.get("whale_setup", {}) or {}
+        direction = c.get("direction", "")
+        target_type = whale_setup.get("direction_type") or ("call" if direction.startswith("CALL") else "put")
+        underlying_price = c.get("price", 0) or 0
+
+        pool = []
+        for x in parsed:
+            if x["contract_type"] != target_type:
+                continue
+            if not x["expiration"]:
+                continue
+            if x["contract_price"] is None or not (WHALE_MIN_PRICE <= x["contract_price"] <= WHALE_MAX_PRICE):
+                continue
+            dte = days_to_expiry(x["expiration"])
+            if dte is None or dte < WHALE_MIN_DTE_DAYS or dte > WHALE_MAX_DTE_DAYS:
+                continue
+            if x["oi"] < WHALE_MIN_OI:
+                continue
+
+            option_key = x.get("ticker")
+            if WHALE_LAST_SENT_CONTRACT.get(option_key) == datetime.now(RIYADH_TZ).date().isoformat():
+                continue
+
+            strike_distance_pct = abs(x["strike"] - underlying_price) / max(underlying_price, 1e-9)
+            delta_score = abs(abs(x["delta"]) - 0.30)
+            volume = _safe_float(x.get("volume", x.get("vol", 0)))
+            score = (
+                strike_distance_pct * 18
+                + delta_score * 5
+                + abs(x["contract_price"] - 1.00) * 0.6
+                - min(x["oi"], 100000) / 12000
+                - min(volume, 50000) / 10000
+                - min(abs(x["gamma"]), 1.0) * 4
+            )
+            pool.append((score, x))
+
+        if not pool:
+            return None
+
+        pool.sort(key=lambda z: z[0])
+        best = pool[0][1]
+        contract = build_contract_from_pick(best, c, target_type, mode="WHALE EXPLOSION")
+        contract["entry_low"] = max(WHALE_MIN_PRICE, round(contract["entry_high"] - WHALE_ENTRY_ZONE_WIDTH, 2))
+        contract["success_rate"] = calc_success_rate(c, o or {"prob": 50}, contract)
+        whale_setup = c.get("whale_setup", {}) or {}
+        contract["explosion_score"] = whale_setup.get("explosion_score", contract["success_rate"])
+        contract["whale_reasons"] = whale_setup.get("reasons", "إعداد حيتان")
+        contract["whale_level_name"] = whale_setup.get("level_name", "منطقة حيتان")
+        contract["whale_trigger_level"] = whale_setup.get("trigger_level", c.get("pivot", 0))
+        contract["whale_rsi"] = whale_setup.get("rsi", 50)
+        contract["whale_consolidation_range_pct"] = whale_setup.get("consolidation_range_pct", 0)
+        return contract
+
+    except Exception as e:
+        print(f"[WHALE CONTRACT PICK ERROR] {ticker}: {e}")
+        return None
+
 # =========================
 # فلترة الصياد
 # =========================
@@ -1489,6 +1944,144 @@ def edit_contract_image(row: dict, caption: str = "", chat_id=None):
         print(f"[EDIT PHOTO ERROR] {e}")
         return send_contract_image(row, caption=caption, chat_id=target_chat_id)
 
+
+def _report_stats(rows: list):
+    st = {"total": len(rows), "wins": 0, "losses": 0, "calls": 0, "puts": 0, "tp1": 0, "tp2": 0, "tp3": 0, "entry": 0.0, "high": 0.0, "net": 0.0, "equity": []}
+    acc = 0.0
+    for row in rows:
+        pnl, current, high = calc_signal_pnl(row)
+        entry = _safe_float(row.get("entry_price"))
+        net = max(0.0, high - entry) if high >= entry else current - entry
+        st["entry"] += entry; st["high"] += high; st["net"] += net
+        acc += net; st["equity"].append(acc)
+        st["wins" if net >= 0 else "losses"] += 1
+        st["calls" if row.get("contract_type") == "call" else "puts"] += 1
+        if high >= _safe_float(row.get("tp1"), 10**9): st["tp1"] += 1
+        if high >= _safe_float(row.get("tp2"), 10**9): st["tp2"] += 1
+        if high >= _safe_float(row.get("tp3"), 10**9): st["tp3"] += 1
+    st["success"] = (st["wins"] / st["total"] * 100) if st["total"] else 0.0
+    return st
+
+def _format_report_fallback(rows, title, period_text):
+    st = _report_stats(rows)
+    msg = f"📊 <b>{title}</b>\n📅 {period_text}\n\nإجمالي العقود: <b>{st['total']}</b>\nالرابحة: {st['wins']}\nالخاسرة: {st['losses']}\nنسبة النجاح: <b>{st['success']:.2f}%</b>\n\n"
+    msg += f"TP1: {st['tp1']}/{st['total']}\nTP2: {st['tp2']}/{st['total']}\nTP3: {st['tp3']}/{st['total']}\n\n"
+    if not rows:
+        msg += "❌ لا توجد عقود في هذه الفترة.\n"
+    for i, row in enumerate(rows, 1):
+        msg += format_report_contract_line(row, i) + "\n"
+    return msg + "\n📢 @Option_Strike01"
+
+def build_report_image(rows: list, title: str, period_text: str):
+    try:
+        from PIL import Image, ImageDraw
+    except Exception:
+        return None
+    st = _report_stats(rows)
+    W, H = REPORT_IMAGE_WIDTH, REPORT_IMAGE_HEIGHT
+    bg=(2,7,10); panel=(7,17,22); line=(170,97,25); gold=(229,151,45); green=(83,188,52); red=(210,61,42); white=(238,238,226)
+    img=Image.new("RGB",(W,H),bg); d=ImageDraw.Draw(img)
+    f_title=_img_font(58,True); f_sub=_img_font(32,False); f_box=_img_font(25,True); f_num=_img_font(44,True); f_med=_img_font(28,True); f_small=_img_font(21,False); f_tiny=_img_font(18,False)
+    d.rectangle((8,8,W-8,H-8), outline=line, width=3)
+    d.text((55,60),"OPTION\nSTRIKE",fill=gold,font=_img_font(36,True),spacing=0)
+    d.text((540,55),title,fill=gold,font=f_title,anchor="ma")
+    d.text((540,125),"تقرير الشركات",fill=gold,font=f_sub,anchor="ma")
+    d.rounded_rectangle((345,170,735,220),radius=12,outline=line,width=2,fill=(10,17,22)); d.text((540,181),period_text,fill=white,font=f_sub,anchor="ma")
+    for x,label,value,color in [(20,"إجمالي العقود",st['total'],white),(210,"الرابحة",st['wins'],green),(400,"الخاسرة",st['losses'],red),(590,"نسبة النجاح",f"{st['success']:.2f}%",green)]:
+        d.rounded_rectangle((x,240,x+175,375),radius=10,outline=line,width=2,fill=panel); d.text((x+88,258),str(label),fill=gold,font=f_box,anchor="ma"); d.text((x+88,304),str(value),fill=color,font=f_num,anchor="ma")
+    total=max(st['total'],1)
+    d.rounded_rectangle((785,240,1060,375),radius=10,outline=line,width=2,fill=panel); d.text((922,258),"توزيع العقود",fill=gold,font=f_box,anchor="ma")
+    d.text((835,303),f"CALL ({st['calls']})  {st['calls']/total*100:.2f}%",fill=green,font=f_small); d.text((835,336),f"PUT ({st['puts']})  {st['puts']/total*100:.2f}%",fill=red,font=f_small)
+    d.rounded_rectangle((20,390,550,610),radius=10,outline=line,width=2,fill=panel); d.text((285,405),"الأداء خلال الفترة",fill=gold,font=f_box,anchor="ma")
+    chart=(65,455,520,575); d.rectangle(chart,outline=(31,55,58),width=1); eq=st['equity'] or [0]; mn=min(eq+[0]); mx=max(eq+[1]); mx = mx if mx != mn else mn+1
+    pts=[]
+    for i,v in enumerate(eq):
+        pts.append((chart[0]+int((chart[2]-chart[0])*(i/max(len(eq)-1,1))), chart[3]-int((chart[3]-chart[1])*((v-mn)/(mx-mn)))))
+    if len(pts)>1: d.line(pts,fill=green,width=4)
+    for p in pts: d.ellipse((p[0]-4,p[1]-4,p[0]+4,p[1]+4),fill=green)
+    d.rounded_rectangle((570,390,1060,610),radius=10,outline=line,width=2,fill=panel); d.text((815,405),"تحقيق الأهداف",fill=gold,font=f_box,anchor="ma")
+    for i,(lab,val) in enumerate([("TP1",st['tp1']),("TP2",st['tp2']),("TP3",st['tp3'])]):
+        y=455+i*48; pct=(val/total*100) if st['total'] else 0
+        d.text((610,y),lab,fill=white,font=f_med); d.text((700,y),f"{val} / {st['total']}",fill=white,font=f_small); d.rectangle((820,y+8,980,y+24),fill=(30,43,43)); d.rectangle((820,y+8,820+int(160*pct/100),y+24),fill=green); d.text((995,y),f"{pct:.2f}%",fill=green,font=f_small)
+    d.rounded_rectangle((20,625,1060,1435),radius=10,outline=line,width=2,fill=panel); d.text((540,638),"جميع العقود",fill=gold,font=f_med,anchor="ma")
+    xs=[1040,980,875,770,650,530,405,290,165]; headers=["#","الشركة","النوع","تاريخ الانتهاء","دخول","أعلى","الصافي","نسبة الربح","الحالة"]; y=680
+    for x,h in zip(xs,headers): d.text((x,y),h,fill=gold,font=f_tiny,anchor="ra")
+    d.line((35,y+30,1045,y+30),fill=line,width=1); y+=40
+    for idx,row in enumerate(rows[:24],1):
+        entry=_safe_float(row.get('entry_price')); high=_safe_float(row.get('highest_price'),entry); current=_safe_float(row.get('current_price'),high); net=max(0,high-entry) if high>=entry else current-entry; pct=(net/entry*100) if entry else 0; ctype='CALL' if row.get('contract_type')=='call' else 'PUT'; color=green if net>=0 else red; status='رابح' if net>=0 else 'خاسر'
+        vals=[idx,row.get('ticker','—'),ctype,format_short_date(row.get('expiration','')),f"{entry:.2f}",f"{high:.2f}",f"{net:.2f}",f"{pct:.0f}%",status]
+        for x,v in zip(xs,vals): d.text((x,y),str(v),fill=color if x in [290,405,165] else white,font=f_tiny,anchor="ra")
+        y+=29
+        if y>1400: break
+    for x1,x2,lab,val,col in [(35,330,"مجموع الدخول",st['entry'],white),(365,660,"مجموع أعلى سعر",st['high'],white),(695,1045,"صافي الربح",st['net'],green if st['net']>=0 else red)]:
+        d.rounded_rectangle((x1,1450,x2,1525),radius=10,outline=line,fill=(5,15,18),width=2); d.text(((x1+x2)//2,1463),lab,fill=white,font=f_small,anchor="ma"); d.text(((x1+x2)//2,1492),f"$ {val:.2f}",fill=col,font=f_med,anchor="ma")
+    d.text((540,1560),"تداول بذكاء .. وانضباط    |    @Option_Strike01",fill=gold,font=f_small,anchor="ma")
+    bio=io.BytesIO(); bio.name="option_strike_report.png"; img.save(bio,format="PNG"); bio.seek(0); return bio
+
+def send_report_image(rows: list, title: str, period_text: str, chat_id=None, keyboard=None):
+    target_chat_id = str(chat_id) if chat_id else CHAT_ID
+    photo = build_report_image(rows, title, period_text)
+    if photo is None:
+        return send(_format_report_fallback(rows, title, period_text), keyboard=keyboard, chat_id=target_chat_id)
+    data = {"chat_id": target_chat_id, "caption": f"📊 <b>{title}</b>\n📅 {period_text}\n\n📢 @Option_Strike01", "parse_mode": "HTML"}
+    if keyboard: data["reply_markup"] = json.dumps(keyboard)
+    try:
+        r = HTTP.post(API_SEND_PHOTO, data=data, files={"photo": photo}, timeout=30); r.raise_for_status(); return r.json()
+    except Exception as e:
+        print(f"[SEND REPORT PHOTO ERROR] {e}"); return send(_format_report_fallback(rows, title, period_text), keyboard=keyboard, chat_id=target_chat_id)
+
+def rows_for_day(day=None):
+    d = day or datetime.now(RIYADH_TZ).date(); return [x for x in SIGNAL_HISTORY if x.get("created_at") and x["created_at"].date() == d]
+
+def rows_for_week():
+    ws=get_week_start(); we=ws+timedelta(days=6); return [x for x in SIGNAL_HISTORY if x.get("created_at") and ws <= x["created_at"].date() <= we], ws, we
+
+def rows_for_month(year:int, month:int):
+    return [x for x in SIGNAL_HISTORY if x.get("created_at") and x["created_at"].year==year and x["created_at"].month==month]
+
+def rows_for_year(year:int):
+    return [x for x in SIGNAL_HISTORY if x.get("created_at") and x["created_at"].year==year]
+
+def report_menu():
+    return {"inline_keyboard":[[{"text":"📋 تقرير اليوم","callback_data":"daily_report_img"},{"text":"🗓 تقرير الأسبوع","callback_data":"weekly_report_img"}],[{"text":"📅 تقرير شهري","callback_data":"report_months"},{"text":"📆 تقرير سنوي","callback_data":"yearly_report_img"}],[{"text":"🏠 رجوع","callback_data":"back"}]]}
+
+def months_archive_menu():
+    keys=sorted({(x["created_at"].year,x["created_at"].month) for x in SIGNAL_HISTORY if x.get("created_at")}, reverse=True); rows=[]; row=[]
+    for y,m in keys[:24]:
+        row.append({"text":f"{m:02d}/{y}","callback_data":f"month_report:{y}:{m}"})
+        if len(row)==3: rows.append(row); row=[]
+    if row: rows.append(row)
+    rows.append([{"text":"🏠 رجوع","callback_data":"reports_menu"}]); return {"inline_keyboard":rows}
+
+def whale_rows_for_day(day=None):
+    d = day or datetime.now(RIYADH_TZ).date()
+    return [x for x in WHALE_HISTORY if x.get("created_at") and x["created_at"].date() == d]
+
+def whale_rows_for_week():
+    ws = get_week_start(); we = ws + timedelta(days=6)
+    return [x for x in WHALE_HISTORY if x.get("created_at") and ws <= x["created_at"].date() <= we], ws, we
+
+def whale_rows_for_month(year:int, month:int):
+    return [x for x in WHALE_HISTORY if x.get("created_at") and x["created_at"].year == year and x["created_at"].month == month]
+
+def whale_rows_for_year(year:int):
+    return [x for x in WHALE_HISTORY if x.get("created_at") and x["created_at"].year == year]
+
+def whale_report_menu():
+    return {"inline_keyboard":[[{"text":"📋 تقرير الحيتان اليومي","callback_data":"whale_daily_report_img"},{"text":"🗓 تقرير الحيتان الأسبوعي","callback_data":"whale_weekly_report_img"}],[{"text":"📅 تقرير الحيتان الشهري","callback_data":"whale_report_months"},{"text":"📆 تقرير الحيتان السنوي","callback_data":"whale_yearly_report_img"}],[{"text":"🏠 رجوع","callback_data":"back"}]]}
+
+def whale_months_archive_menu():
+    keys = sorted({(x["created_at"].year, x["created_at"].month) for x in WHALE_HISTORY if x.get("created_at")}, reverse=True)
+    rows=[]; row=[]
+    for y,m in keys[:24]:
+        row.append({"text":f"{m:02d}/{y}","callback_data":f"whale_month_report:{y}:{m}"})
+        if len(row)==3:
+            rows.append(row); row=[]
+    if row:
+        rows.append(row)
+    rows.append([{"text":"🏠 رجوع","callback_data":"whale_reports_menu"}])
+    return {"inline_keyboard":rows}
+
 def answer_callback(cb_id, text=""):
     try:
         HTTP.post(API_ANSWER, json={
@@ -1625,6 +2218,36 @@ def msg_channel_post(tk, contract):
 
 ⚠️ تنبيه: هذا الطرح تعليمي
 والقرار النهائي يعود للمتداول
+
+📢 @Option_Strike01"""
+
+def msg_whale_channel_post(tk, contract):
+    type_ar = "CALL" if contract["contract_type"] == "call" else "PUT"
+    color = "🟢" if contract["contract_type"] == "call" else "🔴"
+    return f"""🐋 <b>طرح عقود الحيتان | {tk}</b>
+
+{color} النوع: <b>{type_ar}</b>
+🎯 السترايك: ${contract['strike']:.2f}
+📅 التاريخ: {format_arabic_date(contract['expiration'])}
+
+💰 نطاق الدخول: {contract['entry_high']:.2f} – {contract['entry_low']:.2f}
+
+📈 الأهداف:
+🥇 {contract['tp1']:.2f}
+🥈 {contract['tp2']:.2f}
+🥉 {contract['tp3']:.2f}
+
+🛑 الوقف: {contract['stop_text']}
+📊 نسبة النجاح: <b>{contract['success_rate']}%</b>
+🔥 نسبة الانفجار: <b>{contract.get('explosion_score', contract['success_rate'])}%</b>
+
+🐋 سبب الاختيار:
+{contract.get('whale_reasons', 'إعداد حيتان')}
+
+📍 المنطقة: {contract.get('whale_level_name', 'منطقة حيتان')} عند {float(contract.get('whale_trigger_level', 0) or 0):.2f}
+
+⚠️ تنبيه: هذا الطرح تعليمي
+والقرار النهائي يعود للمتداول.
 
 📢 @Option_Strike01"""
 def msg_contract_update(title, entry_price, current_price):
@@ -2109,6 +2732,36 @@ def register_contract_signal(ticker: str, contract: dict):
     }
     OPEN_CONTRACT_SIGNALS[key] = row
     SIGNAL_HISTORY.append(row)
+    save_signal_archive()
+
+def register_whale_signal(ticker: str, contract: dict):
+    key = contract["option_ticker"]
+    row = {
+        "ticker": ticker,
+        "option_ticker": contract["option_ticker"],
+        "contract_type": contract["contract_type"],
+        "strike": contract["strike"],
+        "expiration": contract["expiration"],
+        "entry_price": contract["contract_price"],
+        "highest_price": contract["contract_price"],
+        "current_price": contract["contract_price"],
+        "tp1": contract["tp1"],
+        "tp2": contract["tp2"],
+        "tp3": contract["tp3"],
+        "first_update_sent": False,
+        "last_update_trigger_price": contract["tp1"],
+        "created_at": datetime.now(RIYADH_TZ),
+        "channel_title": f"{ticker} ${contract['strike']:.2f} {'كول' if contract['contract_type'] == 'call' else 'بوت'}",
+        "message_id": contract.get("message_id"),
+        "mid": contract.get("mid", contract.get("contract_price")),
+        "oi": contract.get("oi", "—"),
+        "volume": contract.get("volume", contract.get("vol", "—")),
+        "category": "whale"
+    }
+    OPEN_CONTRACT_SIGNALS[key] = row
+    WHALE_HISTORY.append(row)
+    WHALE_LAST_SENT_CONTRACT[key] = datetime.now(RIYADH_TZ).date().isoformat()
+    save_whale_archive()
 
 def get_live_contract_price(underlying: str, option_ticker: str):
     try:
@@ -2488,6 +3141,78 @@ def scanner_cycle():
         if sent_now >= MAX_SIGNALS_PER_SCAN:
             break
 
+def whale_scanner_cycle():
+    reset_whale_daily_counter_if_needed()
+    if not can_send_more_whales_today():
+        return
+
+    if not is_us_market_open_now():
+        print("[WHALE SCANNER] السوق الأمريكي مغلق - لا يوجد طرح حيتان حالياً")
+        return
+
+    if is_in_no_entry_window():
+        print("[WHALE SCANNER] داخل أول نصف ساعة من الافتتاح - لا يوجد دخول حالياً")
+        return
+
+    results = []
+    market_bias = get_us500_whale_bias() if WHALE_ENHANCED_EXPLOSION_ENABLED else "NEUTRAL"
+    for ticker in WATCHLIST:
+        try:
+            df = get_df(ticker, "1h")
+            if df.empty or len(df) < 20:
+                continue
+
+            c = core_metrics(df, ticker=ticker)
+            if c is None:
+                continue
+
+            if WHALE_ENHANCED_EXPLOSION_ENABLED:
+                c = detect_whale_explosion_setup(df, ticker, c, market_bias=market_bias)
+                if c is None:
+                    continue
+            else:
+                if not is_entry_ready_now(c):
+                    continue
+
+            o = options_info_from_massive(ticker, c["price"])
+            contract = choose_whale_contract_from_massive(ticker, c, o)
+            if not contract:
+                continue
+
+            score = int(contract.get("explosion_score") or calc_score(c, o))
+            if score < max(WHALE_MIN_SCORE, WHALE_MIN_EXPLOSION_SCORE if WHALE_ENHANCED_EXPLOSION_ENABLED else WHALE_MIN_SCORE):
+                continue
+
+            contract["news_items"] = get_stock_news(ticker, limit=2)
+            contract["earnings_event"] = get_ticker_earnings_event_in_week(ticker)
+            results.append((ticker, score, c, o, contract))
+
+        except Exception as e:
+            print(f"[WHALE SCANNER ITEM ERROR] {ticker}: {e}")
+            continue
+
+    results.sort(key=lambda x: x[1], reverse=True)
+
+    sent_now = 0
+    for ticker, score, c, o, contract in results:
+        if not can_send_more_whales_today():
+            break
+
+        send(msg_pro(ticker, "1h", c, o, contract), chat_id=CHAT_ID)
+        time.sleep(1)
+        photo_res = send_contract_image({"ticker": ticker, **contract}, caption=msg_whale_channel_post(ticker, contract), chat_id=CHAT_ID)
+        try:
+            contract["message_id"] = photo_res.get("result", {}).get("message_id")
+        except Exception:
+            contract["message_id"] = None
+
+        register_whale_signal(ticker, contract)
+        add_whale_signal()
+        sent_now += 1
+
+        if sent_now >= WHALE_MAX_SIGNALS_PER_SCAN:
+            break
+
 def contract_update_cycle():
     for option_ticker, sig in list(OPEN_CONTRACT_SIGNALS.items()):
         try:
@@ -2504,11 +3229,24 @@ def contract_update_cycle():
                 edit_contract_image(sig, caption=msg_contract_update(sig["channel_title"], sig["entry_price"], price), chat_id=CHAT_ID)
                 sig["first_update_sent"] = True
                 sig["last_update_trigger_price"] = price
+                if sig.get("category") == "whale":
+                    save_whale_archive()
+                else:
+                    save_signal_archive()
                 continue
 
             if sig["first_update_sent"] and price >= sig["last_update_trigger_price"] + UPDATE_STEP_AFTER_TP1:
                 edit_contract_image(sig, caption=msg_contract_update(sig["channel_title"], sig["entry_price"], price), chat_id=CHAT_ID)
                 sig["last_update_trigger_price"] = price
+                if sig.get("category") == "whale":
+                    save_whale_archive()
+                else:
+                    save_signal_archive()
+
+            if sig.get("category") == "whale":
+                save_whale_archive()
+            else:
+                save_signal_archive()
 
         except Exception as e:
             print(f"[CONTRACT UPDATE ERROR] {option_ticker}: {e}")
@@ -2527,7 +3265,7 @@ async def contract_update_loop():
         await asyncio.sleep(300)
 
 async def scanner_loop():
-    global LAST_SCANNER_SLOT_KEY
+    global LAST_SCANNER_SLOT_KEY, LAST_WHALE_SLOT_KEY
     await asyncio.sleep(10)
     while True:
         try:
@@ -2535,6 +3273,11 @@ async def scanner_loop():
             if slot_key and slot_key != LAST_SCANNER_SLOT_KEY:
                 await asyncio.to_thread(scanner_cycle)
                 LAST_SCANNER_SLOT_KEY = slot_key
+
+            whale_slot_key = get_due_whale_slot_key()
+            if whale_slot_key and whale_slot_key != LAST_WHALE_SLOT_KEY:
+                await asyncio.to_thread(whale_scanner_cycle)
+                LAST_WHALE_SLOT_KEY = whale_slot_key
         except Exception as e:
             send(f"❌ خطأ في الصياد: {str(e)}", chat_id=CHAT_ID)
         await asyncio.sleep(SCAN_INTERVAL_SECONDS)
@@ -2550,6 +3293,8 @@ async def economic_alert_loop():
 
 @app.on_event("startup")
 async def startup_event():
+    load_signal_archive()
+    load_whale_archive()
     asyncio.create_task(scanner_loop())
     asyncio.create_task(contract_update_loop())
     asyncio.create_task(economic_alert_loop())
@@ -2576,7 +3321,10 @@ def main_menu():
             ],
             [
                 {"text": "📂 العقود المفتوحة", "callback_data": "open_contracts"},
-                {"text": "📋 التقرير اليومي", "callback_data": "daily_report"},
+                {"text": "📊 التقارير", "callback_data": "reports_menu"},
+            ],
+            [
+                {"text": "🐋 تقرير عقود الحيتان", "callback_data": "whale_reports_menu"},
             ],
             [
                 {"text": "📆 إعلانات الشركات", "callback_data": "earnings_menu"},
@@ -2837,6 +3585,11 @@ async def webhook(req: Request):
                 await asyncio.to_thread(scanner_cycle)
                 return {"ok": True}
 
+            if text == "/whales":
+                send("🐋 جاري تشغيل صيد عقود الحيتان يدوياً...", chat_id=user)
+                await asyncio.to_thread(whale_scanner_cycle)
+                return {"ok": True}
+
             if not text:
                 send("❌ أرسل رمز سهم صحيح مثل: <code>NVDA</code>", chat_id=user)
                 return {"ok": True}
@@ -2916,8 +3669,77 @@ async def webhook(req: Request):
                 send(msg_earnings_analysis(tk, event, c, o, contract, trade_view), main_menu(), chat_id=user)
                 return {"ok": True}
 
+            if data_cb == "whale_reports_menu":
+                send("🐋 اختر تقرير عقود الحيتان 👇", whale_report_menu(), chat_id=user)
+                return {"ok": True}
+
+            if data_cb == "whale_daily_report_img":
+                rows = whale_rows_for_day()
+                send_report_image(rows, "تقرير عقود الحيتان اليومي", datetime.now(RIYADH_TZ).strftime("%d/%m/%Y"), chat_id=user, keyboard=whale_report_menu())
+                return {"ok": True}
+
+            if data_cb == "whale_weekly_report_img":
+                rows, ws, we = whale_rows_for_week()
+                send_report_image(rows, "تقرير عقود الحيتان الأسبوعي", f"{ws.strftime('%d/%m/%Y')} - {we.strftime('%d/%m/%Y')}", chat_id=user, keyboard=whale_report_menu())
+                return {"ok": True}
+
+            if data_cb == "whale_yearly_report_img":
+                y = datetime.now(RIYADH_TZ).year
+                rows = whale_rows_for_year(y)
+                send_report_image(rows, "تقرير عقود الحيتان السنوي", str(y), chat_id=user, keyboard=whale_report_menu())
+                return {"ok": True}
+
+            if data_cb == "whale_report_months":
+                send("📅 اختر شهر تقرير الحيتان من الأرشيف 👇", whale_months_archive_menu(), chat_id=user)
+                return {"ok": True}
+
+            if data_cb.startswith("whale_month_report:"):
+                try:
+                    _, y, m = data_cb.split(":")
+                    y, m = int(y), int(m)
+                    rows = whale_rows_for_month(y, m)
+                    send_report_image(rows, "تقرير عقود الحيتان الشهري", f"{m:02d}/{y}", chat_id=user, keyboard=whale_months_archive_menu())
+                except Exception as e:
+                    send(f"❌ تعذر عرض تقرير الحيتان الشهري: {e}", whale_report_menu(), chat_id=user)
+                return {"ok": True}
+
+            if data_cb == "reports_menu":
+                send("📊 اختر نوع التقرير 👇", report_menu(), chat_id=user)
+                return {"ok": True}
+
+            if data_cb == "daily_report_img":
+                rows = rows_for_day()
+                send_report_image(rows, "التقرير اليومي", datetime.now(RIYADH_TZ).strftime("%d/%m/%Y"), chat_id=user, keyboard=report_menu())
+                return {"ok": True}
+
+            if data_cb == "weekly_report_img":
+                rows, ws, we = rows_for_week()
+                send_report_image(rows, "التقرير الأسبوعي", f"{ws.strftime('%d/%m/%Y')} - {we.strftime('%d/%m/%Y')}", chat_id=user, keyboard=report_menu())
+                return {"ok": True}
+
+            if data_cb == "yearly_report_img":
+                y = datetime.now(RIYADH_TZ).year
+                rows = rows_for_year(y)
+                send_report_image(rows, "التقرير السنوي", str(y), chat_id=user, keyboard=report_menu())
+                return {"ok": True}
+
+            if data_cb == "report_months":
+                send("📅 اختر الشهر من الأرشيف 👇", months_archive_menu(), chat_id=user)
+                return {"ok": True}
+
+            if data_cb.startswith("month_report:"):
+                try:
+                    _, y, m = data_cb.split(":")
+                    y, m = int(y), int(m)
+                    rows = rows_for_month(y, m)
+                    send_report_image(rows, "التقرير الشهري", f"{m:02d}/{y}", chat_id=user, keyboard=months_archive_menu())
+                except Exception as e:
+                    send(f"❌ تعذر عرض التقرير الشهري: {e}", report_menu(), chat_id=user)
+                return {"ok": True}
+
             if data_cb == "weekly_report":
-                send(msg_weekly_report(), main_menu(), chat_id=user)
+                rows, ws, we = rows_for_week()
+                send_report_image(rows, "التقرير الأسبوعي", f"{ws.strftime('%d/%m/%Y')} - {we.strftime('%d/%m/%Y')}", chat_id=user, keyboard=main_menu())
                 return {"ok": True}
 
             if data_cb == "econ_menu":
@@ -2963,7 +3785,8 @@ async def webhook(req: Request):
                 return {"ok": True}
 
             if data_cb == "daily_report":
-                send(msg_daily_report(), main_menu(), chat_id=user)
+                rows = rows_for_day()
+                send_report_image(rows, "التقرير اليومي", datetime.now(RIYADH_TZ).strftime("%d/%m/%Y"), chat_id=user, keyboard=main_menu())
                 return {"ok": True}
 
             if not ticker:
