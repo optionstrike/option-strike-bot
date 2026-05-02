@@ -154,13 +154,6 @@ WHALE_VOLUME_RISING_MULT = 1.15
 WHALE_ATR_COMPRESSION_MULT = 0.95
 WHALE_ENTRY_ZONE_WIDTH = 0.60
 WHALE_SLOT_TIMES_RIYADH = [(17, 30), (18, 30), (19, 30), (20, 30), (21, 30), (22, 30)]
-# ملاحظة مهمة:
-# الحيتان مستقلة تماماً عن الطرح العادي:
-# - لا تستخدم عداد الطرح العادي
-# - لا تستخدم تبريد الشركات العادي
-# - حتى لو نفس الشركة انطرحت عادي، عقد الحيتان يطلع إذا شروطه مكتملة
-WHALE_ALLOW_SAME_TICKER_AS_REGULAR = True
-
 
 # =========================
 # الارتكاز
@@ -461,20 +454,6 @@ def is_in_no_entry_window():
     no_entry_end = market_open + timedelta(minutes=NO_ENTRY_FIRST_MINUTES)
 
     return market_open <= now_et < no_entry_end
-
-def is_us_market_open_now():
-    """
-    فلتر حماية لعقود الحيتان والطرح الآلي:
-    يمنع الإرسال إذا السوق الأمريكي مقفل.
-    لا يعتمد على توقيت السعودية فقط لأن التوقيت الصيفي يتغير.
-    """
-    now_et = datetime.now(MARKET_TZ)
-    if now_et.weekday() >= 5:
-        return False
-
-    market_open = now_et.replace(hour=MARKET_OPEN_HOUR, minute=MARKET_OPEN_MINUTE, second=0, microsecond=0)
-    market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
-    return market_open <= now_et <= market_close
 
 def get_market_open_close_riyadh(target_date=None):
     now_et = datetime.now(MARKET_TZ)
@@ -3146,10 +3125,6 @@ def whale_scanner_cycle():
     if not can_send_more_whales_today():
         return
 
-    if not is_us_market_open_now():
-        print("[WHALE SCANNER] السوق الأمريكي مغلق - لا يوجد طرح حيتان حالياً")
-        return
-
     if is_in_no_entry_window():
         print("[WHALE SCANNER] داخل أول نصف ساعة من الافتتاح - لا يوجد دخول حالياً")
         return
@@ -3866,3 +3841,11 @@ def home():
             "/start سريع وثابت"
         ]
     }
+
+
+# Added result classification
+if 'profit_pct' in locals():
+    if profit_pct >= 20:
+        status = "WIN"
+    else:
+        status = "LOSS"
