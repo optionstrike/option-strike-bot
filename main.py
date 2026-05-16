@@ -66,7 +66,7 @@ MAX_SIGNALS_PER_DAY = 6
 MAX_SIGNALS_PER_SCAN = 1
 STOCK_COOLDOWN_DAYS = 3
 TREND_CONFIRM_HOURS = 1
-SCAN_INTERVAL_SECONDS = 20
+SCAN_INTERVAL_SECONDS = 60
 
 # =========================
 # فلتر الدخول
@@ -83,6 +83,14 @@ MAX_COMPANY_CONTRACT_PRICE = 3.50
 MAX_SPAC_CONTRACT_PRICE = 3.70
 ENTRY_ZONE_WIDTH = 0.60
 UPDATE_STEP_AFTER_TP1 = 0.30
+
+# فلتر سيولة العقود - بدون تغيير أسعار العقود
+MIN_OPTION_VOLUME = 20
+MIN_OPTION_OI = 100
+MAX_OPTION_SPREAD_PCT = 0.25
+WHALE_MIN_OPTION_VOLUME = 100
+WHALE_MIN_VOLUME_TO_OI_RATIO = 0.30
+REPORT_WIN_MIN_PCT = 20.0
 
 # =========================
 # أهداف العقود الجديدة
@@ -135,10 +143,10 @@ WHALE_MAX_SIGNALS_PER_DAY = 6
 WHALE_MAX_SIGNALS_PER_SCAN = 1
 WHALE_MIN_PRICE = 0.70
 WHALE_MAX_PRICE = 1.50
-WHALE_MIN_DTE_DAYS = 7
-WHALE_MAX_DTE_DAYS = 35
-WHALE_MIN_OI = 50
-WHALE_MIN_SCORE = 60
+WHALE_MIN_DTE_DAYS = 15
+WHALE_MAX_DTE_DAYS = 45
+WHALE_MIN_OI = 100
+WHALE_MIN_SCORE = 75
 # =========================
 # نظام الحيتان المطور - قناص الانفجارات
 # مستقل عن الطرح العادي ولا يغير شروط الشركات
@@ -159,7 +167,7 @@ WHALE_SLOT_TIMES_RIYADH = [(17, 30), (18, 30), (19, 30), (20, 30), (21, 30), (22
 # الارتكاز
 # =========================
 
-INDEX_DAILY_PIVOT = {"US500", "SPY", "QQQ", "SPX", "NDX", "US100"}
+INDEX_DAILY_PIVOT = set()
 
 SPAC_TICKERS = {
     "NBIS", "CRCL", "CRWV", "MARA", "HOOD", "RDDT", "CVNA", "COIN", "MSTR",
@@ -168,7 +176,7 @@ SPAC_TICKERS = {
     "BIDU", "PDD", "BABA", "LULU", "ULTA", "ADBE"
 }
 
-INDEX_TICKERS = {"US500", "SPY", "QQQ", "SPX", "NDX", "US100"}
+INDEX_TICKERS = set()
 
 MIN_DTE_DAYS = 1
 MAX_DTE_DAYS = 30
@@ -188,7 +196,7 @@ NO_ENTRY_FIRST_MINUTES = 30
 PRIORITY_45_TICKERS = [
     "NVDA", "AAPL", "GOOGL", "MSFT", "META", "TSLA", "UNH", "MSTR", "COIN", "LLY",
     "AVGO", "APP", "CRWD", "TSM", "PLTR", "CVNA", "AMD", "CRWV", "CAT", "SNOW",
-    "CRM", "COST", "MU", "MDB", "AMZN", "FSLR", "GE", "NBIS", "CRCL", "DELL",
+    "CRM", "COST", "MU", "MDB", "AMZN", "FSLR", "ZS", "GE", "NBIS", "CRCL", "DELL",
     "LRCX", "HD", "LOW", "ADBE", "ORCL", "ARM", "BA", "FDX", "RDDT", "GLD",
     "IBM", "GS", "SMH", "V"
 ]
@@ -876,6 +884,34 @@ def parse_underlying_price_from_snapshot(item):
 def parse_contract_meta(item):
     details = safe_get(item, "details", default={}) or {}
     greeks = safe_get(item, "greeks", default={}) or {}
+    day = safe_get(item, "day", default={}) or {}
+    session = safe_get(item, "session", default={}) or {}
+    last_quote = safe_get(item, "last_quote", default={}) or {}
+
+    bid = parse_float(
+        last_quote.get("bid")
+        or last_quote.get("bid_price")
+        or last_quote.get("bp")
+        or safe_get(item, "quote", "bid")
+        or safe_get(item, "quote", "bid_price")
+    )
+    ask = parse_float(
+        last_quote.get("ask")
+        or last_quote.get("ask_price")
+        or last_quote.get("ap")
+        or safe_get(item, "quote", "ask")
+        or safe_get(item, "quote", "ask_price")
+    )
+    volume = int(parse_float(
+        day.get("volume")
+        or day.get("v")
+        or session.get("volume")
+        or session.get("v")
+        or item.get("volume")
+        or item.get("vol"),
+        0
+    ) or 0)
+
     return {
         "ticker": details.get("ticker") or item.get("ticker") or item.get("option_ticker"),
         "strike": float(details.get("strike_price", 0) or 0),
@@ -885,6 +921,9 @@ def parse_contract_meta(item):
         "gamma": float(greeks.get("gamma", 0) or 0),
         "iv": float(item.get("implied_volatility", 0) or 0),
         "oi": int(item.get("open_interest", 0) or 0),
+        "volume": volume,
+        "bid": bid,
+        "ask": ask,
         "contract_price": parse_contract_price_from_snapshot(item),
         "underlying_price": parse_underlying_price_from_snapshot(item),
     }
@@ -1234,6 +1273,52 @@ def calc_success_rate(c: dict, o: dict, contract: dict):
         + (4 if abs(contract["delta"]) >= 0.20 else 0)
         + (5 if o["prob"] >= 65 else 0)
     )))
+
+def option_spread_pct(x: dict):
+    bid = parse_float(x.get("bid"))
+    ask = parse_float(x.get("ask"))
+    if bid is None or ask is None or bid <= 0 or ask <= 0 or ask < bid:
+        return None
+    mid = (bid + ask) / 2
+    if mid <= 0:
+        return None
+    return (ask - bid) / mid
+
+def has_clean_option_liquidity(x: dict, whale: bool = False):
+    oi_min = WHALE_MIN_OI if whale else MIN_OPTION_OI
+    vol_min = WHALE_MIN_OPTION_VOLUME if whale else MIN_OPTION_VOLUME
+    oi = int(x.get("oi") or 0)
+    volume = int(x.get("volume") or 0)
+    if oi < oi_min:
+        return False
+    if volume < vol_min:
+        return False
+
+    spread = option_spread_pct(x)
+    if spread is not None and spread > MAX_OPTION_SPREAD_PCT:
+        return False
+
+    # إذا بيانات Bid/Ask غير متوفرة من مزود البيانات، نعوّض بشرط سيولة أقوى حتى لا يموت البوت.
+    if spread is None and not (volume >= vol_min * 2 and oi >= oi_min * 2):
+        return False
+
+    if whale:
+        ratio = volume / max(oi, 1)
+        if volume <= oi and ratio < WHALE_MIN_VOLUME_TO_OI_RATIO:
+            return False
+    return True
+
+def expiration_fit_penalty(dte: int, c: dict, whale: bool = False):
+    if dte is None:
+        return 99
+    if whale:
+        preferred = 28
+    elif c.get("strongest_trend") in ["صاعد قوي 🔥", "هابط قوي 🔻"]:
+        preferred = 14
+    else:
+        preferred = 21
+    return abs(dte - preferred) / 12
+
 # =========================
 # اختيار العقد
 # =========================
@@ -1314,18 +1399,14 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
 
             dte = days_to_expiry(x["expiration"])
 
-            if ticker in INDEX_TICKERS or is_spac_ticker(ticker):
-                if dte is None or dte < 0 or dte > INDEX_MAX_DTE_DAYS:
-                    continue
-            else:
-                if dte is None or dte < MIN_DTE_DAYS or dte > MAX_DTE_DAYS:
-                    continue
+            if dte is None or dte < MIN_DTE_DAYS or dte > MAX_DTE_DAYS:
+                continue
 
-            if x["oi"] < 10:
+            if not has_clean_option_liquidity(x):
                 continue
             strike_distance_pct = abs(x["strike"] - underlying_price) / max(underlying_price, 1e-9)
             delta_score = abs(abs(x["delta"]) - 0.35)
-            dte_penalty = min(max(dte, 0), 45) / 25
+            dte_penalty = expiration_fit_penalty(dte, c)
             score = (
                 strike_distance_pct * 22
                 + delta_score * 5
@@ -1356,17 +1437,16 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
 
             dte = days_to_expiry(x["expiration"])
 
-            if ticker in INDEX_TICKERS or is_spac_ticker(ticker):
-                if dte is None or dte < 0 or dte > INDEX_MAX_DTE_DAYS:
-                    continue
-            else:
-                if dte is None or dte < MIN_DTE_DAYS or dte > MAX_DTE_DAYS:
-                    continue
+            if dte is None or dte < MIN_DTE_DAYS or dte > MAX_DTE_DAYS:
+                continue
+
+            if not has_clean_option_liquidity(x):
+                continue
 
             score = (
                 abs(x["contract_price"] - limit_price) * 1.5
                 - min(x["oi"], 100000) / 20000
-                + min(max(dte, 0), 60) / 40
+                + expiration_fit_penalty(dte, c)
             )
             stage2.append((score, x))
 
@@ -1374,35 +1454,6 @@ def choose_best_contract_from_massive(ticker: str, c: dict, o: dict = None):
             stage2.sort(key=lambda z: z[0])
             best = stage2[0][1]
             contract = build_contract_from_pick(best, c, target_type, mode="NORMAL")
-            contract["success_rate"] = calc_success_rate(c, o or {"prob": 50}, contract)
-            return contract
-
-        stage3 = []
-        for x in parsed:
-            if x["contract_type"] != target_type:
-                continue
-            if not x["expiration"]:
-                continue
-            if x["contract_price"] is None or x["contract_price"] <= 0:
-                continue
-
-            dte = days_to_expiry(x["expiration"])
-
-            if ticker in INDEX_TICKERS or is_spac_ticker(ticker):
-                if dte is None or dte < 0 or dte > INDEX_MAX_DTE_DAYS:
-                    continue
-            else:
-                if dte is None or dte < MIN_DTE_DAYS or dte > MAX_DTE_DAYS:
-                    continue
-
-            strike_distance_pct = abs(x["strike"] - underlying_price) / max(underlying_price, 1e-9)
-            score = strike_distance_pct * 10 - min(x["oi"], 100000) / 20000
-            stage3.append((score, x))
-
-        if stage3:
-            stage3.sort(key=lambda z: z[0])
-            best = stage3[0][1]
-            contract = build_contract_from_pick(best, c, target_type, mode="BEST AVAILABLE")
             contract["success_rate"] = calc_success_rate(c, o or {"prob": 50}, contract)
             return contract
 
@@ -1641,6 +1692,8 @@ def choose_whale_contract_from_massive(ticker: str, c: dict, o: dict = None):
                 continue
             if x["oi"] < WHALE_MIN_OI:
                 continue
+            if not has_clean_option_liquidity(x, whale=True):
+                continue
 
             option_key = x.get("ticker")
             if WHALE_LAST_SENT_CONTRACT.get(option_key) == datetime.now(RIYADH_TZ).date().isoformat():
@@ -1649,12 +1702,16 @@ def choose_whale_contract_from_massive(ticker: str, c: dict, o: dict = None):
             strike_distance_pct = abs(x["strike"] - underlying_price) / max(underlying_price, 1e-9)
             delta_score = abs(abs(x["delta"]) - 0.30)
             volume = _safe_float(x.get("volume", x.get("vol", 0)))
+            premium_score = min((volume * x["contract_price"]) / 1000, 25)
+            flow_ratio_bonus = min((volume / max(x["oi"], 1)) * 10, 20)
             score = (
                 strike_distance_pct * 18
                 + delta_score * 5
                 + abs(x["contract_price"] - 1.00) * 0.6
                 - min(x["oi"], 100000) / 12000
                 - min(volume, 50000) / 10000
+                - premium_score / 10
+                - flow_ratio_bonus / 10
                 - min(abs(x["gamma"]), 1.0) * 4
             )
             pool.append((score, x))
@@ -1933,7 +1990,7 @@ def _report_stats(rows: list):
         net = max(0.0, high - entry) if high >= entry else current - entry
         st["entry"] += entry; st["high"] += high; st["net"] += net
         acc += net; st["equity"].append(acc)
-        st["wins" if net >= 0 else "losses"] += 1
+        st["wins" if is_report_win(row) else "losses"] += 1
         st["calls" if row.get("contract_type") == "call" else "puts"] += 1
         if high >= _safe_float(row.get("tp1"), 10**9): st["tp1"] += 1
         if high >= _safe_float(row.get("tp2"), 10**9): st["tp2"] += 1
@@ -1987,7 +2044,7 @@ def build_report_image(rows: list, title: str, period_text: str):
     for x,h in zip(xs,headers): d.text((x,y),h,fill=gold,font=f_tiny,anchor="ra")
     d.line((35,y+30,1045,y+30),fill=line,width=1); y+=40
     for idx,row in enumerate(rows[:24],1):
-        entry=_safe_float(row.get('entry_price')); high=_safe_float(row.get('highest_price'),entry); current=_safe_float(row.get('current_price'),high); net=max(0,high-entry) if high>=entry else current-entry; pct=(net/entry*100) if entry else 0; ctype='CALL' if row.get('contract_type')=='call' else 'PUT'; color=green if net>=0 else red; status='رابح' if net>=0 else 'خاسر'
+        entry=_safe_float(row.get('entry_price')); high=_safe_float(row.get('highest_price'),entry); current=_safe_float(row.get('current_price'),high); net=max(0,high-entry) if high>=entry else current-entry; pct=(net/entry*100) if entry else 0; ctype='CALL' if row.get('contract_type')=='call' else 'PUT'; is_win=is_report_win(row); color=green if is_win else red; status='رابح' if is_win else 'خاسر'
         vals=[idx,row.get('ticker','—'),ctype,format_short_date(row.get('expiration','')),f"{entry:.2f}",f"{high:.2f}",f"{net:.2f}",f"{pct:.0f}%",status]
         for x,v in zip(xs,vals): d.text((x,y),str(v),fill=color if x in [290,405,165] else white,font=f_tiny,anchor="ra")
         y+=29
@@ -2346,6 +2403,9 @@ def calc_signal_high_pnl(row: dict):
         return 0.0
     return ((high - entry) / entry) * 100
 
+def is_report_win(row: dict):
+    return calc_signal_high_pnl(row) >= REPORT_WIN_MIN_PCT
+
 def signal_status(row: dict):
     pnl, current, high = calc_signal_pnl(row)
     entry = row.get("entry_price", 0) or 0
@@ -2355,10 +2415,10 @@ def signal_status(row: dict):
         return "🥈 حقق TP2"
     if high >= row.get("tp1", 10**9):
         return "🥇 حقق TP1"
-    if current < entry:
+    if is_report_win(row):
+        return "🟢 رابح +20%"
+    if current <= entry or calc_signal_high_pnl(row) < REPORT_WIN_MIN_PCT:
         return "🔴 خاسر"
-    if current > entry:
-        return "🟢 رابح"
     return "⚪ مفتوح"
 
 def format_report_contract_line(row: dict, idx: int):
@@ -2419,12 +2479,10 @@ def msg_daily_report():
             tp2_hits += 1
         if high >= row.get("tp3", 10**9):
             tp3_hits += 1
-        if current < row.get("entry_price", 0):
-            losses += 1
-        elif current > row.get("entry_price", 0) or high >= row.get("tp1", 10**9):
+        if is_report_win(row):
             wins += 1
         else:
-            open_count += 1
+            losses += 1
 
     success_rate = (wins / total) * 100 if total else 0
     msg = (
@@ -2632,12 +2690,10 @@ def msg_weekly_report():
         if high >= row.get("tp3", 10**9):
             tp3_hits += 1
 
-        if current < row.get("entry_price", 0):
-            losses += 1
-        elif current > row.get("entry_price", 0) or high >= row.get("tp1", 10**9):
+        if is_report_win(row):
             wins += 1
         else:
-            open_count += 1
+            losses += 1
 
         if row.get("contract_type") == "call":
             call_count += 1
@@ -2835,11 +2891,8 @@ def get_economic_calendar_cached(day_from: str, day_to: str):
     for item in rows:
         name = item.get("event") or item.get("title") or item.get("name") or ""
         impact_label = normalize_impact_label(item.get("impact"))
-        if ECON_NEWS_ONLY_IMPORTANT:
-            if not is_important_event_name(name):
-                continue
-            if impact_label not in ["🔥 عالي", "⚠️ متوسط"]:
-                continue
+        if ECON_NEWS_ONLY_IMPORTANT and not is_important_event_name(name):
+            continue
 
         dt = parse_event_datetime(item)
         cleaned.append({
@@ -2921,11 +2974,10 @@ def get_upcoming_economic_alerts():
         if not dt:
             continue
         minutes_left = (dt - now).total_seconds() / 60.0
-        if 0 <= minutes_left <= ECON_NEWS_ALERT_MINUTES_BEFORE + 1:
-            if abs(minutes_left - ECON_NEWS_ALERT_MINUTES_BEFORE) <= 1.2:
-                key = f"{ev['name']}|{dt.isoformat()}"
-                if key not in ECON_ALERT_SENT:
-                    alerts.append((key, ev))
+        if 4 <= minutes_left <= 6:
+            key = f"{ev['name']}|{dt.isoformat()}"
+            if key not in ECON_ALERT_SENT:
+                alerts.append((key, ev))
     return alerts
 
 def economic_alert_cycle():
@@ -2944,6 +2996,24 @@ def economic_alert_cycle():
             chat_id=CHAT_ID
         )
         ECON_ALERT_SENT.add(key)
+
+
+def is_high_impact_news_window():
+    if not ECON_NEWS_ALERT_ENABLED:
+        return False
+    try:
+        now = datetime.now(RIYADH_TZ)
+        rows = get_economic_calendar_cached(now.date().isoformat(), (now.date() + timedelta(days=1)).isoformat())
+        for ev in rows:
+            dt = ev.get("date_obj")
+            if not dt:
+                continue
+            minutes_left = (dt - now).total_seconds() / 60.0
+            if -5 <= minutes_left <= ECON_NEWS_ALERT_MINUTES_BEFORE:
+                return True
+    except Exception as e:
+        print(f"[NEWS WINDOW ERROR] {e}")
+    return False
 
 # =========================
 # إعلانات الشركات
@@ -3057,6 +3127,10 @@ def scanner_cycle():
         print("[SCANNER] داخل أول نصف ساعة من الافتتاح - لا يوجد دخول حالياً")
         return
 
+    if is_high_impact_news_window():
+        print("[SCANNER] خبر اقتصادي مهم قريب - إيقاف الطرح مؤقتاً")
+        return
+
     results = []
 
     for ticker in get_active_watchlist():
@@ -3129,8 +3203,12 @@ def whale_scanner_cycle():
         print("[WHALE SCANNER] داخل أول نصف ساعة من الافتتاح - لا يوجد دخول حالياً")
         return
 
+    if is_high_impact_news_window():
+        print("[WHALE SCANNER] خبر اقتصادي مهم قريب - إيقاف الطرح مؤقتاً")
+        return
+
     results = []
-    market_bias = get_us500_whale_bias() if WHALE_ENHANCED_EXPLOSION_ENABLED else "NEUTRAL"
+    market_bias = "NEUTRAL"
     for ticker in WATCHLIST:
         try:
             df = get_df(ticker, "1h")
@@ -3576,7 +3654,7 @@ async def webhook(req: Request):
             if ticker not in set(WATCHLIST) | set(FRIDAY_ZERO_HERO_TICKERS):
                 send(
                     f"❌ السهم <b>{ticker}</b> غير موجود في القائمة\n\n"
-                    f"أمثلة: NVDA, AAPL, TSLA, SPY",
+                    f"أمثلة: NVDA, AAPL, TSLA, ZS",
                     chat_id=user
                 )
                 return {"ok": True}
