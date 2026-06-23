@@ -76,6 +76,19 @@ ENTRY_MAX_DISTANCE_PCT = 0.015
 BREAKOUT_BUFFER_PCT = 0.003
 
 # =========================
+# فلتر الجودة المطور
+# =========================
+
+MIN_SCANNER_SCORE = 75
+MIN_FRAME_ALIGNMENT_SCORE = 2
+NEAR_SR_ATR_MULT = 0.50
+NEAR_SR_PCT = 0.010
+RSI_CALL_MAX = 72
+RSI_PUT_MIN = 28
+VOLUME_SPIKE_MULT = 1.25
+STRUCTURE_LOOKBACK_BARS = 30
+
+# =========================
 # شروط العقود
 # =========================
 
@@ -165,7 +178,7 @@ SPAC_TICKERS = {
     "NBIS", "CRCL", "CRWV", "MARA", "HOOD", "RDDT", "CVNA", "COIN", "MSTR",
     "PLTR", "APP", "SNOW", "DDOG", "MDB", "TWLO", "DASH", "ABNB", "UBER",
     "SMCI", "ARM", "CRWD", "ENPH", "FSLR", "BE", "ALB", "SHOP", "PYPL",
-    "BIDU", "PDD", "BABA", "LULU", "ULTA", "ADBE"
+    "BIDU", "PDD", "BABA", "LULU", "ULTA", "SPCX", "ADBE", "MS"
 }
 
 INDEX_TICKERS = {"US500", "SPY", "QQQ", "SPX", "NDX", "US100"}
@@ -190,7 +203,7 @@ PRIORITY_45_TICKERS = [
     "AVGO", "APP", "CRWD", "TSM", "PLTR", "CVNA", "AMD", "CRWV", "CAT", "SNOW",
     "CRM", "COST", "MU", "MDB", "AMZN", "FSLR", "GE", "NBIS", "CRCL", "DELL",
     "LRCX", "HD", "LOW", "ADBE", "ORCL", "ARM", "BA", "FDX", "RDDT", "GLD",
-    "IBM", "GS", "SMH", "V"
+    "IBM", "GS", "SMH", "V", "SPCX", "MS"
 ]
 
 FRIDAY_ZERO_HERO_TICKERS = ["TSLA", "MU", "META", "APP", "CAT", "CVNA"]
@@ -1681,6 +1694,138 @@ def choose_whale_contract_from_massive(ticker: str, c: dict, o: dict = None):
         return None
 
 # =========================
+# فلتر الجودة المطور
+# =========================
+
+def calc_rsi(series, period=14):
+    try:
+        delta = series.diff()
+        gain = delta.clip(lower=0).rolling(period).mean()
+        loss = (-delta.clip(upper=0)).rolling(period).mean()
+        rs = gain / loss.replace(0, 1e-9)
+        return float((100 - (100 / (1 + rs))).iloc[-1])
+    except Exception:
+        return 50.0
+
+
+def calc_atr(df, period=14):
+    try:
+        high = df["High"]
+        low = df["Low"]
+        close = df["Close"]
+        prev_close = close.shift(1)
+        tr = pd.concat([
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs()
+        ], axis=1).max(axis=1)
+        return float(tr.rolling(period).mean().iloc[-1])
+    except Exception:
+        return 0.0
+
+
+def trend_snapshot(df):
+    if df.empty or len(df) < 55:
+        return None
+    close = df["Close"]
+    ema20 = float(close.ewm(span=20).mean().iloc[-1])
+    ema50 = float(close.ewm(span=50).mean().iloc[-1])
+    price = float(close.iloc[-1])
+    if price > ema20 > ema50:
+        trend = "CALL"
+    elif price < ema20 < ema50:
+        trend = "PUT"
+    else:
+        trend = "NEUTRAL"
+    return {
+        "price": price,
+        "ema20": ema20,
+        "ema50": ema50,
+        "trend": trend,
+        "rsi": calc_rsi(close),
+        "atr": calc_atr(df),
+        "volume": float(df["Volume"].iloc[-1]) if "Volume" in df else 0,
+        "avg_volume": float(df["Volume"].rolling(20).mean().iloc[-1]) if "Volume" in df and len(df) >= 20 else 0,
+    }
+
+
+def structure_levels(df, lookback=STRUCTURE_LOOKBACK_BARS):
+    if df.empty or len(df) < lookback + 2:
+        return None
+    recent = df.iloc[-lookback-1:-1]
+    return {
+        "resistance": float(recent["High"].max()),
+        "support": float(recent["Low"].min()),
+    }
+
+
+def quality_gate(ticker: str, c: dict):
+    """
+    فلتر إجباري قبل اختيار العقد:
+    - توافق 1H و 4H مع اتجاه الصفقة.
+    - منع CALL من مقاومة إلا بعد اختراق مؤكد.
+    - منع PUT من دعم إلا بعد كسر مؤكد.
+    - منع المطاردة عند RSI متشبع.
+    """
+    try:
+        direction = "CALL" if c.get("direction", "").startswith("CALL") else "PUT"
+        df_1h = get_df(ticker, "1h")
+        df_4h = get_df(ticker, "4h")
+        snap_1h = trend_snapshot(df_1h)
+        snap_4h = trend_snapshot(df_4h)
+        levels = structure_levels(df_1h)
+        if not snap_1h or not snap_4h or not levels:
+            return False, "بيانات غير كافية لتأكيد الفريمات", {}
+
+        alignment_score = int(snap_1h["trend"] == direction) + int(snap_4h["trend"] == direction)
+        if alignment_score < MIN_FRAME_ALIGNMENT_SCORE:
+            return False, f"رفض: عدم توافق الفريمات 1H/4H مع {direction}", {
+                "trend_1h": snap_1h["trend"], "trend_4h": snap_4h["trend"]
+            }
+
+        price = float(c.get("price") or snap_1h["price"])
+        atr = max(snap_1h["atr"], price * 0.003, 1e-9)
+        resistance = levels["resistance"]
+        support = levels["support"]
+        near_buffer = max(atr * NEAR_SR_ATR_MULT, price * NEAR_SR_PCT)
+
+        prev_close = float(df_1h["Close"].iloc[-2])
+        last_close = float(df_1h["Close"].iloc[-1])
+        volume_ok = snap_1h["avg_volume"] > 0 and snap_1h["volume"] >= snap_1h["avg_volume"] * VOLUME_SPIKE_MULT
+
+        breakout_confirmed = last_close > resistance * (1 + BREAKOUT_BUFFER_PCT) and prev_close > resistance
+        breakdown_confirmed = last_close < support * (1 - BREAKOUT_BUFFER_PCT) and prev_close < support
+
+        if direction == "CALL":
+            if snap_1h["rsi"] > RSI_CALL_MAX:
+                return False, f"رفض: RSI متشبع للكول {snap_1h['rsi']:.1f}", {}
+            if price <= resistance and (resistance - price) <= near_buffer and not (breakout_confirmed and volume_ok):
+                return False, "رفض: CALL قريب من مقاومة بدون اختراق وفوليوم", {
+                    "resistance": resistance, "distance": resistance - price
+                }
+        else:
+            if snap_1h["rsi"] < RSI_PUT_MIN:
+                return False, f"رفض: RSI متشبع للبوت {snap_1h['rsi']:.1f}", {}
+            if price >= support and (price - support) <= near_buffer and not (breakdown_confirmed and volume_ok):
+                return False, "رفض: PUT قريب من دعم بدون كسر وفوليوم", {
+                    "support": support, "distance": price - support
+                }
+
+        c["quality_gate"] = {
+            "trend_1h": snap_1h["trend"],
+            "trend_4h": snap_4h["trend"],
+            "rsi_1h": round(snap_1h["rsi"], 2),
+            "resistance_1h": round(resistance, 2),
+            "support_1h": round(support, 2),
+            "volume_spike": bool(volume_ok),
+            "breakout_confirmed": bool(breakout_confirmed),
+            "breakdown_confirmed": bool(breakdown_confirmed),
+        }
+        return True, "قبول: توافق فريمات + موقع سعري آمن", c["quality_gate"]
+    except Exception as e:
+        return False, f"خطأ فلتر الجودة: {e}", {}
+
+# =========================
 # فلترة الصياد
 # =========================
 
@@ -1698,7 +1843,13 @@ def calc_score(c, o):
         score += 10
     if c["trend"] == "هابط 📉" and c["direction"].startswith("PUT"):
         score += 10
-    return score
+    q = c.get("quality_gate", {}) or {}
+    target = "CALL" if c.get("direction", "").startswith("CALL") else "PUT"
+    if q.get("trend_1h") == target and q.get("trend_4h") == target:
+        score += 20
+    if q.get("volume_spike"):
+        score += 5
+    return min(100, score)
 
 def is_entry_ready_now(c):
     if c["direction"] == "انتظار ⚪":
@@ -3072,6 +3223,11 @@ def scanner_cycle():
             if c is None:
                 continue
 
+            ok_quality, quality_reason, quality_data = quality_gate(ticker, c)
+            if not ok_quality:
+                print(f"[QUALITY REJECT] {ticker}: {quality_reason}")
+                continue
+
             if not is_entry_ready_now(c):
                 continue
 
@@ -3081,13 +3237,15 @@ def scanner_cycle():
                 continue
 
             score = calc_score(c, o)
-            if score < 60:
+            if score < MIN_SCANNER_SCORE:
+                print(f"[SCORE REJECT] {ticker}: score={score} < {MIN_SCANNER_SCORE}")
                 continue
 
             news_items = get_stock_news(ticker, limit=3)
             earnings_event = get_ticker_earnings_event_in_week(ticker)
             contract["news_items"] = news_items
             contract["earnings_event"] = earnings_event
+            contract["quality_gate"] = c.get("quality_gate", {})
 
             results.append((ticker, score, c, o, contract))
 
